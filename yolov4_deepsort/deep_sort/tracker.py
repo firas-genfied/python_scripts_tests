@@ -225,7 +225,8 @@ class Tracker:
         valid_features = []
         
         # Build lists of track_ids and corresponding features, filtering out assigned IDs.
-        for track_id, track_data in self.global_database.items():
+        database_copy = dict(self.global_database)
+        for track_id, track_data in database_copy.items():
             if track_id in assigned_ids:
                 continue
             track_features = track_data["features"]
@@ -1381,7 +1382,8 @@ class Tracker:
         all_matches = []
         
         # Check all track IDs in the global database
-        for track_id, data in self.global_database.items():
+        database_copy = dict(self.global_database)
+        for track_id, data in database_copy.items():
             # Skip if already assigned
             if track_id in assigned_ids:
                 continue
@@ -1519,7 +1521,8 @@ class Tracker:
         
         # Then, check all IDs in the global database
         database_matches = []
-        for db_id, db_info in self.global_database.items():
+        database_copy = dict(self.global_database)
+        for db_id, db_info in database_copy.items():
             # Skip IDs that are already in the visible matches
             if any(vm[0] == db_id for vm in visible_matches):
                 continue
@@ -1611,7 +1614,8 @@ class Tracker:
             logger.info(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
 
         # Iterate through all track_ids in the global database without skipping any
-        for track_id, data in self.global_database.items():
+        database_copy = dict(self.global_database)
+        for track_id, data in database_copy.items():
             valid_distances = []
             for db_feature in data["features"]:
                 # Flatten features to ensure they are 1D arrays

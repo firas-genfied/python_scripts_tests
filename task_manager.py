@@ -1,5 +1,19 @@
 from collections import defaultdict
 import asyncio
+import logging
+import os
+
+# Configure logger at the top of your module (or in a separate config module)
+LOG_FILENAME = "tracker.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILENAME),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 class TaskManager:

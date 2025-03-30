@@ -42,6 +42,8 @@ logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|error_concealment;1"
+
 def log_total_memory(gpu_processors):
     total_allocated = 0
     total_reserved = 0
@@ -876,9 +878,11 @@ class RTSPStreamProcessor:
         
         # Configure OpenCV capture with RTSP transport
         capture = cv2.VideoCapture(stream_info['url'], cv2.CAP_FFMPEG)
+        # capture.set(cv2.CAP_PROP_RTSP_TRANSPORT, cv2.CAP_RTSP_TRANSPORT_TCP)  # Force TCP transport
         
         # Set additional parameters for RTSP streaming
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # Minimize buffer size to reduce latency
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Minimize buffer size to reduce latency
+        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000) 
         
         if not capture.isOpened():
             logger.error(f"Failed to open RTSP stream: {stream_info['url']}")
