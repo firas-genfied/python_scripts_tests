@@ -149,8 +149,9 @@ async def fetch_camera_config(url: str) -> dict:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             response.raise_for_status()  # raises an exception for non-200 responses
-            config = await response.json()
-            return config
+            camera_list = await response.json()
+            # config = await response.json()
+            return {"cameras": camera_list}
 
 # Import needed to match original code
 class TrackState:
@@ -1051,8 +1052,8 @@ class RTSPStreamProcessor:
             batch_start_time = time.time()
             # logger.info(f"Processing batch of {len(current_batch)} frames")
                     
-            from_ts, to_ts = get_time_window_list(current_batch)
-            logger.info(f"Batch time window (list approach): from {from_ts} to {to_ts}")
+            # from_ts, to_ts = get_time_window_list(current_batch)
+            # logger.info(f"Batch time window (list approach): from {from_ts} to {to_ts}")
             # Process batch on GPU (segmentation + feature extraction)
             # Use round-robin to select a GPU processor for processing this batch
             processor = self._select_processor_for_batch()
@@ -1391,15 +1392,17 @@ class RTSPStreamProcessor:
 class FrameByFrameProcessor(RTSPStreamProcessor):
     """Processes frames individually rather than in batches"""
     
-    def __init__(self, processing_fps=5, gpu_processors=None, frame_buffer_config=None, thread_pool_size=8):
+    def __init__(self, processing_fps=5, gpu_processors=None, num_processors = 2, frame_buffer_config=None, thread_pool_size=8, send_fps = 1,):
         # Call parent constructor but with batch_size=1
         super().__init__(
             batch_size=1, 
             batch_interval=0.001, 
+            num_processors = num_processors,
             processing_fps=processing_fps,
             gpu_processors=gpu_processors,
             frame_buffer_config=frame_buffer_config,
-            thread_pool_size=thread_pool_size
+            thread_pool_size=thread_pool_size,
+            send_fps = send_fps
         )        
         # Override the thread pool to be slightly larger
         # self.thread_pool = ThreadPoolExecutor(max_workers=8)
@@ -1419,7 +1422,7 @@ class FrameByFrameProcessor(RTSPStreamProcessor):
             frame, metadata = frame_batch[0]
             
             # Select a GPU processor (for simplicity, we assume one processor here)
-            processor = self.gpu_processors[0]
+            processor = self._select_processor_for_batch()
             
             # Process the frame on the GPU
             metadata, detections, features = await loop.run_in_executor(
@@ -1442,6 +1445,24 @@ class FrameByFrameProcessor(RTSPStreamProcessor):
                 features,
                 metadata['timestamp']
             )
+
+            # Ensure all required fields are present regardless of detection count
+            if "image_url" not in result or not result["image_url"]:
+                result["image_url"] = ""  # Default empty string if not already set
+
+            if "camera_id" not in result or not result["camera_id"]:
+                result["camera_id"] = ""  # Default empty string if not already set
+
+            if "is_organised" not in result:
+                result["is_organised"] = True  # Default to True
+                
+            # Make sure date_time is properly set
+            if "date_time" not in result or not result["date_time"]:
+                result["date_time"] = metadata["timestamp"]
+
+            if "persons" not in result:
+                result["persons"] = []
+                    
 
             # Immediately dispatch the result
             await send_detection_data([result])
@@ -1702,10 +1723,10 @@ async def main():
     # Load camera configuration
     processor = None
     try:
-        # camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/camera-config")
+        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
         with open(args.config, 'r') as f:
             base_config = json.load(f)
-        # base_config['cameras'] = camera_config_remote.get('cameras', [])
+        base_config['cameras'] = camera_config_remote.get('cameras', [])
 
         system_config = base_config.get("system", {})
         buffer_config = base_config.get("buffer_settings", {})
@@ -1803,26 +1824,62 @@ async def frame_by_frame_main():
     args = parser.parse_args()
     
     logger.info("Starting Frame-by-Frame RTSP Stream Processor service")
+    processor = None
     
     # Create processor
-    processor = FrameByFrameProcessor(processing_fps=args.fps)
+    # processor = FrameByFrameProcessor(processing_fps=args.fps)
     
     # Load camera configuration
     try:
+        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
         with open(args.config, 'r') as f:
-            camera_config = json.load(f)
+            base_config = json.load(f)
+        base_config['cameras'] = camera_config_remote.get('cameras', [])
+
+        system_config = base_config.get("system", {})
+        buffer_config = base_config.get("buffer_settings", {})
+        gpu_config = system_config.get("gpu_config", {})
+        memory_management = system_config.get("memory_management", {})
+        thread_pool_config = system_config.get("thread_pool", {})
+        thread_pool_size = thread_pool_config.get("max_workers", 8)
+        send_fps = args.send_fps
+
+        # Determine GPU settings
+        if gpu_config.get("enabled", False):
+            # Use the number of devices listed in the gpu_config
+            num_processors = gpu_config.get("num_processors", 2)
+            # Override batch_size per GPU if provided, else use the command-line argument
+            batch_size = gpu_config.get("batch_size_per_gpu", args.batch_size)
+        else:
+            num_processors = 2  # or any default value if GPUs are not enabled
+            batch_size = args.batch_size
         
-        # Add each camera
-        for camera in camera_config['cameras']:
-            processor.add_camera(
-                rtsp_url=camera['rtsp_url'],
-                camera_id=camera['camera_id'],
-                store_id=camera['store_id']
-            )
+        processor = FrameByFrameProcessor(
+            num_processors=num_processors,
+            processing_fps=args.fps,
+            frame_buffer_config=buffer_config,
+            thread_pool_size=thread_pool_size,
+            send_fps = send_fps
+        )
+        try:
+            # Add each camera
+            for camera in base_config['cameras']:
+                processor.add_camera(
+                    rtsp_url=camera['rtsp_url'],
+                    camera_id=camera['camera_id'],
+                    store_id=camera['store_id']
+                )
+        except Exception as e:
+            logger.error(f"Error loading camera configuration: {e}", exc_info=True)
+
     except Exception as e:
         logger.error(f"Error loading camera configuration: {e}", exc_info=True)
         # Use default configuration
         # (Same default configuration as in the original code)
+
+    if processor is None:
+        logger.error("Processor was not initialized. Exiting.")
+        return
         
     try:
         # Run the processor
