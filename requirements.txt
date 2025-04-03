@@ -45,3 +45,7 @@ tf-keras==2.18.0
 # Human pose estimation
 mediapipe==0.10.21
 confluent-kafka
+
+#vectorDB
+pymilvus
+
