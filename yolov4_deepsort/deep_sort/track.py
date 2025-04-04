@@ -70,29 +70,22 @@ class Track:
         self.age += 1
         self.time_since_update += 1
 
-    def update(self, kf, detection, global_database):
+    def update(self, kf, detection):
         """Perform Kalman filter measurement update step and update the feature cache."""
         self.mean, self.covariance = kf.update(
-            self.mean, self.covariance, detection.to_xyah())
-        
-        # Append the detection's feature to the features list
+            self.mean, self.covariance, detection.to_xyah()
+        )
+
         if detection.feature is not None:
-            self.features.append(detection.feature)  # Keep only the latest feature
+            self.features.append(detection.feature)
             logger.info(f"Adding feature to track_id {self.track_id}. Total features: {len(self.features)}")
-            
-            # Update the global database only if the track is Confirmed
-            if self.state == TrackState.Confirmed:
-                if self.track_id in global_database:
-                    global_database[self.track_id]["features"].append(detection.feature)
-                else:
-                    global_database[self.track_id] = {"features": [detection.feature], "class_name": self.class_name}
-                logger.info(f"Updated global database for track_id {self.track_id} with {len(global_database[self.track_id]['features'])} features.")
-        
+
         self.hits += 1
         logger.info(f"{self.track_id} total hits is {self.hits}")
         self.time_since_update = 0
         if self.state == TrackState.Tentative and self.hits >= self._n_init:
             self.state = TrackState.Confirmed
+
 
     def mark_missed(self):
         """Mark this track as missed (no association at the current time step)."""

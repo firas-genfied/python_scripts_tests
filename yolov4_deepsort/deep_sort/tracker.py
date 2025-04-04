@@ -10,7 +10,7 @@ from .track import TrackState
 import logging
 import os
 from collections import defaultdict
-
+from milvus_read_client import MilvusReIDClient
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
@@ -161,7 +161,7 @@ class Tracker:
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
+    def __init__(self, metric, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5, milvus_client = None):
         self.metric = metric
         self.max_iou_distance = max_iou_distance
         self.max_age = max_age
@@ -172,642 +172,94 @@ class Tracker:
         self.kf = kalman_filter_anuj.KalmanFilter(dt = 1/25)
         self.tracks = []
         self._next_id = 1
+        self.milvus_client = milvus_client
 
         # Load or create the global database
-        self.global_database_file = "global_database_anuj.pkl"
-        if os.path.exists(self.global_database_file):
-            with open(self.global_database_file, "rb") as f:
-                self.global_database = pickle.load(f)
-            # logger.info(f"Loaded global database from {self.global_database_file}.")
-        else:
-            self.global_database = {}
-            logger.info(f"Created new global database.")
         self.retired_ids = set()
 
-    def mark_track_as_left(self, track):
+    def mark_track_as_left(self, track, store_id):
         """Mark a track as left and retire its ID."""
-        # Remove from global database if present
-        if track.track_id in self.global_database:
-            del self.global_database[track.track_id]
-        # Add to retired IDs so it is not reused
+        try:
+            self.milvus_client.delete_track(track_id=track.track_id, store_id=store_id)
+            logger.info(f"Deleted track {track.track_id} from Milvus collection.")
+        except Exception as e:
+            logger.error(f"Error deleting track {track.track_id} from Milvus: {e}")
+        
         self.retired_ids.add(track.track_id)
         # Mark the track as deleted so it will be removed from active tracking
         track.state = TrackState.Deleted
         logger.info(f"Track {track.track_id} retired and removed from global database.")
+    
+    def _insert_feature_into_milvus(self, track, detection):
+        """
+        Insert the detection's feature into Milvus for a confirmed track.
 
-    def save_global_database(self):
-        """Save the global database to a file."""
-        with open(self.global_database_file, "wb") as f:
-            pickle.dump(self.global_database, f)
-        logger.info(f"Saved global database to {self.global_database_file}.")
+        Args:
+            track: The Track object being updated
+            detection: The Detection object with the new feature
+        """
+        if track.state == TrackState.Confirmed and detection.feature is not None:
+            try:
+                camera_id = getattr(detection, "camera_id", 0)
+                timestamp = getattr(detection, "timestamp", 0)
+                self.milvus_client.insert_embedding(
+                    track_id=track.track_id,
+                    embedding=detection.feature,
+                    store_id=self.milvus_client.store_id,
+                    camera_id=camera_id,
+                    timestamp=timestamp
+                )
+                logger.info(f"[Milvus] Inserted feature for track_id {track.track_id}.")
+            except Exception as e:
+                logger.error(f"[Milvus] Failed to insert feature for track_id {track.track_id}: {e}")
+
 
     def predict(self):
         """Propagate track state distributions one time step forward."""
         for track in self.tracks:
             track.predict(self.kf)
-
-    def _find_next_best_match(self, feature, bbox, assigned_ids, max_candidates=5, distance_threshold=0.7):
+    
+    def _find_next_best_match(self, feature, assigned_ids, max_candidates=5, distance_threshold=0.7):
         """
-        Find the next best match from the global database, excluding already assigned IDs,
-        by filtering out the track IDs and then proceeding with the normal distance computation.
-        
+        Find the next best match from Milvus, excluding already assigned IDs,
+        and return both the best track ID and its distance.
+
         Args:
             feature: Feature vector of the detection.
-            bbox: Bounding box of the detection in tlbr format.
             assigned_ids: Set of track IDs already assigned in the current frame.
             max_candidates: Maximum number of candidates to consider.
             distance_threshold: Maximum cosine distance threshold for a valid match.
-            
+
         Returns:
-            track_id: Next best matching track ID, or None if no good match found.
+            Tuple[int or None, float]: (track_id, distance) or (None, inf) if no good match found.
         """
-        valid_track_ids = []
-        valid_features = []
-        
-        # Build lists of track_ids and corresponding features, filtering out assigned IDs.
-        database_copy = dict(self.global_database)
-        for track_id, track_data in database_copy.items():
-            if track_id in assigned_ids:
-                continue
-            track_features = track_data["features"]
-            if not track_features:
-                continue
-            
-            # We assume here you want to compare the new detection feature against all features for the track.
-            valid_track_ids.append(track_id)
-            valid_features.append(np.array(track_features))
-        
-        if not valid_track_ids:
-            return None
+        try:
+            results = self.milvus_client.search_embedding(
+                query_embedding=feature,
+                top_k=max_candidates * 2,
+                store_filter=self.milvus_client.store_id
+            )
 
-        # Compute the cost for each track using your metric's distance method.
-        # Here, we compute distances per track by passing the detection feature and each track's features.
-        candidates = []
-        for track_id, track_feats in zip(valid_track_ids, valid_features):
-            # Note: self.metric.distance expects a matrix of features and a list/array of target IDs.
-            # We call the underlying metric function directly (e.g., _nn_cosine_distance) to compute the distance.
-            cost_matrix = self.metric._metric(np.array([feature]), track_feats)
-            cost = np.min(cost_matrix)  # best cost for this track
-            candidates.append((track_id, cost))
-        
-        # Sort candidates by cost
-        candidates.sort(key=lambda x: x[1])
-        
-        # Check the top candidates against the threshold
-        for track_id, cost in candidates[:max_candidates]:
-            if cost < distance_threshold:
-                return track_id
+            # Filter and sort
+            unassigned_matches = [
+                (track_id, distance)
+                for track_id, distance in results
+                if track_id not in assigned_ids
+            ]
+            unassigned_matches.sort(key=lambda x: x[1])
 
-        return None
+            for track_id, distance in unassigned_matches[:max_candidates]:
+                if distance < distance_threshold:
+                    logger.info(f"[Milvus] Best unassigned match: track_id={track_id}, distance={distance}")
+                    return track_id, distance
 
-    # def update(self, detections): #best one so far
-    #     """
-    #     Modified update method that handles overlapping detections while maintaining
-    #     robust tracking performance and preventing duplicate ID assignment.
-    #     """
-    #     # Step 1: Identify potentially overlapping detections
-    #     overlap_threshold = 0.25  # IoU threshold
-    #     num_dets = len(detections)
-    #     overlap_groups = {}  # Track which detections overlap with others
-        
-    #     # Find all overlapping pairs of detections
-    #     for i in range(num_dets):
-    #         box_i = detections[i].to_tlbr()
-    #         entering_i, frac_i = is_entering_store_percent(box_i, line_y=108, threshold=0.60)  # Use original threshold
-            
-    #         if i not in overlap_groups:
-    #             overlap_groups[i] = []
-                
-    #         for j in range(i + 1, num_dets):
-    #             box_j = detections[j].to_tlbr()
-                
-    #             # Check overlap using both methods for robustness
-    #             iou = compute_iou(box_i, box_j)
-    #             overlap_A, fraction_A = overlap_ratio_single_box(box_i, box_j, ratio_threshold=0.30)
-    #             overlap_B, fraction_B = overlap_ratio_single_box(box_j, box_i, ratio_threshold=0.30)
-                
-    #             if (iou > overlap_threshold) or overlap_A or overlap_B:
-    #                 logger.info(f"Detected overlap between boxes {box_i} and {box_j}: IoU={iou:.2f}, fractions: {fraction_A:.2f}, {fraction_B:.2f}")
-                    
-    #                 if j not in overlap_groups:
-    #                     overlap_groups[j] = []
-                    
-    #                 overlap_groups[i].append(j)
-    #                 overlap_groups[j].append(i)
-        
-    #     # Step 2: Run the standard matching cascade first
-    #     matches, unmatched_tracks, unmatched_detections = self._match(detections)
-        
-    #     # Step 3: Update track set for matched detections
-    #     for track_idx, detection_idx in matches:
-    #         self.tracks[track_idx].update(self.kf, detections[detection_idx], self.global_database)
-    #         logger.info(f"Matched detection to track_id {self.tracks[track_idx].track_id}.")
-        
-    #     # Step 4: Mark unmatched tracks as missed
-    #     for track_idx in unmatched_tracks:
-    #         self.tracks[track_idx].mark_missed()
-        
-    #     # Step 5: Process unmatched detections with special handling for overlaps
-    #     remaining_unmatched = []
-        
-    #     # Keep track of which IDs have been assigned in this frame
-    #     assigned_ids = set()
-    #     # Add all matched track IDs to the assigned set
-    #     for track_idx, _ in matches:
-    #         assigned_ids.add(self.tracks[track_idx].track_id)
-        
-    #     # First handle detections that are part of overlap groups
-    #     overlap_detections = set()
-    #     for det_idx in unmatched_detections:
-    #         if det_idx in overlap_groups and len(overlap_groups[det_idx]) > 0:
-    #             overlap_detections.add(det_idx)
-        
-    #     # Sort overlapping detections by a heuristic to process most likely matches first
-    #     # (This helps ensure better assignments when multiple overlapping detections compete for IDs)
-    #     overlap_detections_list = list(overlap_detections)
-    #     overlap_detections_list.sort(key=lambda idx: len(overlap_groups[idx]), reverse=True)
-        
-    #     # Process overlap detections first
-    #     for det_idx in overlap_detections_list:
-    #         detection = detections[det_idx]
-    #         bbox = detection.to_tlbr()
-    #         entering, fraction = is_entering_store_percent(bbox, line_y=108, threshold=0.60)
-            
-    #         if entering:
-    #             # Force new ID for entering detections
-    #             logger.info(f"Overlapping detection with bbox {bbox} is entering the store (fraction: {fraction}). Assigning new ID.")
-    #             matched_track_id = None
-    #         else:
-    #             # Use more comprehensive matching for overlapping detections
-    #             logger.info(f"Matching overlapping detection {bbox} with global database.")
-    #             matched_track_id = self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
-                
-    #             # Check if this ID is already assigned in this frame
-    #             if matched_track_id is not None and matched_track_id in assigned_ids:
-    #                 logger.warning(f"ID {matched_track_id} already assigned in this frame. Finding next best match.")
-    #                 # Find the next best match from the database
-    #                 matched_track_id = self._find_next_best_match(detection.feature, bbox, assigned_ids)
-                    
-    #                 if matched_track_id is not None:
-    #                     logger.info(f"Found alternative match: track_id {matched_track_id}")
-    #                 else:
-    #                     logger.info("No good alternative match found. Will assign new ID.")
-            
-    #         if matched_track_id is not None:
-    #             # Re-identify the track using the database
-    #             mean, covariance = self.kf.initiate(detection.to_xyah())
-    #             class_name = detection.get_class()
-    #             self.tracks.append(Track(
-    #                 mean, covariance, matched_track_id, self.n_init, self.max_age,
-    #                 detection.feature, class_name))
-                
-    #             # Always ensure feature history is maintained
-    #             self.tracks[-1].features = self.global_database[matched_track_id]["features"]
-    #             logger.info(f"Re-identified overlapping detection as track_id {matched_track_id} with {len(self.tracks[-1].features)} features.")
-                
-    #             # Mark this ID as assigned
-    #             assigned_ids.add(matched_track_id)
-    #         else:
-    #             # If no match found or all potential matches already assigned, create new track
-    #             mean, covariance = self.kf.initiate(detection.to_xyah())
-    #             class_name = detection.get_class()
-    #             self.tracks.append(Track(
-    #                 mean, covariance, self._next_id, self.n_init, self.max_age,
-    #                 detection.feature, class_name))
-    #             logger.info(f"Assigned new track_id {self._next_id} for overlapping detection.")
-                
-    #             # Mark this ID as assigned
-    #             assigned_ids.add(self._next_id)
-    #             self._next_id += 1
-        
-    #     # Process remaining unmatched detections using standard approach
-    #     for det_idx in unmatched_detections:
-    #         if det_idx not in overlap_detections:
-    #             remaining_unmatched.append(det_idx)
-        
-    #     for det_idx in remaining_unmatched:
-    #         detection = detections[det_idx]
-    #         bbox = detection.to_tlbr()
-    #         entering, fraction = is_entering_store_percent(bbox, line_y=108, threshold=0.60)
-            
-    #         if entering:
-    #             logger.info(f"Detection with bbox {bbox} is entering the store (fraction: {fraction}).")
-    #             matched_track_id = None
-    #         else:
-    #             matched_track_id = self._match_with_global_database(detection.feature, bbox)
-                
-    #             # Check if this ID is already assigned in this frame
-    #             if matched_track_id is not None and matched_track_id in assigned_ids:
-    #                 logger.warning(f"ID {matched_track_id} already assigned in this frame. Finding next best match.")
-    #                 # Find the next best match from the database
-    #                 matched_track_id = self._find_next_best_match(detection.feature, bbox, assigned_ids)
-                    
-    #                 if matched_track_id is not None:
-    #                     logger.info(f"Found alternative match: track_id {matched_track_id}")
-    #                 else:
-    #                     logger.info("No good alternative match found. Will assign new ID.")
-            
-    #         if matched_track_id is not None:
-    #             # Re-identify track using database
-    #             mean, covariance = self.kf.initiate(detection.to_xyah())
-    #             class_name = detection.get_class()
-    #             self.tracks.append(Track(
-    #                 mean, covariance, matched_track_id, self.n_init, self.max_age,
-    #                 detection.feature, class_name))
-                
-    #             # Always ensure feature history is maintained
-    #             self.tracks[-1].features = self.global_database[matched_track_id]["features"]
-    #             logger.info(f"Re-identified track_id {matched_track_id} from global database with {len(self.tracks[-1].features)} features.")
-                
-    #             # Mark this ID as assigned
-    #             assigned_ids.add(matched_track_id)
-    #         else:
-    #             # Assign new track ID
-    #             mean, covariance = self.kf.initiate(detection.to_xyah())
-    #             class_name = detection.get_class()
-    #             self.tracks.append(Track(
-    #                 mean, covariance, self._next_id, self.n_init, self.max_age,
-    #                 detection.feature, class_name))
-    #             logger.info(f"Assigned new track_id {self._next_id} for detection.")
-                
-    #             # Mark this ID as assigned
-    #             assigned_ids.add(self._next_id)
-    #             self._next_id += 1
-        
-    #     # Remove deleted tracks
-    #     self.tracks = [t for t in self.tracks if not t.is_deleted()]
-        
-    #     # Update distance metric
-    #     active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
-    #     features, targets = [], []
-    #     for track in self.tracks:
-    #         if not track.is_confirmed():
-    #             continue
-    #         features += track.features
-    #         targets += [track.track_id for _ in track.features]
-    #         track.features = []
-        
-    #     if features:
-    #         self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
+            logger.info("[Milvus] No unassigned track ID below threshold.")
+            return None, float('inf')
 
+        except Exception as e:
+            logger.error(f"[Milvus] Error in _find_next_best_match: {e}")
+            return None, float('inf')
 
-    # def update(self, detections): #untested thoroughly but working
-    #     """
-    #     Comprehensive update method that handles ID competition between detections,
-    #     new entries, overlapping detections, and maintains tracking consistency.
-        
-    #     This implementation avoids index invalidation by collecting all track modifications
-    #     and applying them only after all processing is complete, while maintaining
-    #     track ID consistency across frames.
-    #     """
-    #     # Step 1: Identify potentially overlapping detections
-    #     overlap_threshold = 0.25  # IoU threshold
-    #     num_dets = len(detections)
-    #     overlap_groups = {}  # Track which detections overlap with others
-        
-    #     # Find all overlapping pairs of detections
-    #     for i in range(num_dets):
-    #         box_i = detections[i].to_tlbr()
-    #         entering_i, frac_i = is_entering_store_percent(box_i, line_y=108, threshold=0.60)
-            
-    #         if i not in overlap_groups:
-    #             overlap_groups[i] = []
-                
-    #         for j in range(i + 1, num_dets):
-    #             box_j = detections[j].to_tlbr()
-                
-    #             # Check overlap using both methods for robustness
-    #             iou = compute_iou(box_i, box_j)
-    #             overlap_A, fraction_A = overlap_ratio_single_box(box_i, box_j, ratio_threshold=0.30)
-    #             overlap_B, fraction_B = overlap_ratio_single_box(box_j, box_i, ratio_threshold=0.30)
-                
-    #             if (iou > overlap_threshold) or overlap_A or overlap_B:
-    #                 logger.info(f"Detected overlap between boxes {box_i} and {box_j}: IoU={iou:.2f}, fractions: {fraction_A:.2f}, {fraction_B:.2f}")
-                    
-    #                 if j not in overlap_groups:
-    #                     overlap_groups[j] = []
-                    
-    #                 overlap_groups[i].append(j)
-    #                 overlap_groups[j].append(i)
-        
-    #     # Step 2: Run the standard matching cascade first
-    #     matches, unmatched_tracks, unmatched_detections = self._match(detections)
-        
-    #     # Create a dict mapping track_idx to track object for easier reference
-    #     track_idx_to_track = {idx: self.tracks[idx] for idx in range(len(self.tracks))}
-        
-    #     # First process the good matches from the cascade directly
-    #     for track_idx, detection_idx in matches:
-    #         track = track_idx_to_track[track_idx]
-    #         detection = detections[detection_idx]
-            
-    #         # Skip tracks with no features or initialize them
-    #         if not track.features:
-    #             # First update with this feature
-    #             track.update(self.kf, detection, self.global_database)
-    #             logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
-    #             continue
-            
-    #         # Calculate distance to check if this is a good match
-    #         distance = calculate_cosine_distance(detection.feature, track.features[-1])
-    #         logger.info(f"distance for id {track_idx} with detection is {distance} ")
-            
-    #         # If this is a good match (distance below threshold), update track directly
-    #         if distance < self.matching_threshold:
-    #             # Update the track directly
-    #             track.update(self.kf, detection, self.global_database)
-    #             logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
-                        
-    #             # Remove this detection and track from further processing
-    #             if detection_idx in unmatched_detections:
-    #                 unmatched_detections.remove(detection_idx)
-    #             if track_idx in unmatched_tracks:
-    #                 unmatched_tracks.remove(track_idx)
-        
-    #     # Step 3: Collect all potential ID matches for all remaining detections with scores
-    #     potential_matches = {}  # {detection_idx: [(track_id, distance, is_entering, is_visible), ...]}
-    #     entering_detections = set()  # Track which detections are entering
-        
-    #     # Process all remaining detections to find ALL potential ID matches
-    #     for det_idx in unmatched_detections:
-    #         detection = detections[det_idx]
-    #         bbox = detection.to_tlbr()
-            
-    #         # Check if this detection represents someone entering
-    #         entering, fraction = is_entering_store_percent(bbox, line_y=108, threshold=0.60)
-            
-    #         if entering:
-    #             logger.info(f"Detection with bbox {bbox} is entering the store (fraction: {fraction}).")
-    #             # Mark this detection as entering
-    #             entering_detections.add(det_idx)
-    #             continue
-            
-    #         # For non-entering detections, find all potential ID matches from the database
-    #         database_matches = self._find_all_potential_matches(detection.feature, bbox)
-            
-    #         if det_idx not in potential_matches:
-    #             potential_matches[det_idx] = []
-            
-    #         # Add all database matches to potential matches list
-    #         for db_id, db_distance, is_visible in database_matches:
-    #             if db_distance <= self.matching_threshold:  # Only add if within threshold
-    #                 potential_matches[det_idx].append((db_id, db_distance, is_visible))
-    #                 logger.info(f"Potential match: detection {det_idx} with database ID {db_id}, distance {db_distance}, visible: {is_visible}")
-        
-    #     # Step 4: Process detections based on whether they are part of overlapping groups or not
-    #     assigned_detections = set()
-    #     assigned_ids = set()
-    #     final_assignments = {}  # {det_idx: (track_id, is_new)}
-        
-    #     # Keep track of which track IDs are already active in the current frame
-    #     active_track_ids = set(track.track_id for track in self.tracks if track.is_confirmed())
-        
-    #     # FIRST: Process overlapping detections separately with special handling
-    #     overlap_detections = set()
-    #     for det_idx in unmatched_detections:
-    #         if det_idx in overlap_groups and len(overlap_groups[det_idx]) > 0:
-    #             overlap_detections.add(det_idx)
-        
-    #     # Sort overlapping detections by a heuristic (number of overlaps)
-    #     overlap_detections_list = sorted(
-    #         list(overlap_detections), 
-    #         key=lambda idx: len(overlap_groups[idx]), 
-    #         reverse=True
-    #     )
-        
-    #     # Process overlapping detections first with explicit handling
-    #     for det_idx in overlap_detections_list:
-    #         if det_idx in assigned_detections:
-    #             continue
-                
-    #         detection = detections[det_idx]
-    #         bbox = detection.to_tlbr()
-            
-    #         # If detection is entering, assign new ID
-    #         if det_idx in entering_detections:
-    #             # Force new ID for entering detections
-    #             logger.info(f"Overlapping detection with bbox {bbox} is entering the store. Assigning new ID.")
-    #             new_id = self._next_id
-    #             assigned_ids.add(new_id)
-    #             assigned_detections.add(det_idx)
-    #             final_assignments[det_idx] = (new_id, True)
-    #             self._next_id += 1
-    #             continue
-            
-    #         # Use more comprehensive matching specifically for overlapping detections
-    #         logger.info(f"Matching overlapping detection {bbox} with global database.")
-    #         matched_track_id = self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
-            
-    #         # Check if this ID is already assigned in this frame
-    #         if matched_track_id is not None and matched_track_id in assigned_ids:
-    #             logger.warning(f"ID {matched_track_id} already assigned in this frame. Competition check needed.")
-                
-    #             # Find which detection already has this ID
-    #             existing_det_idx = next(d_idx for d_idx, (t_id, _) in final_assignments.items() if t_id == matched_track_id)
-    #             existing_detection = detections[existing_det_idx]
-                
-    #             # Calculate distances for both detections to this ID
-    #             current_distance = self._calculate_distance_to_id(detection.feature, matched_track_id)
-    #             existing_distance = self._calculate_distance_to_id(existing_detection.feature, matched_track_id)
-                
-    #             logger.info(f"Distance comparison: Current detection ({det_idx}): {current_distance}, " +
-    #                     f"Existing detection ({existing_det_idx}): {existing_distance}")
-                
-    #             if current_distance < existing_distance:
-    #                 # Current detection has a better match - reassign the existing detection
-    #                 logger.info(f"Current detection {det_idx} has a better match with ID {matched_track_id}. " +
-    #                         f"Reassigning detection {existing_det_idx}.")
-                    
-    #                 # Remove the existing assignment
-    #                 assigned_detections.remove(existing_det_idx)
-    #                 del final_assignments[existing_det_idx]
-                    
-    #                 # We'll keep the matched_track_id for the current detection
-    #                 # The existing detection will be processed again later
-    #             else:
-    #                 # Existing detection has a better match - find an alternative for the current detection
-    #                 logger.info(f"Existing detection {existing_det_idx} has a better match with ID {matched_track_id}. " +
-    #                         f"Finding alternative for detection {det_idx}.")
-                    
-    #                 # Find the next best match from the database
-    #                 matched_track_id = self._find_next_best_match(detection.feature, bbox, assigned_ids)
-                    
-    #                 if matched_track_id is not None:
-    #                     logger.info(f"Found alternative match: track_id {matched_track_id}")
-    #                 else:
-    #                     logger.info("No good alternative match found. Will assign new ID.")
-            
-    #         if matched_track_id is not None:
-    #             # Assign track ID
-    #             assigned_ids.add(matched_track_id)
-    #             assigned_detections.add(det_idx)
-                
-    #             # For existing tracks, mark as update (False)
-    #             # For new tracks from the database, mark as new (True)
-    #             is_new_track = matched_track_id not in active_track_ids
-    #             final_assignments[det_idx] = (matched_track_id, is_new_track)
-    #         else:
-    #             # Assign new ID only if no match found
-    #             new_id = self._next_id
-    #             assigned_ids.add(new_id)
-    #             assigned_detections.add(det_idx)
-    #             final_assignments[det_idx] = (new_id, True)
-    #             self._next_id += 1
-        
-    #     # SECOND: For remaining non-overlapping detections, use competition-based approach
-    #     # For each track ID, find the detection that has the best match score
-    #     id_to_best_detection = {}  # {track_id: (detection_idx, distance)}
-        
-    #     # Only consider non-overlapping, unassigned detections
-    #     unassigned_non_overlapping = [
-    #         det_idx for det_idx in unmatched_detections 
-    #         if det_idx not in assigned_detections and det_idx not in overlap_detections
-    #     ]
-        
-    #     # First pass: Find the best detection for each ID among non-overlapping detections
-    #     for det_idx in unassigned_non_overlapping:
-    #         if det_idx in entering_detections:
-    #             continue  # Skip entering detections in this pass
-                
-    #         if det_idx in potential_matches and potential_matches[det_idx]:
-    #             for track_id, distance, is_visible in potential_matches[det_idx]:
-    #                 if track_id is not None and track_id not in assigned_ids:
-    #                     if track_id not in id_to_best_detection or distance < id_to_best_detection[track_id][1]:
-    #                         id_to_best_detection[track_id] = (det_idx, distance)
-        
-    #     # Second pass: Assign non-overlapping detections based on competition results
-    #     # First handle ID winners - these get priority
-    #     for track_id, (det_idx, distance) in id_to_best_detection.items():
-    #         if det_idx not in assigned_detections and track_id not in assigned_ids:
-    #             # For existing tracks, mark as update (False)
-    #             # For new tracks from the database, mark as new (True)
-    #             is_new_track = track_id not in active_track_ids
-    #             final_assignments[det_idx] = (track_id, is_new_track)
-    #             assigned_detections.add(det_idx)
-    #             assigned_ids.add(track_id)
-    #             logger.info(f"ID competition winner: detection {det_idx} gets track_id {track_id} with distance {distance}")
-        
-    #     # Now handle remaining unassigned detections
-    #     for det_idx in unassigned_non_overlapping:
-    #         if det_idx in assigned_detections:
-    #             continue  # Already assigned
-            
-    #         # If detection is entering, assign new ID
-    #         if det_idx in entering_detections:
-    #             # Assign new ID for entering detection
-    #             new_id = self._next_id
-    #             final_assignments[det_idx] = (new_id, True)  # New ID
-    #             assigned_ids.add(new_id)
-    #             assigned_detections.add(det_idx)
-    #             logger.info(f"Entering detection {det_idx} gets new track_id {new_id}")
-    #             self._next_id += 1
-    #             continue
-            
-    #         # For non-entering detections, try to find best available ID
-    #         best_available_id = None
-    #         best_distance = float('inf')
-            
-    #         if det_idx in potential_matches and potential_matches[det_idx]:
-    #             for track_id, distance, _ in potential_matches[det_idx]:
-    #                 if track_id is not None and track_id not in assigned_ids and distance < best_distance:
-    #                     best_available_id = track_id
-    #                     best_distance = distance
-            
-    #         if best_available_id is not None and best_distance <= self.matching_threshold:
-    #             # Assign next best available ID
-    #             is_new_track = best_available_id not in active_track_ids
-    #             final_assignments[det_idx] = (best_available_id, is_new_track)
-    #             assigned_ids.add(best_available_id)
-    #             assigned_detections.add(det_idx)
-    #             logger.info(f"Alternative match: detection {det_idx} gets track_id {best_available_id} with distance {best_distance}")
-    #         else:
-    #             # No good match available, assign new ID
-    #             new_id = self._next_id
-    #             final_assignments[det_idx] = (new_id, True)  # New ID
-    #             assigned_ids.add(new_id)
-    #             assigned_detections.add(det_idx)
-    #             logger.info(f"No good match found: detection {det_idx} gets new track_id {new_id}")
-    #             self._next_id += 1
-        
-    #     # Step 5: Collect all remaining track modifications for batch application
-    #     tracks_to_update = {}  # {track_id: (detection, is_new_track)}
-    #     tracks_to_mark_missed = set()  # Set of track_ids to mark as missed
-        
-    #     # Process remaining unmatched tracks
-    #     for track_idx in unmatched_tracks:
-    #         track_id = track_idx_to_track[track_idx].track_id
-    #         if track_id not in assigned_ids:
-    #             tracks_to_mark_missed.add(track_id)
-        
-    #     # Process all final assignments to create new tracks or update existing ones
-    #     for det_idx, (track_id, is_new_track) in final_assignments.items():
-    #         detection = detections[det_idx]
-            
-    #         # Look for existing track with this ID
-    #         existing_track = None
-    #         for track in self.tracks:
-    #             if track.track_id == track_id and track.is_confirmed():
-    #                 existing_track = track
-    #                 break
-            
-    #         if existing_track is not None and not is_new_track:
-    #             # Update existing track
-    #             tracks_to_update[track_id] = (detection, False)
-    #         else:
-    #             # Create new track
-    #             tracks_to_update[track_id] = (detection, True)
-        
-    #     # Step 6: Apply all modifications to the track list
-    #     # First, update existing tracks and mark tracks as missed
-    #     for track in self.tracks:
-    #         if track.track_id in tracks_to_update:
-    #             detection, is_new = tracks_to_update[track.track_id]
-    #             if not is_new:
-    #                 # Update this existing track
-    #                 track.update(self.kf, detection, self.global_database)
-    #                 logger.info(f"Updated existing track {track.track_id}")
-    #                 # Remove from tracks_to_update so we don't create a duplicate
-    #                 del tracks_to_update[track.track_id]
-    #         elif track.track_id in tracks_to_mark_missed:
-    #             # Mark this track as missed
-    #             track.mark_missed()
-    #             logger.info(f"Marked track {track.track_id} as missed")
-        
-    #     # Now create any new tracks
-    #     for track_id, (detection, _) in tracks_to_update.items():
-    #         mean, covariance = self.kf.initiate(detection.to_xyah())
-    #         class_name = detection.get_class()
-            
-    #         new_track = Track(
-    #             mean, covariance, track_id, self.n_init, self.max_age,
-    #             detection.feature, class_name
-    #         )
-            
-    #         # Copy features from global database if available
-    #         if track_id in self.global_database:
-    #             new_track.features = self.global_database[track_id]["features"]
-    #             logger.info(f"Created track with ID {track_id} (reidentified from database with {len(new_track.features)} features)")
-    #         else:
-    #             logger.info(f"Created new track with ID {track_id}")
-            
-    #         # Add the new track
-    #         self.tracks.append(new_track)
-        
-    #     # Step 7: Remove deleted tracks
-    #     self.tracks = [t for t in self.tracks if not t.is_deleted()]
-        
-    #     # Step 8: Update distance metric
-    #     active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
-    #     features, targets = [], []
-    #     for track in self.tracks:
-    #         if not track.is_confirmed():
-    #             continue
-    #         features += track.features
-    #         targets += [track.track_id for _ in track.features]
-    #         track.features = []
-        
-    #     if features:
-    #         self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
 
 
     def _deduplicate_tracks(self):
@@ -929,7 +381,8 @@ class Tracker:
             for track in tracks_by_id[track_id]:
                 # If no features exist yet, update immediately:
                 if not track.features:
-                    track.update(self.kf, detection, self.global_database)
+                    track.update(self.kf, detection)
+                    self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
                     continue
 
@@ -939,7 +392,8 @@ class Tracker:
 
                 # If the distance is below threshold, update the track:
                 if distance < self.matching_threshold:
-                    track.update(self.kf, detection, self.global_database)
+                    track.update(self.kf, detection)
+                    self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                     if detection_idx in unmatched_detections:
                         unmatched_detections.remove(detection_idx)
@@ -952,7 +406,7 @@ class Tracker:
             # # Skip tracks with no features or initialize them
             # if not track.features:
             #     # First update with this feature
-            #     track.update(self.kf, detection, self.global_database)
+            #     track.update(self.kf, detection)
             #     logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
             #     continue
             
@@ -963,7 +417,7 @@ class Tracker:
             # # If this is a good match (distance below threshold), update track directly
             # if distance < self.matching_threshold:
             #     # Update the track directly
-            #     track.update(self.kf, detection, self.global_database)
+            #     track.update(self.kf, detection)
             #     logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                 
                 # Remove this detection and track from further processing
@@ -1289,7 +743,8 @@ class Tracker:
                 detection, is_new = tracks_to_update[track.track_id]
                 if not is_new:
                     # Update this existing track
-                    track.update(self.kf, detection, self.global_database)
+                    track.update(self.kf, detection)
+                    self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Updated existing track {track.track_id}")
                     # Remove from tracks_to_update so we don't create a duplicate
                     del tracks_to_update[track.track_id]
@@ -1322,7 +777,7 @@ class Tracker:
             else:
                 existing_tracks = [t for t in self.tracks if t.track_id == track_id]
                 best_track = max(existing_tracks, key=lambda t: t.hits)
-                # best_track.update(self.kf, detection, self.global_database)
+                # best_track.update(self.kf, detection)
                 # logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
                 if track_id in self.global_database and self.global_database[track_id]["features"]:
                     if not best_track.features:
@@ -1346,7 +801,8 @@ class Tracker:
                         logger.info(f"Merged features from database for track {track_id}, now has {len(best_track.features)} features")
 
                 # Update the best track with the detection (from option C)
-                best_track.update(self.kf, detection, self.global_database)
+                best_track.update(self.kf, detection)
+                self._insert_feature_into_milvus(best_track, detection)
                 logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
         
         # Step 7: Remove deleted tracks
@@ -1367,43 +823,42 @@ class Tracker:
             self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
 
 
-    def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
+    def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, store_id, max_candidates=10):
         """
-        Find the best match regardless of threshold, used for center detections.
-        
+        Find the best match regardless of threshold from Milvus, used for center detections.
+
         Args:
             feature: Feature vector to match
             assigned_ids: Set of already assigned IDs to exclude
+            store_id: The store ID context for sharded vector space
             max_candidates: Maximum number of candidates to consider
-        
+
         Returns:
             track_id: Best matching track ID, or None if no unassigned IDs exist
         """
-        all_matches = []
-        
-        # Check all track IDs in the global database
-        database_copy = dict(self.global_database)
-        for track_id, data in database_copy.items():
-            # Skip if already assigned
-            if track_id in assigned_ids:
-                continue
-                
-            # Calculate best match with this ID
-            best_distance = float('inf')
-            for db_feature in data["features"]:
-                distance = calculate_cosine_distance(feature, db_feature)
-                best_distance = min(best_distance, distance)
-                
-            # Add to candidates list regardless of threshold
-            all_matches.append((track_id, best_distance))
-        
-        # If no unassigned IDs, return None
-        if not all_matches:
+        try:
+            # Get candidate track IDs and their features from Milvus
+            track_features_dict = self.milvus_client.get_all_track_features(store_id)
+
+            all_matches = []
+
+            for track_id, db_features in track_features_dict.items():
+                if track_id in assigned_ids or not db_features:
+                    continue
+
+                best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
+                all_matches.append((track_id, best_distance))
+
+            if not all_matches:
+                return None
+
+            all_matches.sort(key=lambda x: x[1])
+            return all_matches[0][0]
+
+        except Exception as e:
+            logger.error(f"[Tracker] Error in _find_best_match_regardless_of_threshold: {e}")
             return None
-            
-        # Sort by distance and return best match
-        all_matches.sort(key=lambda x: x[1])
-        return all_matches[0][0]  # Return the ID with lowest distance
+
                 
         def _calculate_distance(self, feature, track):
             """
@@ -1425,33 +880,16 @@ class Tracker:
                 np.array([track.features[-1]])
             )
             return cost_matrix[0, 0]
-        
-    def _calculate_distance_directly(self, feature, track):
-        """
-        Calculate the feature distance between a detection and a track.
-        
-        Args:
-            feature: The feature vector of the detection
-            track: The track object
-            
-        Returns:
-            float: The distance score (lower is better)
-        """
-        if not track.features:
-            return float('inf')
-        
-        # Use the last feature from the track and our custom distance function
-        return calculate_cosine_distance(feature, track.features[-1]) 
 
-
-    def _calculate_distance_to_id(self, feature, track_id):
+    def _calculate_distance_to_id(self, feature, track_id, store_id):
         """
-        Calculate the distance between a feature vector and a specific track ID.
-        
+        Calculate the distance between a feature vector and a specific track ID using Milvus.
+
         Args:
             feature: Feature vector to compare
             track_id: Track ID to compare against
-            
+            store_id: Unique identifier for the store context
+
         Returns:
             float: The best distance score (lower is better)
         """
@@ -1459,25 +897,24 @@ class Tracker:
         for track in self.tracks:
             if track.track_id == track_id and track.is_confirmed():
                 if track.features:
-                    # Use our direct calculation with the last feature
                     distance = calculate_cosine_distance(feature, track.features[-1])
-                    logger.info(f"distance to id is {distance}")
+                    logger.info(f"[Tracker] distance to active track ID {track_id}: {distance}")
                     return distance
-        
-        # If not in active tracks or no features, check global database
-        if track_id in self.global_database and "features" in self.global_database[track_id]:
-            db_features = self.global_database[track_id]["features"]
-            if len(db_features) > 0:
-                # Find the best match among all features for this ID
-                best_distance = float('inf')
-                for db_feature in db_features:
-                    distance = calculate_cosine_distance(feature, db_feature)
-                    best_distance = min(best_distance, distance)
-                
+
+        # Fallback to Milvus if not found in active tracks
+        try:
+            db_features = self.milvus_client.get_features_by_track_id(store_id, track_id)
+            if db_features:
+                best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
+                logger.info(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
                 return best_distance
-        
-        # If no features found, return infinity
+            else:
+                logger.info(f"[Tracker] no features found in Milvus for track ID {track_id}")
+        except Exception as e:
+            logger.error(f"[Tracker] error querying Milvus for track ID {track_id}: {e}")
+
         return float('inf')
+
 
     def _find_all_potential_matches(self, feature, bbox, max_candidates=10):
         """
@@ -1518,31 +955,27 @@ class Tracker:
                     
                     if distance < threshold:
                         visible_matches.append((track.track_id, distance, True))
-        
+
+        visible_ids = {vm[0] for vm in visible_matches}
+    
+        # Query Milvus for top potential matches for this store
+        milvus_matches = self.milvus_client.search_embedding(
+            query_embedding=feature,
+            top_k=max_candidates * 2,
+            store_filter=self.milvus_client.store_id
+        )
+
+
         # Then, check all IDs in the global database
         database_matches = []
-        database_copy = dict(self.global_database)
-        for db_id, db_info in database_copy.items():
-            # Skip IDs that are already in the visible matches
-            if any(vm[0] == db_id for vm in visible_matches):
-                continue
-            
-            # Calculate distances to all features for this ID
-            if "features" in db_info and db_info["features"]:
-                # Find the best match among all features for this ID
-                best_distance = float('inf')
-                for db_feature in db_info["features"]:
-                    distance = calculate_cosine_distance(feature, db_feature)
-                    best_distance = min(best_distance, distance)
-                
-                if best_distance < threshold:
-                    database_matches.append((db_id, best_distance, False))
-        
-        # Combine and sort all matches by distance (ascending)
+        for track_id, distance in milvus_matches:
+            if track_id not in visible_ids and distance < threshold:
+                database_matches.append((track_id, distance, False))
+
+        # Combine both and return top N sorted by distance
         all_matches = visible_matches + database_matches
         all_matches.sort(key=lambda x: x[1])
-        
-        # Return top candidates
+
         return all_matches[:max_candidates]
 
     def _match(self, detections):
@@ -1614,40 +1047,26 @@ class Tracker:
             logger.info(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
 
         # Iterate through all track_ids in the global database without skipping any
-        database_copy = dict(self.global_database)
-        for track_id, data in database_copy.items():
-            valid_distances = []
+            # Perform search on Milvus
+        results = self.milvus_client.search_embedding(
+            query_embedding=detection_feature,
+            top_k=10,
+            store_filter=self.milvus_client.store_id
+        )
+        best_track_id = None
+        best_distance = float('inf')
+        for track_id, distance in results:
+            logger.info(f"Candidate match from Milvus: track_id={track_id}, distance={distance}")
             for db_feature in data["features"]:
-                # Flatten features to ensure they are 1D arrays
-                detection_feature_arr = np.asarray(detection_feature).flatten()
-                db_feature_arr = np.asarray(db_feature).flatten()
-
-                # Calculate cosine distance between detection feature and database feature
-                dot_product = np.dot(detection_feature_arr, db_feature_arr)
-                norm_detection = np.linalg.norm(detection_feature_arr)
-                norm_db = np.linalg.norm(db_feature_arr)
-                cosine_similarity = dot_product / (norm_detection * norm_db)
-                cosine_distance = 1 - cosine_similarity
-
-                # Only consider distances below the threshold
-                if cosine_distance < threshold:
-                    valid_distances.append(cosine_distance)
-
-            if valid_distances:
-                smallest_distance_for_track = min(valid_distances)
-                logger.info(f"Track ID {track_id} has valid distances: {valid_distances}. Smallest: {smallest_distance_for_track}")
-                if smallest_distance_for_track < min_distance:
-                    min_distance = smallest_distance_for_track
-                    matched_track_id = track_id
-            else:
-                logger.info(f"Track ID {track_id} did not yield valid distances under threshold.")
-
-        if matched_track_id is not None:
-            logger.info(f"Matched track_id {matched_track_id} with distance {min_distance}.")
-        else:
-            logger.info("No match found in global database. Assigning new track_id.")
-
-        return matched_track_id
+                if distance < threshold and distance < best_distance:
+                    best_track_id = track_id
+                    best_distance = distance
+            if best_track_id is not None:
+                logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+                return best_track_id
+            
+            logger.info("No match found in Milvus database below threshold.")
+            return None
 
 
     def _match_with_global_database(self, detection_feature, detection_bbox, center_bbox = (0, 108, 1152, 800)):
@@ -1683,7 +1102,14 @@ class Tracker:
         # active_track_ids = [track.track_id for track in self.tracks if track.is_confirmed()]
 
         # Iterate through all track_ids in the global database
-        for track_id, data in self.global_database.items():
+        results = self.milvus_client.search_embedding(
+            query_embedding=detection_feature,
+            top_k=10,
+            store_filter=self.milvus_client.store_id
+        )
+        best_track_id = None
+        best_distance = float('inf')
+        for track_id, distance in results:
             # Skip if the track_id is currently active
             if track_id in visible_confirmed_track_ids:
                 logger.info(f"Skipping track_id {track_id} because it is confirmed and currently visible in scene")
@@ -1698,32 +1124,14 @@ class Tracker:
                 detection_feature = np.asarray(detection_feature).flatten()
                 db_feature = np.asarray(db_feature).flatten()
 
-                # Calculate cosine distance between detection feature and database feature
-                dot_product = np.dot(detection_feature, db_feature)
-                norm_detection = np.linalg.norm(detection_feature)
-                norm_db = np.linalg.norm(db_feature)
-                cosine_similarity = dot_product / (norm_detection * norm_db)
-                cosine_distance = 1 - cosine_similarity
+                logger.info(f"Candidate match: track_id={track_id}, distance={distance}")
+                if distance < threshold and distance < best_distance:
+                    best_track_id = track_id
+                    best_distance = distance
+                
+            if best_track_id is not None:
+                logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+                return best_track_id
 
-                # Only consider distances less than 0.3
-                if cosine_distance < threshold:
-                    valid_distances.append(cosine_distance)
-
-            # If there are valid distances for this track_id, find the smallest one
-            if valid_distances:
-                smallest_distance_for_track = min(valid_distances)
-                logger.info(f"Track ID {track_id} has valid distances: {valid_distances}. Smallest: {smallest_distance_for_track}")
-
-                # Check if this track_id has the smallest overall distance
-                if smallest_distance_for_track < min_distance:
-                    min_distance = smallest_distance_for_track
-                    matched_track_id = track_id
-            else:
-                logger.info(f"Smallest distance with {track_id} is more than 0.5, so we are skipping it.")
-
-        if matched_track_id is not None:
-            logger.info(f"Matched track_id {matched_track_id} with distance {min_distance}.")
-        else:
-            logger.info("No match found in global database. Assigning new track_id.")
-
-        return matched_track_id
+            logger.info("No suitable match found in Milvus. Assigning new track_id.")
+            return None

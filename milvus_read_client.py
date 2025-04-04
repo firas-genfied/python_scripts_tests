@@ -4,6 +4,8 @@ from pymilvus import connections, Collection, CollectionSchema, FieldSchema, Dat
 import numpy as np
 import logging
 from typing import List, Tuple, Union
+from config import get_milvus_host_port  # Import the helper
+from collections import defaultdict
 
 # Load .env variables
 load_dotenv()
@@ -11,35 +13,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("milvus-client")
 
-# Define shard mapping (example: adjust based on your deployment)
-SHARD_MAP = {
-    "1-10": ("localhost", "19530"),
-    "11-20": ("localhost", "19530"),
-    "21-30": ("localhost", "19530")
-}
-
-def get_shard_by_store(store_id: int) -> Tuple[str, str]:
-    for key_range, (host, port) in SHARD_MAP.items():
-        low, high = map(int, key_range.split("-"))
-        if low <= store_id <= high:
-            return host, port
-    raise ValueError(f"No shard assigned for store_id={store_id}")
-
-
-def get_milvus_connection(store_id: int) -> Tuple[str, str]:
-    # Example: 10 stores per shard
-    shard_index = (store_id - 1) // 10 + 1
-    host = os.getenv(f"MILVUS_SHARD_{shard_index}_HOST", os.getenv("MILVUS_LOCAL_HOST", "localhost"))
-    port = os.getenv(f"MILVUS_SHARD_{shard_index}_PORT", os.getenv("MILVUS_LOCAL_PORT", "19530"))
-    return host, port
-
-
 class MilvusReIDClient:
     def __init__(self, store_id: int, collection_name: str = "person_embeddings"):
         self.store_id = store_id
         self.collection_name = collection_name
 
-        host, port = get_shard_by_store(store_id)
+        host, port = get_milvus_host_port(store_id)
         logger.info(f"[store_id={store_id}] Connecting to Milvus at {host}:{port}...")
         connections.connect("default", host=host, port=port)
         logger.info("Connected to Milvus.")
@@ -113,3 +92,43 @@ class MilvusReIDClient:
             matches.append((hit.entity.get("track_id"), hit.distance))
 
         return matches
+    
+    def get_all_track_features(self) -> dict[int, List[np.ndarray]]:
+        """
+        Returns a dictionary where keys are track_ids and values are lists of embeddings (np.ndarrays),
+        filtered by the current store_id.
+        """
+        expr = f"store_id == {self.store_id}"
+        logger.info(f"Querying all embeddings for store_id={self.store_id} from collection '{self.collection_name}'...")
+
+        try:
+            results = self.collection.query(
+                expr=expr,
+                output_fields=["track_id", "embedding"],
+                limit=100_000  # adjust if needed
+            )
+        except Exception as e:
+            logger.error(f"Failed to query embeddings: {e}")
+            return {}
+
+        feature_map = defaultdict(list)
+        for row in results:
+            track_id = row["track_id"]
+            embedding = np.array(row["embedding"], dtype=np.float32)
+            feature_map[track_id].append(embedding)
+
+        return dict(feature_map)
+    
+    def delete_track(self, track_id: int, store_id: int):
+        """
+        Delete all embeddings associated with a given track_id and store_id from the collection.
+        """
+        expr = f"track_id == {track_id} and store_id == {store_id}"
+        logger.info(f"Deleting records for track_id={track_id}, store_id={store_id} from collection '{self.collection_name}'...")
+        try:
+            self.collection.delete(expr)
+            self.collection.flush()
+            logger.info(f"Successfully deleted records for track_id={track_id}, store_id={store_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete track_id={track_id}, store_id={store_id}: {e}")
+
