@@ -17,8 +17,20 @@ import aiohttp
 
 # Import your custom modules
 from processor_segment_with_transreid import Segmentation_DeepSort, confirm_human, compute_iou
-from processor_segment_with_transreid import is_entering_store_percent, has_left_store_percent, filter_duplicate_detections
-from processor_segment_with_transreid import crop_without_resize, setup_predictor
+from processor_segment_with_transreid import setup_predictor
+
+from utils.detection_utils import (
+    crop_without_resize, 
+    is_entering_store_percent, 
+    has_left_store_percent, 
+    filter_duplicate_detections, 
+    compute_iou
+)
+from utils.log_utils import log_total_memory
+from utils.processor_utils import (
+    initialize_processors, 
+    set_memory_limit
+)
 from sender import send_detection_data
 
 # Initialize TransReID model
@@ -37,6 +49,8 @@ from robust_frame_buffer import RobustFrameBuffer, FrameBufferStats
 
 from task_manager import TaskManager
 
+from milvus_read_client import MilvusReIDClient
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -44,37 +58,7 @@ logger = logging.getLogger(__name__)
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|error_concealment;1"
 
-def log_total_memory(gpu_processors):
-    total_allocated = 0
-    total_reserved = 0
-    for idx, processor in enumerate(gpu_processors):
-        device = processor.device  # Ensure each processor has a 'device' attribute.
-        allocated = torch.cuda.memory_allocated(device)
-        reserved = torch.cuda.memory_reserved(device)
-        logger.info(
-            f"Processor {idx} on {device}: allocated = {allocated/1024**2:.2f} MB, "
-            f"reserved = {reserved/1024**2:.2f} MB"
-        )
-        total_allocated += allocated
-        total_reserved += reserved
-        
-    logger.info(
-        f"Total across all processors: allocated = {total_allocated/1024**2:.2f} MB, "
-        f"reserved = {total_reserved/1024**2:.2f} MB"
-    )
-
-def set_memory_limit(fraction=0.9):
-    """Limit GPU memory usage to a fraction of available memory"""
-    if torch.cuda.is_available():
-        device = torch.device("cuda:0")
-        device_properties = torch.cuda.get_device_properties(device)
-        total_memory = device_properties.total_memory
-        
-        # Set a limit on reserved memory
-        max_memory = int(total_memory * fraction)
-        torch.cuda.set_per_process_memory_fraction(fraction, device)
-        
-        logger.info(f"Set GPU memory limit to {fraction * 100:.0f}% of total ({max_memory / (1024**3):.2f} GB)")
+MILVUS_CLIENTS = {}
 
 def get_time_window_list(image_batch):
     """
@@ -128,25 +112,6 @@ def get_time_window_single_pass(image_batch):
     return (min_ts.isoformat() if min_ts else None, 
             max_ts.isoformat() if max_ts else None)
 
-async def initialize_processors(gpu_processors):
-    """Initialize processors in sequence to avoid memory spikes"""
-    for i, processor in enumerate(gpu_processors):
-        logger.info(f"Initializing processor {i}...")
-        
-        # Force initialization of models if not already done
-        if not hasattr(processor, 'model') or processor.model is None:
-            # Initialize model here or call a method that does
-            pass
-            
-        await asyncio.sleep(0.5)  # Brief pause between initializations
-        
-        # Log memory after each initialization
-        if processor.device.type == "cuda":
-            allocated = torch.cuda.memory_allocated(processor.device) / (1024**2)
-            reserved = torch.cuda.memory_reserved(processor.device) / (1024**2)
-            logger.info(f"After initializing processor {i}: allocated={allocated:.1f}MB, reserved={reserved:.1f}MB")
-
-
 async def fetch_camera_config(url: str) -> dict:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
@@ -154,6 +119,12 @@ async def fetch_camera_config(url: str) -> dict:
             camera_list = await response.json()
             # config = await response.json()
             return {"cameras": camera_list}
+
+
+def get_milvus_client_for_store(store_id: int) -> MilvusReIDClient:
+    if store_id not in MILVUS_CLIENTS:
+        MILVUS_CLIENTS[store_id] = MilvusReIDClient(store_id=store_id)
+    return MILVUS_CLIENTS[store_id]
 
 # Import needed to match original code
 class TrackState:
@@ -585,9 +556,9 @@ class CameraProcessor:
     def __init__(self, camera_id, store_id):
         self.camera_id = camera_id
         self.store_id = store_id
-        
+        milvus_client = get_milvus_client_for_store(store_id)
         # Initialize tracker and status tracking
-        self.processor = Segmentation_DeepSort(info_flag=True)
+        self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = milvus_client)
         self.tracker = self.processor.tracker
         self.person_status = {}
         self.recent_entries = {"entries": [], "classified": {}}
@@ -1717,14 +1688,6 @@ async def main():
     
     logger.info("Starting RTSP Stream Processor service")
     
-    # # Create processor
-    # processor = RTSPStreamProcessor(
-    #     batch_size=args.batch_size,
-    #     batch_interval=args.batch_interval,
-    #     processing_fps=args.fps
-    # )
-    
-    # Load camera configuration
     processor = None
     try:
         camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")

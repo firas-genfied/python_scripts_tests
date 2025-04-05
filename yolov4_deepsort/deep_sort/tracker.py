@@ -11,6 +11,7 @@ import logging
 import os
 from collections import defaultdict
 from milvus_read_client import MilvusReIDClient
+from tracker_utils import calculate_cosine_distance, compute_iou, overlap_ratio_single_box, is_entering_store_percent
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
@@ -23,137 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def calculate_cosine_distance(feature_a, feature_b):
-    """
-    Calculate cosine distance between two feature vectors.
-    Handles various input formats safely including None values.
-    
-    Args:
-        feature_a: First feature vector in any numpy array format
-        feature_b: Second feature vector in any numpy array format
-    
-    Returns:
-        float: Cosine distance (0 to 2, where 0 is identical)
-    """
-    # Handle None inputs
-    if feature_a is None or feature_b is None:
-        return float('inf')  # Maximum distance for None features
-        
-    # Ensure features are flattened to 1D
-    feature_a = np.asarray(feature_a).flatten()
-    feature_b = np.asarray(feature_b).flatten()
-    
-    # Handle zero-norm vectors
-    norm_a = np.linalg.norm(feature_a)
-    norm_b = np.linalg.norm(feature_b)
-    
-    if norm_a < 1e-10 or norm_b < 1e-10:
-        return 1.0  # Maximum dissimilarity for zero vectors
-    
-    # Calculate cosine similarity
-    cosine_similarity = np.dot(feature_a, feature_b) / (norm_a * norm_b)
-    
-    # Clamp to [-1, 1] to handle numerical errors
-    cosine_similarity = max(min(cosine_similarity, 1.0), -1.0)
-    
-    # Convert to distance (0 to 2)
-    return 1.0 - cosine_similarity
-
-def compute_iou(boxA, boxB):
-    """
-    Compute the Intersection-over-Union (IoU) of two bounding boxes.
-    Each box is [x1, y1, x2, y2].
-    """
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    interArea = interW * interH
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    if (boxAArea + boxBArea - interArea) == 0:
-        return 0.0
-    return interArea / float(boxAArea + boxBArea - interArea)
-
-def overlap_ratio_single_box(boxA, boxB, ratio_threshold=0.5):
-    """
-    Computes the fraction of boxA's area that is overlapped by boxB.
-    If the fraction is greater than or equal to ratio_threshold, returns True.
-
-    Args:
-        boxA (list or tuple): [x1, y1, x2, y2] for the first bounding box.
-        boxB (list or tuple): [x1, y1, x2, y2] for the second bounding box.
-        ratio_threshold (float): The threshold for the overlap fraction. Default is 0.5.
-
-    Returns:
-        (bool, float): Tuple where the first element is True if the fraction of boxA
-                       overlapped by boxB is >= ratio_threshold, and the second element
-                       is the actual fraction.
-    """
-    xA1, yA1, xA2, yA2 = boxA
-    xB1, yB1, xB2, yB2 = boxB
-
-    # Compute area of boxA
-    areaA = max(0, xA2 - xA1) * max(0, yA2 - yA1)
-    if areaA <= 0:
-        return False, 0.0
-
-    # Compute intersection coordinates
-    inter_x1 = max(xA1, xB1)
-    inter_y1 = max(yA1, yB1)
-    inter_x2 = min(xA2, xB2)
-    inter_y2 = min(yA2, yB2)
-
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    intersection_area = inter_w * inter_h
-
-    if intersection_area <= 0:
-        return False, 0.0
-
-    overlap_fraction = intersection_area / float(areaA)
-    return (overlap_fraction >= ratio_threshold, overlap_fraction)
-
-
-def is_entering_store_percent(bbox, line_y, threshold=0.60):
-    """
-    Determines if more than a given percentage of the bounding box is below a horizontal line.
-
-    In image coordinates (y increases downward):
-      - If the entire bbox is below the line (y1 >= line_y), fraction = 1.0.
-      - If the entire bbox is above the line (y2 < line_y), fraction = 0.0.
-      - Otherwise, fraction = (y2 - line_y) / (y2 - y1).
-
-    Args:
-        bbox (list or tuple): The bounding box [x1, y1, x2, y2].
-        line_y (int): The y-coordinate of the horizontal line marking the store entrance.
-        threshold (float): The fraction threshold (default 0.70 means 70%).
-
-    Returns:
-        (bool, float): A tuple where the first element is True if the fraction below the line
-                       is greater than the threshold (i.e. the person is inside the store), 
-                       and the second element is the calculated fraction.
-    """
-    y1 = bbox[1]
-    y2 = bbox[3]
-    height = y2 - y1
-    if height <= 0:
-        return False, 0.0
-
-    # If the entire bbox has entered
-    if y1 >= line_y:
-        fraction_below = 1.0
-        return False,fraction_below
-    # If the entire bbox has not entered
-    elif y2 <= line_y:
-        fraction_below = 0.0
-        return False,fraction_below
-    else:
-        fraction_below = (y2 - line_y) / height
-
-    return fraction_below > threshold and fraction_below < 0.9, fraction_below
 
 class Tracker:
     """
@@ -161,7 +31,7 @@ class Tracker:
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5, milvus_client = None):
+    def __init__(self, metric, camera_id, store_id, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5, milvus_client = None):
         self.metric = metric
         self.max_iou_distance = max_iou_distance
         self.max_age = max_age
@@ -173,14 +43,16 @@ class Tracker:
         self.tracks = []
         self._next_id = 1
         self.milvus_client = milvus_client
+        self.camera_id = camera_id
+        self.store_id = store_id
 
         # Load or create the global database
         self.retired_ids = set()
 
-    def mark_track_as_left(self, track, store_id):
+    def mark_track_as_left(self, track):
         """Mark a track as left and retire its ID."""
         try:
-            self.milvus_client.delete_track(track_id=track.track_id, store_id=store_id)
+            self.milvus_client.delete_track(track_id=track.track_id, store_id=self.store_id)
             logger.info(f"Deleted track {track.track_id} from Milvus collection.")
         except Exception as e:
             logger.error(f"Error deleting track {track.track_id} from Milvus: {e}")
@@ -205,14 +77,13 @@ class Tracker:
                 self.milvus_client.insert_embedding(
                     track_id=track.track_id,
                     embedding=detection.feature,
-                    store_id=self.milvus_client.store_id,
-                    camera_id=camera_id,
+                    store_id=self.store_id,
+                    camera_id=self.camera_id,
                     timestamp=timestamp
                 )
                 logger.info(f"[Milvus] Inserted feature for track_id {track.track_id}.")
             except Exception as e:
                 logger.error(f"[Milvus] Failed to insert feature for track_id {track.track_id}: {e}")
-
 
     def predict(self):
         """Propagate track state distributions one time step forward."""
@@ -237,7 +108,7 @@ class Tracker:
             results = self.milvus_client.search_embedding(
                 query_embedding=feature,
                 top_k=max_candidates * 2,
-                store_filter=self.milvus_client.store_id
+                store_filter=self.store_id
             )
 
             # Filter and sort
@@ -259,8 +130,6 @@ class Tracker:
         except Exception as e:
             logger.error(f"[Milvus] Error in _find_next_best_match: {e}")
             return None, float('inf')
-
-
 
     def _deduplicate_tracks(self):
         """
@@ -592,8 +461,14 @@ class Tracker:
                         logger.info(f"Center detection {det_idx} gets forced match with ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     else:
+                        try:
+                            all_ids = self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            alt_id = min(all_ids) if all_ids else self._next_id
+                        except Exception as e:
+                            logger.error(f"Error fetching all track IDs from Milvus: {e}")
+                            alt_id = self._next_id
+
                         # Fallback to oldest ID if no good match
-                        alt_id = min(self.global_database.keys()) if self.global_database else self._next_id
                         logger.info(f"Center detection {det_idx} gets fallback ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     
@@ -691,7 +566,12 @@ class Tracker:
                         final_assignments[det_idx] = (alt_id, False)
                     else:
                         # Fallback to oldest ID
-                        alt_id = min(self.global_database.keys()) if self.global_database else self._next_id
+                        try:
+                            all_ids = self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            alt_id = min(all_ids) if all_ids else self._next_id
+                        except Exception as e:
+                            logger.error(f"Error fetching all track IDs from Milvus: {e}")
+                            alt_id = self._next_id
                         logger.info(f"Center detection {det_idx} gets fallback ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     
@@ -765,42 +645,48 @@ class Tracker:
                     detection.feature, class_name
                 )
             
-                # Copy features from global database if available
-                if track_id in self.global_database:
-                    new_track.features = self.global_database[track_id]["features"]
-                    logger.info(f"Created track with ID {track_id} (reidentified from database with {len(new_track.features)} features)")
-                else:
-                    logger.info(f"Created new track with ID {track_id}")
+                try:
+                    db_features = self.milvus_client.get_features_by_track_id(
+                        store_id=self.store_id,
+                        track_id=track_id
+                    )
+                    if db_features:
+                        new_track.features = db_features
+                        logger.info(f"Created track with ID {track_id} (reidentified from Milvus with {len(new_track.features)} features)")
+                    else:
+                        logger.info(f"Created new track with ID {track_id} (no features found in Milvus)")
+                except Exception as e:
+                    logger.error(f"Failed to fetch features from Milvus for track_id {track_id}: {e}")
+                    logger.info(f"Created new track with ID {track_id} (fallback)")
             
                 # Add the new track
                 self.tracks.append(new_track)
             else:
                 existing_tracks = [t for t in self.tracks if t.track_id == track_id]
                 best_track = max(existing_tracks, key=lambda t: t.hits)
+                try:
+
                 # best_track.update(self.kf, detection)
                 # logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
-                if track_id in self.global_database and self.global_database[track_id]["features"]:
-                    if not best_track.features:
-                        # If track has no features, copy all from database
-                        best_track.features = self.global_database[track_id]["features"].copy()
-                        logger.info(f"Restored {len(best_track.features)} features from database for track {track_id}")
-                    elif len(self.global_database[track_id]["features"]) > len(best_track.features):
-                        # If database has more features, merge them with deduplication
-                        db_features = self.global_database[track_id]["features"]
-                        # Only add features that aren't already in the track
-                        for db_feature in db_features:
-                            is_duplicate = False
-                            for existing_feature in best_track.features:
-                                if np.array_equal(db_feature, existing_feature):
-                                    is_duplicate = True
-                                    break
-                            if not is_duplicate:
-                                best_track.features.append(db_feature)
-                            # if db_feature not in best_track.features:
-                            #     best_track.features.append(db_feature)
-                        logger.info(f"Merged features from database for track {track_id}, now has {len(best_track.features)} features")
-
-                # Update the best track with the detection (from option C)
+                # if track_id in self.global_database and self.global_database[track_id]["features"]:
+                    db_features = self.milvus_client.get_features_by_track_id(
+                        store_id=self.store_id,
+                        track_id=track_id
+                    )
+                    if db_features:
+                        if not best_track.features:
+                            best_track.features = db_features
+                        elif len(db_features) > len(best_track.features):
+                            added = 0
+                            for db_feature in db_features:
+                                if not any(np.array_equal(db_feature, f) for f in best_track.features):
+                                    best_track.features.append(db_feature)
+                                    added += 1
+                            logger.info(f"[Milvus] Merged {added} new features for track {track_id}. Total now: {len(best_track.features)}")
+                    else:
+                        logger.info(f"[Milvus] No features found to restore for track {track_id}")
+                except Exception as e:
+                    logger.error(f"[Milvus] Failed to fetch/merge features for track {track_id}: {e}")
                 best_track.update(self.kf, detection)
                 self._insert_feature_into_milvus(best_track, detection)
                 logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
@@ -822,15 +708,13 @@ class Tracker:
         if features:
             self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
 
-
-    def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, store_id, max_candidates=10):
+    def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
         Find the best match regardless of threshold from Milvus, used for center detections.
 
         Args:
             feature: Feature vector to match
             assigned_ids: Set of already assigned IDs to exclude
-            store_id: The store ID context for sharded vector space
             max_candidates: Maximum number of candidates to consider
 
         Returns:
@@ -838,7 +722,7 @@ class Tracker:
         """
         try:
             # Get candidate track IDs and their features from Milvus
-            track_features_dict = self.milvus_client.get_all_track_features(store_id)
+            track_features_dict = self.milvus_client.get_all_track_features(self.store_id)
 
             all_matches = []
 
@@ -860,35 +744,34 @@ class Tracker:
             return None
 
                 
-        def _calculate_distance(self, feature, track):
-            """
-            Calculate the feature distance between a detection and a track.
+    def _calculate_distance(self, feature, track):
+        """
+        Calculate the feature distance between a detection and a track.
+        
+        Args:
+            feature: The feature vector of the detection
+            track: The track object
             
-            Args:
-                feature: The feature vector of the detection
-                track: The track object
-                
-            Returns:
-                float: The distance score (lower is better)
-            """
-            if not track.features:
-                return float('inf')
-            
-            # Use the track's last feature for comparison
-            cost_matrix = self.metric.distance(
-                np.array([feature]), 
-                np.array([track.features[-1]])
-            )
-            return cost_matrix[0, 0]
+        Returns:
+            float: The distance score (lower is better)
+        """
+        if not track.features:
+            return float('inf')
+        
+        # Use the track's last feature for comparison
+        cost_matrix = self.metric.distance(
+            np.array([feature]), 
+            np.array([track.features[-1]])
+        )
+        return cost_matrix[0, 0]
 
-    def _calculate_distance_to_id(self, feature, track_id, store_id):
+    def _calculate_distance_to_id(self, feature, track_id):
         """
         Calculate the distance between a feature vector and a specific track ID using Milvus.
 
         Args:
             feature: Feature vector to compare
             track_id: Track ID to compare against
-            store_id: Unique identifier for the store context
 
         Returns:
             float: The best distance score (lower is better)
@@ -903,7 +786,7 @@ class Tracker:
 
         # Fallback to Milvus if not found in active tracks
         try:
-            db_features = self.milvus_client.get_features_by_track_id(store_id, track_id)
+            db_features = self.milvus_client.get_features_by_track_id(self.store_id, track_id)
             if db_features:
                 best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
                 logger.info(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
@@ -914,7 +797,6 @@ class Tracker:
             logger.error(f"[Tracker] error querying Milvus for track ID {track_id}: {e}")
 
         return float('inf')
-
 
     def _find_all_potential_matches(self, feature, bbox, max_candidates=10):
         """
@@ -962,7 +844,7 @@ class Tracker:
         milvus_matches = self.milvus_client.search_embedding(
             query_embedding=feature,
             top_k=max_candidates * 2,
-            store_filter=self.milvus_client.store_id
+            store_filter=self.store_id
         )
 
 
@@ -1051,23 +933,21 @@ class Tracker:
         results = self.milvus_client.search_embedding(
             query_embedding=detection_feature,
             top_k=10,
-            store_filter=self.milvus_client.store_id
+            store_filter=self.store_id
         )
         best_track_id = None
         best_distance = float('inf')
         for track_id, distance in results:
             logger.info(f"Candidate match from Milvus: track_id={track_id}, distance={distance}")
-            for db_feature in data["features"]:
-                if distance < threshold and distance < best_distance:
-                    best_track_id = track_id
-                    best_distance = distance
-            if best_track_id is not None:
-                logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
-                return best_track_id
-            
+            if distance < threshold and distance < best_distance:
+                best_track_id = track_id
+                best_distance = distance
+        if best_track_id is not None:
+            logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+            return best_track_id
+        else:    
             logger.info("No match found in Milvus database below threshold.")
             return None
-
 
     def _match_with_global_database(self, detection_feature, detection_bbox, center_bbox = (0, 108, 1152, 800)):
         """
@@ -1105,7 +985,7 @@ class Tracker:
         results = self.milvus_client.search_embedding(
             query_embedding=detection_feature,
             top_k=10,
-            store_filter=self.milvus_client.store_id
+            store_filter=self.store_id
         )
         best_track_id = None
         best_distance = float('inf')
@@ -1118,20 +998,12 @@ class Tracker:
             # Initialize a list to store distances less than 0.1 for this track_id
             valid_distances = []
 
-            # Iterate through all features for this track_id
-            for db_feature in data["features"]:
-                # Ensure the features are in the correct format (1D arrays)
-                detection_feature = np.asarray(detection_feature).flatten()
-                db_feature = np.asarray(db_feature).flatten()
-
-                logger.info(f"Candidate match: track_id={track_id}, distance={distance}")
-                if distance < threshold and distance < best_distance:
-                    best_track_id = track_id
-                    best_distance = distance
-                
-            if best_track_id is not None:
-                logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
-                return best_track_id
-
+            if distance < threshold and distance < best_distance:
+                best_track_id = track_id
+                best_distance = distance
+        if best_track_id is not None:
+            logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+            return best_track_id
+        else:
             logger.info("No suitable match found in Milvus. Assigning new track_id.")
             return None

@@ -14,8 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("milvus-client")
 
 class MilvusReIDClient:
-    def __init__(self, store_id: int, collection_name: str = "person_embeddings"):
-        self.store_id = store_id
+    def __init__(self, store_id: int,collection_name: str = "person_embeddings"):
         self.collection_name = collection_name
 
         host, port = get_milvus_host_port(store_id)
@@ -59,7 +58,7 @@ class MilvusReIDClient:
         timestamp: int
     ):
         data = [[track_id], [embedding], [store_id], [camera_id], [timestamp]]
-        logger.info(f"Inserting embedding for track_id={track_id}, store_id={self.store_id}")
+        logger.info(f"Inserting embedding for track_id={track_id}, store_id={store_id}")
         self.collection.insert(data)
         self.collection.flush()
 
@@ -93,13 +92,13 @@ class MilvusReIDClient:
 
         return matches
     
-    def get_all_track_features(self) -> dict[int, List[np.ndarray]]:
+    def get_all_track_features(self, store_id) -> dict[int, List[np.ndarray]]:
         """
         Returns a dictionary where keys are track_ids and values are lists of embeddings (np.ndarrays),
         filtered by the current store_id.
         """
-        expr = f"store_id == {self.store_id}"
-        logger.info(f"Querying all embeddings for store_id={self.store_id} from collection '{self.collection_name}'...")
+        expr = f"store_id == {store_id}"
+        logger.info(f"Querying all embeddings for store_id={store_id} from collection '{self.collection_name}'...")
 
         try:
             results = self.collection.query(
@@ -118,6 +117,28 @@ class MilvusReIDClient:
             feature_map[track_id].append(embedding)
 
         return dict(feature_map)
+    
+    def get_all_track_ids(self, store_id: int) -> List[int]:
+        """
+        Fetch all unique track_ids in the collection for a given store_id.
+        Assumes the collection has a 'track_id' and 'store_id' field.
+        """
+        try:
+            collection = Collection(self.collection_name)
+
+            # Ensure index is loaded
+            collection.load()
+
+            expr = f"store_id == {store_id}"
+            output_fields = ["track_id"]
+            results = collection.query(expr, output_fields=output_fields)
+
+            # Extract unique track_ids
+            track_ids = list({r["track_id"] for r in results})
+            return track_ids
+        except Exception as e:
+            logger.error(f"Error fetching track_ids for store_id {store_id} from Milvus: {e}")
+            return []
     
     def delete_track(self, track_id: int, store_id: int):
         """
