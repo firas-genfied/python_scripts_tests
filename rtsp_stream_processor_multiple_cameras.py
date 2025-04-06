@@ -715,10 +715,6 @@ class CameraProcessor:
                     
                 })
         
-        # Save tracker state - only save every 30 frames to reduce I/O
-        if self.frame_count % 30 == 0:
-            self.tracker.save_global_database()
-        
         # Create result dictionary
         result = {
             "camera_id": str(self.camera_id),

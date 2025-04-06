@@ -647,8 +647,8 @@ class Tracker:
             
                 try:
                     db_features = self.milvus_client.get_features_by_track_id(
-                        store_id=self.store_id,
-                        track_id=track_id
+                        track_id = track_id,
+                        store_id=self.store_id
                     )
                     if db_features:
                         new_track.features = db_features
@@ -670,8 +670,8 @@ class Tracker:
                 # logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
                 # if track_id in self.global_database and self.global_database[track_id]["features"]:
                     db_features = self.milvus_client.get_features_by_track_id(
+                        track_id = track_id,
                         store_id=self.store_id,
-                        track_id=track_id
                     )
                     if db_features:
                         if not best_track.features:
@@ -786,7 +786,7 @@ class Tracker:
 
         # Fallback to Milvus if not found in active tracks
         try:
-            db_features = self.milvus_client.get_features_by_track_id(self.store_id, track_id)
+            db_features = self.milvus_client.get_features_by_track_id(track_id, self.store_id)
             if db_features:
                 best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
                 logger.info(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
@@ -981,7 +981,6 @@ class Tracker:
         # Get the list of currently active track IDs
         # active_track_ids = [track.track_id for track in self.tracks if track.is_confirmed()]
 
-        # Iterate through all track_ids in the global database
         results = self.milvus_client.search_embedding(
             query_embedding=detection_feature,
             top_k=10,
