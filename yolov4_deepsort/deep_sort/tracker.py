@@ -25,9 +25,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Tracker:
+class AsyncTracker:
     """
-    This is the multi-target tracker.
+    This is the Asynchronous multi-target tracker.
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
@@ -49,10 +49,10 @@ class Tracker:
         # Load or create the global database
         self.retired_ids = set()
 
-    def mark_track_as_left(self, track):
+    async def mark_track_as_left(self, track):
         """Mark a track as left and retire its ID."""
         try:
-            self.milvus_client.delete_track(track_id=track.track_id, store_id=self.store_id)
+            await self.milvus_client.delete_track(track_id=track.track_id, store_id=self.store_id)
             logger.info(f"Deleted track {track.track_id} from Milvus collection.")
         except Exception as e:
             logger.error(f"Error deleting track {track.track_id} from Milvus: {e}")
@@ -62,7 +62,7 @@ class Tracker:
         track.state = TrackState.Deleted
         logger.info(f"Track {track.track_id} retired and removed from global database.")
     
-    def _insert_feature_into_milvus(self, track, detection):
+    async def _insert_feature_into_milvus(self, track, detection):
         """
         Insert the detection's feature into Milvus for a confirmed track.
 
@@ -74,7 +74,7 @@ class Tracker:
             try:
                 camera_id = getattr(detection, "camera_id", 0)
                 timestamp = getattr(detection, "timestamp", 0)
-                self.milvus_client.insert_embedding(
+                await self.milvus_client.insert_embedding(
                     track_id=track.track_id,
                     embedding=detection.feature,
                     store_id=self.store_id,
@@ -90,7 +90,7 @@ class Tracker:
         for track in self.tracks:
             track.predict(self.kf)
     
-    def _find_next_best_match(self, feature, assigned_ids, max_candidates=5, distance_threshold=0.7):
+    async def _find_next_best_match(self, feature, assigned_ids, max_candidates=5, distance_threshold=0.7):
         """
         Find the next best match from Milvus, excluding already assigned IDs,
         and return both the best track ID and its distance.
@@ -105,7 +105,7 @@ class Tracker:
             Tuple[int or None, float]: (track_id, distance) or (None, inf) if no good match found.
         """
         try:
-            results = self.milvus_client.search_embedding(
+            results = await self.milvus_client.search_embedding(
                 query_embedding=feature,
                 top_k=max_candidates * 2,
                 store_filter=self.store_id
@@ -164,7 +164,7 @@ class Tracker:
         # Update the tracks list
         self.tracks = tracks_to_keep
 
-    def update(self, detections):
+    async def update(self, detections):
         """
         Comprehensive update method with location constraint for new ID creation.
         Includes an exception for the first 250 frames (10 seconds) to handle abrupt camera startup.
@@ -251,7 +251,7 @@ class Tracker:
                 # If no features exist yet, update immediately:
                 if not track.features:
                     track.update(self.kf, detection)
-                    self._insert_feature_into_milvus(track, detection)
+                    await self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
                     continue
 
@@ -262,7 +262,7 @@ class Tracker:
                 # If the distance is below threshold, update the track:
                 if distance < self.matching_threshold:
                     track.update(self.kf, detection)
-                    self._insert_feature_into_milvus(track, detection)
+                    await self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                     if detection_idx in unmatched_detections:
                         unmatched_detections.remove(detection_idx)
@@ -320,7 +320,7 @@ class Tracker:
                 logger.info(f"Detection with bbox {bbox} is below threshold y={new_id_y_threshold}, must use existing ID.")
             
             # For non-entering detections, find all potential ID matches from the database
-            database_matches = self._find_all_potential_matches(detection.feature, bbox)
+            database_matches = await self._find_all_potential_matches(detection.feature, bbox)
             
             if det_idx not in potential_matches:
                 potential_matches[det_idx] = []
@@ -386,7 +386,7 @@ class Tracker:
             
             # Use more comprehensive matching specifically for overlapping detections
             logger.info(f"Matching overlapping detection {bbox} with global database.")
-            matched_track_id = self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
+            matched_track_id = await self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
             
             # Check if this ID is already assigned in this frame
             if matched_track_id is not None and matched_track_id in assigned_ids:
@@ -397,8 +397,8 @@ class Tracker:
                 existing_detection = detections[existing_det_idx]
                 
                 # Calculate distances for both detections to this ID
-                current_distance = self._calculate_distance_to_id(detection.feature, matched_track_id)
-                existing_distance = self._calculate_distance_to_id(existing_detection.feature, matched_track_id)
+                current_distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
+                existing_distance = await self._calculate_distance_to_id(existing_detection.feature, matched_track_id)
                 
                 logger.info(f"Distance comparison: Current detection ({det_idx}): {current_distance}, " +
                         f"Existing detection ({existing_det_idx}): {existing_distance}")
@@ -420,7 +420,7 @@ class Tracker:
                             f"Finding alternative for detection {det_idx}.")
                     
                     # Find the next best match from the database
-                    matched_track_id = self._find_next_best_match(detection.feature, bbox, assigned_ids)
+                    matched_track_id = await self._find_next_best_match(detection.feature, bbox, assigned_ids)
                     
                     if matched_track_id is not None:
                         logger.info(f"Found alternative match: track_id {matched_track_id}")
@@ -433,10 +433,10 @@ class Tracker:
                 if det_idx in center_detections and matched_track_id not in active_track_ids and not startup_grace_period:
                     logger.info(f"Center detection matched with inactive ID {matched_track_id}. Ensuring it is a good match.")
                     # Verify this is a sufficiently good match
-                    distance = self._calculate_distance_to_id(detection.feature, matched_track_id)
+                    distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
                     if distance > self.matching_threshold * 1.5:  # Relax threshold a bit for center detections
                         # If not a good match, find the best available active ID
-                        alternative_id = self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
+                        alternative_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                         if alternative_id is not None:
                             matched_track_id = alternative_id
                             logger.info(f"Using better alternative active ID {matched_track_id} for center detection.")
@@ -455,14 +455,14 @@ class Tracker:
                 # No match found - check if new ID is allowed
                 if det_idx in center_detections and not startup_grace_period:
                     # Center detection must use existing ID - find best available
-                    alt_id = self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
+                    alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                     
                     if alt_id is not None:
                         logger.info(f"Center detection {det_idx} gets forced match with ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     else:
                         try:
-                            all_ids = self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
                             alt_id = min(all_ids) if all_ids else self._next_id
                         except Exception as e:
                             logger.error(f"Error fetching all track IDs from Milvus: {e}")
@@ -559,7 +559,7 @@ class Tracker:
                 # No good match available
                 if is_center and not startup_grace_period:
                     # Center detection must use existing ID - find any usable match
-                    alt_id = self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
+                    alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                     
                     if alt_id is not None:
                         logger.info(f"Center detection {det_idx} forced to use existing ID {alt_id}")
@@ -567,7 +567,7 @@ class Tracker:
                     else:
                         # Fallback to oldest ID
                         try:
-                            all_ids = self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
                             alt_id = min(all_ids) if all_ids else self._next_id
                         except Exception as e:
                             logger.error(f"Error fetching all track IDs from Milvus: {e}")
@@ -624,7 +624,7 @@ class Tracker:
                 if not is_new:
                     # Update this existing track
                     track.update(self.kf, detection)
-                    self._insert_feature_into_milvus(track, detection)
+                    await self._insert_feature_into_milvus(track, detection)
                     logger.info(f"Updated existing track {track.track_id}")
                     # Remove from tracks_to_update so we don't create a duplicate
                     del tracks_to_update[track.track_id]
@@ -646,7 +646,7 @@ class Tracker:
                 )
             
                 try:
-                    db_features = self.milvus_client.get_features_by_track_id(
+                    db_features = await self.milvus_client.get_features_by_track_id(
                         track_id = track_id,
                         store_id=self.store_id
                     )
@@ -669,7 +669,7 @@ class Tracker:
                 # best_track.update(self.kf, detection)
                 # logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
                 # if track_id in self.global_database and self.global_database[track_id]["features"]:
-                    db_features = self.milvus_client.get_features_by_track_id(
+                    db_features = await self.milvus_client.get_features_by_track_id(
                         track_id = track_id,
                         store_id=self.store_id,
                     )
@@ -688,7 +688,7 @@ class Tracker:
                 except Exception as e:
                     logger.error(f"[Milvus] Failed to fetch/merge features for track {track_id}: {e}")
                 best_track.update(self.kf, detection)
-                self._insert_feature_into_milvus(best_track, detection)
+                await self._insert_feature_into_milvus(best_track, detection)
                 logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
         
         # Step 7: Remove deleted tracks
@@ -708,7 +708,7 @@ class Tracker:
         if features:
             self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
 
-    def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
+    async def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
         Find the best match regardless of threshold from Milvus, used for center detections.
 
@@ -722,7 +722,7 @@ class Tracker:
         """
         try:
             # Get candidate track IDs and their features from Milvus
-            track_features_dict = self.milvus_client.get_all_track_features(self.store_id)
+            track_features_dict = await self.milvus_client.get_all_track_features(self.store_id)
 
             all_matches = []
 
@@ -742,8 +742,7 @@ class Tracker:
         except Exception as e:
             logger.error(f"[Tracker] Error in _find_best_match_regardless_of_threshold: {e}")
             return None
-
-                
+          
     def _calculate_distance(self, feature, track):
         """
         Calculate the feature distance between a detection and a track.
@@ -765,7 +764,7 @@ class Tracker:
         )
         return cost_matrix[0, 0]
 
-    def _calculate_distance_to_id(self, feature, track_id):
+    async def _calculate_distance_to_id(self, feature, track_id):
         """
         Calculate the distance between a feature vector and a specific track ID using Milvus.
 
@@ -786,7 +785,7 @@ class Tracker:
 
         # Fallback to Milvus if not found in active tracks
         try:
-            db_features = self.milvus_client.get_features_by_track_id(track_id, self.store_id)
+            db_features = await self.milvus_client.get_features_by_track_id(track_id, self.store_id)
             if db_features:
                 best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
                 logger.info(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
@@ -798,7 +797,7 @@ class Tracker:
 
         return float('inf')
 
-    def _find_all_potential_matches(self, feature, bbox, max_candidates=10):
+    async def _find_all_potential_matches(self, feature, bbox, max_candidates=10):
         """
         Find all potential ID matches for a detection from the global database.
         
@@ -841,7 +840,7 @@ class Tracker:
         visible_ids = {vm[0] for vm in visible_matches}
     
         # Query Milvus for top potential matches for this store
-        milvus_matches = self.milvus_client.search_embedding(
+        milvus_matches = await self.milvus_client.search_embedding(
             query_embedding=feature,
             top_k=max_candidates * 2,
             store_filter=self.store_id
@@ -904,7 +903,7 @@ class Tracker:
 
         return matches, unmatched_tracks, unmatched_detections
     
-    def _match_with_global_database_all_tracks_considered(self, detection_feature, detection_bbox, center_bbox=(0, 108, 1152, 800)):
+    async def _match_with_global_database_all_tracks_considered(self, detection_feature, detection_bbox, center_bbox=(0, 108, 1152, 800)):
         """
         Match a detection with tracks in the global database.
         Returns the track_id with the smallest distance if it's below the threshold.
@@ -930,7 +929,7 @@ class Tracker:
 
         # Iterate through all track_ids in the global database without skipping any
             # Perform search on Milvus
-        results = self.milvus_client.search_embedding(
+        results = await self.milvus_client.search_embedding(
             query_embedding=detection_feature,
             top_k=10,
             store_filter=self.store_id

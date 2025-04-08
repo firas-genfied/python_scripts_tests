@@ -120,11 +120,51 @@ async def fetch_camera_config(url: str) -> dict:
             # config = await response.json()
             return {"cameras": camera_list}
 
-
-def get_milvus_client_for_store(store_id: int) -> MilvusReIDClient:
+async def get_async_milvus_client_for_store(store_id: int) -> AsyncMilvusRouterClient:
+    """Get or create an AsyncMilvusRouterClient for a store"""
+    global MILVUS_CLIENTS
     if store_id not in MILVUS_CLIENTS:
-        MILVUS_CLIENTS[store_id] = MilvusReIDClient(store_id=store_id)
+        # Initialize with router URL from config
+        router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+        client = AsyncMilvusRouterClient(
+            router_url=router_url,
+            store_id=store_id,
+            embedding_dim=768  # Match your model's embedding dimension
+        )
+        MILVUS_CLIENTS[store_id] = client
     return MILVUS_CLIENTS[store_id]
+
+async def initialize_milvus_clients(self, store_ids):
+    """Initialize AsyncMilvusRouterClient instances for all stores"""
+    # Get router URL from environment or use default
+    router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+    
+    logger.info(f"Initializing Milvus clients using router URL: {router_url}")
+    
+    # Initialize a client for each store
+    for store_id in store_ids:
+        try:
+            # Create new AsyncMilvusRouterClient
+            client = AsyncMilvusRouterClient(
+                router_url=router_url,
+                store_id=store_id,
+                embedding_dim=768,  # Match your model's embedding dimension
+                connection_timeout=10,
+                batch_size=100
+            )
+            
+            # Check connection health
+            is_healthy = await client.check_connection_health()
+            if is_healthy:
+                logger.info(f"Successfully connected to Milvus router for store {store_id}")
+                self.milvus_clients[store_id] = client
+            else:
+                logger.error(f"Failed to connect to Milvus router for store {store_id}")
+                
+        except Exception as e:
+            logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
+    
+    logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients")
 
 # Import needed to match original code
 class TrackState:
@@ -553,11 +593,11 @@ class GPUBatchProcessor:
 
 class CameraProcessor:
     """Handles per-camera tracking and processing"""
-    def __init__(self, camera_id, store_id):
+    def __init__(self, camera_id, store_id, milvus_client):
         self.camera_id = camera_id
         self.store_id = store_id
-        milvus_client = get_milvus_client_for_store(store_id)
         # Initialize tracker and status tracking
+        self.milvus_client = milvus_client
         self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = milvus_client)
         self.tracker = self.processor.tracker
         self.person_status = {}
@@ -569,10 +609,9 @@ class CameraProcessor:
         self.groups = 0
         self.false_positive_blacklist = []
         self.frame_count = 0
-        
         logger.info(f"Initialized CameraProcessor for camera {camera_id} in store {store_id}")
     
-    def process_frame(self, frame, frame_id, detections, features, timestamp):
+    async def process_frame(self, frame, frame_id, detections, features, timestamp):
         """
         Process a single frame for this camera using pre-computed detections and features
         
@@ -611,7 +650,7 @@ class CameraProcessor:
         
         # Update tracker
         self.tracker.predict()
-        self.tracker.update(detection_objs)
+        await self.tracker.update(detection_objs)
         
         # Process tracking results
         active_tracks = []
@@ -794,6 +833,7 @@ class RTSPStreamProcessor:
         for i, proc in enumerate(self.gpu_processors):
             logger.info(f"GPU processor {i}: device={proc.device}")
     
+    
     def _select_processor_for_batch(self):
         """Select the least busy processor for the next batch"""
         # If memory usage info is available, use it for balancing
@@ -807,12 +847,40 @@ class RTSPStreamProcessor:
             self.current_processor_index = (self.current_processor_index + 1) % len(self.gpu_processors)
         
         return self.gpu_processors[proc_idx]
-    
+
     def get_camera_processor(self, camera_id, store_id):
         """Get or create a camera processor for the given camera"""
         key = f"{store_id}_{camera_id}"
         if key not in self.camera_processors:
-            self.camera_processors[key] = CameraProcessor(camera_id, store_id)
+            # Use the async client from the milvus_clients dictionary
+            if store_id not in self.milvus_clients:
+                router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+                self.milvus_clients[store_id] = AsyncMilvusRouterClient(
+                    router_url=router_url,
+                    store_id=store_id,
+                    embedding_dim=768,  # match your model's feature dimension
+                    connection_timeout=10,
+                    batch_size=100
+                )
+                milvus_client = self.milvus_clients[store_id]
+
+            # milvus_client = self.milvus_clients.get(store_id)
+            # if not milvus_client:
+                # logger.error(f"No Milvus client found for store {store_id}")
+                # Initialize one if missing
+                # router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+                # milvus_client = AsyncMilvusRouterClient(
+                    # router_url=router_url,
+                    # store_id=store_id,
+                    # embedding_dim=768
+                # )
+                # self.milvus_clients[store_id] = milvus_client
+                
+            self.camera_processors[key] = CameraProcessor(
+                camera_id, 
+                store_id,
+                milvus_client=milvus_client
+            )
         return self.camera_processors[key]
     
     def add_camera(self, rtsp_url, camera_id, store_id):
@@ -1060,15 +1128,25 @@ class RTSPStreamProcessor:
                 processor = self.get_camera_processor(camera_id, store_id)
                 
                 # Create task for CPU processing
-                task = loop.run_in_executor(
-                    self.thread_pool,
-                    processor.process_frame,
+                # task = loop.run_in_executor(
+                #     self.thread_pool,
+                #     processor.process_frame,
+                #     original_frame,
+                #     frame_id,
+                #     detections,
+                #     features,
+                #     timestamp
+                # )
+
+                # Create task for processing (now async)
+                task = processor.process_frame(
                     original_frame,
                     frame_id,
                     detections,
                     features,
                     timestamp
                 )
+
                 tasks.append((task, metadata))
             
             # Wait for all processing to complete
@@ -1226,39 +1304,57 @@ class RTSPStreamProcessor:
     async def run(self):
         """Main method to run the processor"""
         logger.info("Starting RTSP Stream Processor")
-        await initialize_processors(self.gpu_processors)
-        await self.frame_buffer.start_monitors()
-        # processing_task = asyncio.create_task(self._processing_loop())
-        processing_task = self.task_manager.create_task(self._processing_loop(), category="_processing_loop")
         
-        # Start frame readers for all cameras
+        # Get unique store IDs from all cameras
+        store_ids = set(stream_info['store_id'] for stream_info in self.camera_streams.values())
+        logger.info(f"Found {len(store_ids)} unique stores: {store_ids}")
+        await self.initialize_milvus_clients(store_ids)
+        await initialize_processors(self.gpu_processors)    
+        await self.frame_buffer.start_monitors()
+        # Start the processing loop
+        processing_task = self.task_manager.create_task(
+            self._processing_loop(), 
+            category="_processing_loop"
+        )
+            # Start frame readers for all cameras
         frame_readers = []
         for camera_id in self.camera_streams:
-            self.task_manager.create_task(self.frame_reader_task(camera_id), category="frame_reader_task")
-            # frame_readers.append(frame_render)
-        
+            reader_task = self.task_manager.create_task(
+                self.frame_reader_task(camera_id), 
+                category="frame_reader_task"
+            )
+            frame_readers.append(reader_task)
+
         # Start health monitor
-        # health_monitor = asyncio.create_task(self._health_monitor())
-        self.task_manager.create_task(self._health_monitor(), category="_health_monitor")
-    
-        # all_tasks = frame_readers + [processing_task, health_monitor]
+        health_monitor = self.task_manager.create_task(
+            self._health_monitor(), 
+            category="_health_monitor"
+        )
+
         try:
-            # Note: Even though these tasks are being tracked by the task manager,
-            # we still need to await them directly here to keep the run() method running
-            # await asyncio.gather(*all_tasks)
+            # Wait for the processing task to complete (or be cancelled)
             await processing_task
         except asyncio.CancelledError:
             logger.info("Main processing task was cancelled")
         except Exception as e:
             logger.error(f"Error in main task loop: {e}")
-            # # Cancel all tasks on error
-            # for task in all_tasks:
-            #     if not task.done():
-            #         task.cancel()
         finally:
-            # Wait for any other background tasks managed by the task manager
-            # This will handle any other tasks created during execution
+            # Clean up resources
+            logger.info("Cleaning up resources...")
+
+            # Close all Milvus clients
+            for store_id, client in self.milvus_clients.items():
+                try:
+                    logger.info(f"Closing Milvus client for store {store_id}")
+                    await client.close()
+                except Exception as e:
+                    logger.error(f"Error closing Milvus client for store {store_id}: {e}")
+
+            # Wait for any remaining tasks
             await self.task_manager.wait_for_all(timeout=5.0)
+
+            logger.info("All resources cleaned up")
+
 
     async def _processing_loop(self):
         """Background task that ensures batch processing happens regularly"""
@@ -1357,6 +1453,14 @@ class RTSPStreamProcessor:
             except Exception as e:
                 logger.error(f"Error in final batch processing: {e}")
         self.thread_pool.shutdown(wait=False)
+
+        # Close all async Milvus clients
+        for store_id, client in self.milvus_clients.items():
+            try:
+                logger.info(f"Closing Milvus client for store {store_id}")
+                await client.close()
+            except Exception as e:
+                logger.error(f"Error closing Milvus client for store {store_id}: {e}")
         
         logger.info("RTSP Stream Processor successfully stopped")
 
