@@ -279,7 +279,7 @@ class AsyncMilvusRouterClient:
             logger.error(f"Error retrieving features for track_id={track_id}: {e}")
             return []
     
-    async def get_all_track_features(self, store_id, limit=100000):
+    async def get_all_track_features(self, store_id, limit=100):
         """
         Returns a dictionary where keys are track_ids and values are lists of embeddings
         
@@ -287,7 +287,7 @@ class AsyncMilvusRouterClient:
             Dict mapping track_ids to lists of feature embeddings
         """
         store_id = store_id if store_id is not None else self.store_id
-        
+        safe_limit = min(limit, 16384)
         try:
             client = await self._get_client()
             response = await client.get(

@@ -49,7 +49,7 @@ from robust_frame_buffer import RobustFrameBuffer, FrameBufferStats
 
 from task_manager import TaskManager
 
-from milvus_read_client import MilvusReIDClient
+from milvus_router_client import AsyncMilvusRouterClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -133,38 +133,6 @@ async def get_async_milvus_client_for_store(store_id: int) -> AsyncMilvusRouterC
         )
         MILVUS_CLIENTS[store_id] = client
     return MILVUS_CLIENTS[store_id]
-
-async def initialize_milvus_clients(self, store_ids):
-    """Initialize AsyncMilvusRouterClient instances for all stores"""
-    # Get router URL from environment or use default
-    router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
-    
-    logger.info(f"Initializing Milvus clients using router URL: {router_url}")
-    
-    # Initialize a client for each store
-    for store_id in store_ids:
-        try:
-            # Create new AsyncMilvusRouterClient
-            client = AsyncMilvusRouterClient(
-                router_url=router_url,
-                store_id=store_id,
-                embedding_dim=768,  # Match your model's embedding dimension
-                connection_timeout=10,
-                batch_size=100
-            )
-            
-            # Check connection health
-            is_healthy = await client.check_connection_health()
-            if is_healthy:
-                logger.info(f"Successfully connected to Milvus router for store {store_id}")
-                self.milvus_clients[store_id] = client
-            else:
-                logger.error(f"Failed to connect to Milvus router for store {store_id}")
-                
-        except Exception as e:
-            logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
-    
-    logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients")
 
 # Import needed to match original code
 class TrackState:
@@ -832,6 +800,8 @@ class RTSPStreamProcessor:
         # Log GPU device details
         for i, proc in enumerate(self.gpu_processors):
             logger.info(f"GPU processor {i}: device={proc.device}")
+        
+        self.milvus_clients = {}
     
     
     def _select_processor_for_batch(self):
@@ -862,7 +832,7 @@ class RTSPStreamProcessor:
                     connection_timeout=10,
                     batch_size=100
                 )
-                milvus_client = self.milvus_clients[store_id]
+            milvus_client = self.milvus_clients[store_id]
 
             # milvus_client = self.milvus_clients.get(store_id)
             # if not milvus_client:
@@ -883,6 +853,38 @@ class RTSPStreamProcessor:
             )
         return self.camera_processors[key]
     
+    async def initialize_milvus_clients(self, store_ids):
+        """Initialize AsyncMilvusRouterClient instances for all stores"""
+        # Get router URL from environment or use default
+        router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+        
+        logger.info(f"Initializing Milvus clients using router URL: {router_url}")
+        
+        # Initialize a client for each store
+        for store_id in store_ids:
+            try:
+                # Create new AsyncMilvusRouterClient
+                client = AsyncMilvusRouterClient(
+                    router_url=router_url,
+                    store_id=store_id,
+                    embedding_dim=768,  # Match your model's embedding dimension
+                    connection_timeout=10,
+                    batch_size=100
+                )
+                
+                # Check connection health
+                is_healthy = await client.check_connection_health()
+                if is_healthy:
+                    logger.info(f"Successfully connected to Milvus router for store {store_id}")
+                    self.milvus_clients[store_id] = client
+                else:
+                    logger.error(f"Failed to connect to Milvus router for store {store_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
+        
+        logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients")
+
     def add_camera(self, rtsp_url, camera_id, store_id):
         """Add a camera to be processed"""
         logger.info(f"Adding camera {camera_id} in store {store_id} with URL {rtsp_url}")

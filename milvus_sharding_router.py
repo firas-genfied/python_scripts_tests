@@ -126,6 +126,7 @@ class ConnectionPool:
                 key=lambda k: self.connections[shard_id][k]
             )
             self.connections[shard_id][connection_alias] = time.time()
+            logger.debug(f"Reusing existing connection for shard {shard_id}: {connection_alias}")
             return connection_alias
             
     async def update_shard_config(self, shard_id: str, config: ShardConfig):
@@ -363,9 +364,9 @@ class MilvusCollectionManager:
             return
             
         try:
-            collection = Collection(self.collection_name)
-            if not collection.is_loaded:
-                collection.load()
+            collection = Collection(self.collection_name, using=connection_alias)
+            # if not collection.is_loaded:
+            collection.load()
             self.collection_loaded[shard_id] = True
             logger.info(f"Loaded collection {self.collection_name} on shard {shard_id}")
         except Exception as e:
@@ -376,7 +377,7 @@ class MilvusCollectionManager:
         """Execute an operation on a specific shard"""
         await self.ensure_collection_loaded(connection_alias, shard_id)
         
-        collection = Collection(self.collection_name)
+        collection = Collection(self.collection_name, using=connection_alias)
         
         if operation == "insert":
             return collection.insert(**kwargs)
@@ -450,29 +451,34 @@ class RouterHealthMonitor:
                 await asyncio.sleep(self.check_interval)
                 
     async def _check_shard_health(self, shard_id: str, config: ShardConfig) -> bool:
-        """Check health of a specific shard"""
+        """Check health of a specific shard using a temporary connection"""
+        temp_alias = f"temp_health_{shard_id}"
         try:
-            # Try to get a connection to test health
-            connection_alias = f"health_check_{shard_id}"
-            
-            # Create a temporary connection
+            # Create a temporary connection with a short timeout
             connections.connect(
-                connection_alias,
+                temp_alias,
                 host=config.host,
                 port=config.port,
-                timeout=5  # Short timeout for health checks
+                timeout=5
             )
-            
-            # Check if we can reach the server and list collections
-            collections_list = utility.list_collections()
-            
-            # Cleanup
-            connections.disconnect(connection_alias)
-            
+            logger.debug(f"Temp health connection '{temp_alias}' created for shard {shard_id}")
+
+            # Perform a simple operation to verify health; here, list the collections
+            collections_list = utility.list_collections(using=temp_alias)
+            logger.debug(f"Temp health check for shard {shard_id} succeeded. Collections: {collections_list}")
+
+            # Immediately disconnect the temporary connection
+            connections.disconnect(temp_alias)
+            logger.debug(f"Temp health connection '{temp_alias}' disconnected for shard {shard_id}")
             return True
         except Exception as e:
-            logger.error(f"Health check failed for shard {shard_id}: {e}")
+            logger.error(f"Health check failed for shard {shard_id} with alias {temp_alias}: {e}")
+            try:
+                connections.disconnect(temp_alias)
+            except Exception:
+                pass
             return False
+
             
     async def is_shard_healthy(self, shard_id: str) -> bool:
         """Check if a shard is currently healthy"""
@@ -507,6 +513,7 @@ class ShardedMilvusRouter:
                 redis_url=None,
                 collection_name="person_embeddings",
                 embedding_dim=768):
+        self.embedding_dim = embedding_dim
         self.sharding_manager = ShardingManager(config_service_url, redis_url)
         self.connection_pool = ConnectionPool()
         self.collection_manager = MilvusCollectionManager(collection_name, embedding_dim)
@@ -808,23 +815,27 @@ class ShardedMilvusRouter:
         try:
             connection_alias, shard_id = await self._get_connection_for_store(request.store_id)
             
-            # Prepare deletion expression
-            expr = f"track_id == {request.track_id} && store_id == {request.store_id}"
+            # Prepare deletion expression and log details
+            expr = f"track_id == {request.track_id} and store_id == {request.store_id}"
+            logger.debug(f"Deletion expression for track {request.track_id}: {expr}")
+            logger.debug(f"Using connection alias: {connection_alias} on shard: {shard_id}")
             
-            # Execute delete operation
+            # Execute delete operation and log the operation result
             result = await self.collection_manager.execute_operation(
                 connection_alias=connection_alias,
                 shard_id=shard_id,
                 operation="delete",
                 expr=expr
             )
+            logger.debug(f"Result from delete operation: {result}")
             
             # Flush to ensure deletion is committed
-            await self.collection_manager.execute_operation(
+            flush_result = await self.collection_manager.execute_operation(
                 connection_alias=connection_alias,
                 shard_id=shard_id,
                 operation="flush"
             )
+            logger.debug(f"Result from flush operation: {flush_result}")
             
             return {
                 "success": True,
@@ -833,9 +844,9 @@ class ShardedMilvusRouter:
             }
             
         except Exception as e:
-            logger.error(f"Delete error: {e}")
+            logger.error(f"Delete error for track_id={request.track_id}, store_id={request.store_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-            
+
     async def get_topology(self):
         """Get the current sharding topology"""
         try:
@@ -939,9 +950,10 @@ class ShardedMilvusRouter:
                 # For large result sets, use pagination
                 results = []
                 offset = 0
-                page_size = 10000
+                # page_size = 10000
                 
                 while offset < limit:
+                    page_size = min(10000, 16384 - offset)
                     page = await self.collection_manager.execute_operation(
                         connection_alias=connection_alias,
                         shard_id=shard_id,
@@ -1001,11 +1013,32 @@ class ShardedMilvusRouter:
             # Convert to tracker-compatible format
             feature_map = {}
             for track_id, features_data in features_result["features"].items():
-                # Convert to int to match tracker code expectations
-                track_id_int = int(track_id)
-                # Convert each embedding to numpy array as expected by tracker
-                embeddings = [np.array(f["embedding"], dtype=np.float32) for f in features_data]
+                try:
+                    track_id_int = int(track_id)
+                except Exception as e:
+                    logger.error(f"Cannot convert track ID '{track_id}' to integer: {e}")
+                embeddings = []
+                for f in features_data:
+                    logger.debug(f"Track {track_id_int}, feature entry type: {type(f)}, value: {f}")
+                    if isinstance(f, dict) and "embedding" in f:
+                        try:
+                            emb_array = np.array(f["embedding"], dtype=np.float32)
+                            embeddings.append(emb_array)
+                        except Exception as conv_ex:
+                            logger.error(f"Error converting embedding for track {track_id_int} from dict: {conv_ex}")
+                    elif isinstance(f, (list, np.ndarray)):
+                        try:
+                            # If already a list/array, convert directly
+                            emb_array = np.array(f, dtype=np.float32)
+                            embeddings.append(emb_array)
+                        except Exception as conv_ex:
+                            logger.error(f"Error converting embedding for track {track_id_int} from list/array: {conv_ex}")
+                    else:
+                        logger.error(f"Unexpected feature format for track {track_id_int}: {f}")
                 feature_map[track_id_int] = embeddings
+                # Convert each embedding to numpy array as expected by tracker
+                # embeddings = [np.array(f["embedding"], dtype=np.float32) for f in features_data]
+                # feature_map[track_id_int] = embeddings
                 
             return feature_map
         except Exception as e:
@@ -1099,7 +1132,8 @@ async def get_topology():
 @app.get("/features/{track_id}/{store_id}")
 async def get_features(track_id: int, store_id: int):
     """Get all features for a specific track_id"""
-    return await router.get_features_by_track_id(track)
+    # return await router.get_features_by_track_id(track)
+    return await router.get_features_by_track_id(track_id, store_id)
 
 @app.get("/track/features/{track_id}/{store_id}")
 async def get_track_features_for_tracker(track_id: int, store_id: int):

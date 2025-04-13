@@ -1,0 +1,106 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+venv/
+.Python
+
+# Jupyter notebooks (if any)
+*.ipynb
+
+# Logs
+*.log
+logs/
+status_checker_logs.txt
+*.out
+*.bak
+*.tmp
+
+# Model files and weights
+*.pt
+*.pth
+*.weights
+*.onnx
+*.bin
+*.h5
+*.hdf5
+*.pkl
+*.npy
+*.npz
+TransReID/models/
+TransReID_temp/
+yolov8l.pt
+yolo11l.pt
+checkpoints/
+**/checkpoints/
+**/model_data/
+**/outputs/
+.cache/
+
+# Video/image files (large or not needed for container)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+input_videos/
+video_output/
+output_images/
+faces/
+images/
+camera1/
+
+# Intermediate or redundant folders
+output_jsons/
+data/
+tmp/
+temp/
+crops/
+overlays/
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker & Git configs
+.dockerignore
+docker-compose.yml
+Dockerfile
+Dockerfile_bkup
+.git/
+.gitignore
+
+# Environment configs
+.env
+*.yml
+*.yaml
+
+# Misc files
+=4.6.0
+unwanted_*.txt
+
+# Binaries or compiled code
+*.so
+*.dll
+*.exe
+*.a
+*.o
+
+# Milvus and other submodules (if not used in image)
+milvus/
+router-repo/
+
+# Any unwanted files by name
+tracker*.log
