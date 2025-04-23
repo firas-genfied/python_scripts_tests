@@ -11,7 +11,7 @@ import logging
 import os
 from collections import defaultdict
 from milvus_read_client import MilvusReIDClient
-from tracker_utils import calculate_cosine_distance, compute_iou, overlap_ratio_single_box, is_entering_store_percent
+from .tracker_utils import calculate_cosine_distance, compute_iou, overlap_ratio_single_box, is_entering_store_percent
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
@@ -31,9 +31,8 @@ class AsyncTracker:
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, camera_id, store_id, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5, milvus_client = None):
+    def __init__(self, metric, camera_id, store_id, milvus_client, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
         self.metric = metric
-        self.max_iou_distance = max_iou_distance
         self.max_age = max_age
         self.n_init = n_init
         self.matching_threshold = matching_threshold  # Set the matching threshold
@@ -43,6 +42,8 @@ class AsyncTracker:
         self.tracks = []
         self._next_id = 1
         self.milvus_client = milvus_client
+        self.max_iou_distance = max_iou_distance
+        logger.info(f"Successfully receievd milvus client from processor to upate values for store {self.milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
 

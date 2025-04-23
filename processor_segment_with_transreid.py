@@ -17,10 +17,10 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from yolov4_deepsort.deep_sort import preprocessing, nn_matching
 from yolov4_deepsort.deep_sort.detection import Detection
-from yolov4_deepsort.deep_sort.tracker import Tracker
+from yolov4_deepsort.deep_sort.tracker import AsyncTracker
 from yolov4_deepsort.tools import generate_detections as gdet
 from yolov4_deepsort.deep_sort.track import TrackState
-from utils.detection_utils import has_left_store_percent, is_entering_store_percent, compute_iou, filter_duplicate_detections, crop_without_resize, 
+from utils.detection_utils import has_left_store_percent, is_entering_store_percent, compute_iou, filter_duplicate_detections, crop_without_resize
 from ultralytics import YOLO
 from status_checker import improved_human_status
 from PIL import Image
@@ -135,7 +135,9 @@ class Segmentation_DeepSort:
         self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", self.max_cosine_distance, self.nn_budget)
         self.camera_id = camera_id
         self.store_id = store_id
-        self.tracker = Tracker(self.metric, camera_id, store_id, milvus_client)
+        self.milvus_client = milvus_client
+        logger.info(f"passing milvus_client to the tracker for store {self.milvus_client.store_id}")
+        self.tracker = AsyncTracker(self.metric, camera_id, store_id, self.milvus_client)
         
         # Flag for detailed information
         self.info_flag = info_flag

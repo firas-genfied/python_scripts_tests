@@ -562,11 +562,13 @@ class GPUBatchProcessor:
 class CameraProcessor:
     """Handles per-camera tracking and processing"""
     def __init__(self, camera_id, store_id, milvus_client):
+        logger.info("Inside CameraProcessor Constructor")
+        logger.info(f"Received milvus client for store {milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
         # Initialize tracker and status tracking
         self.milvus_client = milvus_client
-        self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = milvus_client)
+        self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = self.milvus_client)
         self.tracker = self.processor.tracker
         self.person_status = {}
         self.recent_entries = {"entries": [], "classified": {}}
@@ -824,6 +826,7 @@ class RTSPStreamProcessor:
         if key not in self.camera_processors:
             # Use the async client from the milvus_clients dictionary
             if store_id not in self.milvus_clients:
+                logger.info("Store ID not handled by any milvus client")
                 router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
                 self.milvus_clients[store_id] = AsyncMilvusRouterClient(
                     router_url=router_url,
@@ -832,8 +835,9 @@ class RTSPStreamProcessor:
                     connection_timeout=10,
                     batch_size=100
                 )
+            logger.info(f"Milvus Client found for store {self.milvus_clients[store_id].store_id}")
             milvus_client = self.milvus_clients[store_id]
-
+            logger.info(f"passing client for store id {milvus_client.store_id} to processor ")
             # milvus_client = self.milvus_clients.get(store_id)
             # if not milvus_client:
                 # logger.error(f"No Milvus client found for store {store_id}")
@@ -883,7 +887,7 @@ class RTSPStreamProcessor:
             except Exception as e:
                 logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
         
-        logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients")
+        logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients {self.milvus_clients}")
 
     def add_camera(self, rtsp_url, camera_id, store_id):
         """Add a camera to be processed"""
@@ -1076,7 +1080,7 @@ class RTSPStreamProcessor:
             )
             
             if not current_batch:
-                logger.debug("No frames in buffer to process")
+                logger.info("No frames in buffer to process")
                 self.processing_busy = False
                 return
            # if not self.frame_buffer:
@@ -1127,8 +1131,9 @@ class RTSPStreamProcessor:
                     continue
                 
                 # Get camera processor
+                logger.info("About to get_camera_processor for %s/%s", camera_id, store_id) 
                 processor = self.get_camera_processor(camera_id, store_id)
-                
+                logger.info(f"processor.milvus_client.store_id is {processor.milvus_client.store_id}")
                 # Create task for CPU processing
                 # task = loop.run_in_executor(
                 #     self.thread_pool,
@@ -1208,36 +1213,44 @@ class RTSPStreamProcessor:
                                f"with {result['no_of_people']} people (latency: {total_latency*1000:.1f}ms)")
                     current_time = time.time()
                     if current_time - self.last_send_time >= self.send_interval:
-                        send_task = asyncio.create_task(send_detection_data(results_to_send))
-                        send_tasks.append(send_task)
+                        payload_str = json.dumps(results_to_send, indent=2)
+                        logger.info("About to send detection payload:\n%s", payload_str)
+                        # send_task = asyncio.create_task(send_detection_data(results_to_send))
+                        # send_tasks.append(send_task)
                         self.last_send_time = current_time
                     else:
-                        logger.debug("Skipping send to maintain configured send rate")
+                        logger.info("Skipping send to maintain configured send rate")
                 except Exception as task_error:
                     logger.error(f"Error processing task: {task_error}", exc_info=True)
 
             # After collecting all results
             if results_to_send:
-                success = await send_detection_data(results_to_send)
-                if not success:
-                    logger.warning("Failed to send batch of results after multiple attempts")
+                payload_str = json.dumps(results_to_send, indent=2)
+                logger.info("About to send detection payload:\n%s", payload_str)
+                # success = await send_detection_data(results_to_send)
+                # if not success:
+                    # logger.warning("Failed to send batch of results after multiple attempts")
 
             # Make sure to send any remaining results after the loop
             if results_to_send:
                 current_time = time.time()
                 if current_time - self.last_send_time >= self.send_interval:
-                    send_task = asyncio.create_task(send_detection_data(results_to_send))
-                    send_tasks.append(send_task)
+                    payload_str = json.dumps(results_to_send, indent=2)
+                    logger.info("About to send detection payload:\n%s", payload_str)
+                    # send_task = asyncio.create_task(send_detection_data(results_to_send))
+                    # send_tasks.append(send_task)
                     self.last_send_time = current_time
                     logger.info(f"Sent final batch of {len(results_to_send)} results")
                     results_to_send = []  # Clear the list after sending
                 else:
                     # If we need to respect the interval, schedule the send for later
                     wait_time = self.send_interval - (current_time - self.last_send_time)
-                    logger.debug(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
+                    logger.info(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
                     await asyncio.sleep(wait_time)
-                    send_task = asyncio.create_task(send_detection_data(results_to_send))
-                    send_tasks.append(send_task)
+                    payload_str = json.dumps(results_to_send, indent=2)
+                    logger.info("About to send detection payload:\n%s", payload_str)
+                    # send_task = asyncio.create_task(send_detection_data(results_to_send))
+                    # send_tasks.append(send_task)
                     self.last_send_time = time.time()
                     results_to_send = []  # Clear the list after sending
                     # Wait for all send tasks to complete
@@ -1542,7 +1555,7 @@ class FrameByFrameProcessor(RTSPStreamProcessor):
                     
 
             # Immediately dispatch the result
-            await send_detection_data([result])
+            # await send_detection_data([result])
             logger.info(f"Processed frame {metadata['frame_id']} from camera {metadata['camera_id']}")
 
     async def run(self):
@@ -1747,12 +1760,12 @@ class FrameByFrameProcessor(RTSPStreamProcessor):
             # Send result
             current_time = time.time()
             if current_time - self.last_send_time >= self.send_interval:
-                success = await send_detection_data([result])
-                if not success:
-                    logger.warning(f"Failed to send detection data for frame {frame_id}")
+                # success = await send_detection_data([result])
+                # if not success:
+                    # logger.warning(f"Failed to send detection data for frame {frame_id}")
                 self.last_send_time = current_time
             else:
-                logger.debug("Skipping send to maintain configured send rate")
+                logger.info("Skipping send to maintain configured send rate")
             
             logger.info(f"Processed frame {frame_id} from camera {camera_id}: "
                       f"{len(detections)} detections, latency: {total_latency*1000:.1f}ms")
@@ -1792,10 +1805,10 @@ async def main():
     
     processor = None
     try:
-        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
+        # camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
         with open(args.config, 'r') as f:
             base_config = json.load(f)
-        base_config['cameras'] = camera_config_remote.get('cameras', [])
+        # base_config['cameras'] = camera_config_remote.get('cameras', [])
 
         system_config = base_config.get("system", {})
         buffer_config = base_config.get("buffer_settings", {})

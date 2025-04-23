@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from yolov4_deepsort.deep_sort import preprocessing, nn_matching
 from yolov4_deepsort.deep_sort.detection import Detection
-from yolov4_deepsort.deep_sort.tracker import Tracker
+from yolov4_deepsort.deep_sort.tracker import AsyncTracker
 from yolov4_deepsort.tools import generate_detections as gdet
 from ultralytics import YOLO
 from status_checker import improved_human_status
