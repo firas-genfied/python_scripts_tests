@@ -79,7 +79,7 @@ RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/w
     torchvision==0.21.0+cu126 \
     torchaudio==2.6.0+cu126
     
-RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt
+RUN pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt
 
 # Install Detectron2 from GitHub
 RUN pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git'
