@@ -8,11 +8,17 @@ ENV BASE_DIR=/app
 WORKDIR /app
 
 # Install prerequisites and add deadsnakes PPA for Python 3.10
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update
-
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      software-properties-common \
+      lsb-release \
+      gnupg2 \
+      ca-certificates \
+      apt-transport-https \
+ && add-apt-repository ppa:deadsnakes/ppa \
+ && apt-get update \
+ && rm -rf /var/lib/apt/lists/*
+ 
 # Install Python 3.10, pip, and related packages along with other system dependencies
 RUN apt-get install -y --no-install-recommends \
     python3.10 \
