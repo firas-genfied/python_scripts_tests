@@ -17,27 +17,39 @@ RUN apt-get update \
       apt-transport-https \
  && add-apt-repository ppa:deadsnakes/ppa \
  && apt-get update \
- && rm -rf /var/lib/apt/lists/*
- 
-# Install Python 3.10, pip, and related packages along with other system dependencies
-RUN apt-get install -y --no-install-recommends \
+ && apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-dev \
     python3.10-venv \
     python3-pip \
     build-essential \
-    software-properties-common \
-    apt-transport-https \
     git \
     curl \
-    ca-certificates \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
     libgl1-mesa-glx \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    ffmpeg
+# Install Python 3.10, pip, and related packages along with other system dependencies
+# RUN apt-get install -y --no-install-recommends \
+#     python3.10 \
+#     python3.10-dev \
+#     python3.10-venv \
+#     python3-pip \
+#     build-essential \
+#     software-properties-common \
+#     apt-transport-https \
+#     git \
+#     curl \
+#     ca-certificates \
+#     libglib2.0-0 \
+#     libsm6 \
+#     libxext6 \
+#     libxrender-dev \
+#     libgl1-mesa-glx \
+#     ffmpeg \
+#     && rm -rf /var/lib/apt/lists/*
 
 # Ensure that "python3" points to Python 3.10
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
