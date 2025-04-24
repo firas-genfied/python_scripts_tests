@@ -1,6 +1,6 @@
 # Use the provided NVIDIA CUDA base image with cuDNN 8 on Ubuntu 20.04
-# FROM nvidia/cuda:12.6.0-cudnn8-runtime-ubuntu20.04
-FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu20.04
+# FROM nvidia/cuda:12.6.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
 
 # Set noninteractive mode for apt-get
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,14 +10,6 @@ WORKDIR /app
 # Install prerequisites and add deadsnakes PPA for Python 3.10
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      software-properties-common \
-      lsb-release \
-      gnupg2 \
-      ca-certificates \
-      apt-transport-https \
- && add-apt-repository ppa:deadsnakes/ppa \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-dev \
     python3.10-venv \
@@ -25,6 +17,11 @@ RUN apt-get update \
     build-essential \
     git \
     curl \
+    ca-certificates \
+    lsb-release \
+    gnupg2 \
+    apt-transport-https \
+    software-properties-common \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
