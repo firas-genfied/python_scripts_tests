@@ -84,6 +84,10 @@ RUN pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/
 # Install Detectron2 from GitHub
 RUN pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git'
 
+# make sure numpy & scipy are at known‐good versions
+RUN pip3 uninstall -y numpy scipy \
+ && pip3 install --no-cache-dir --ignore-installed numpy==1.26.4 scipy==1.11.3
+
 COPY setup_models.sh /app/setup_models.sh
 RUN chmod +x /app/setup_models.sh && /app/setup_models.sh
 

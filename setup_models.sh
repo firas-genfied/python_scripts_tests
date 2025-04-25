@@ -1,34 +1,33 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-echo "🔽 Downloading TransReID pretrained model..."
-MODEL_PATH="/app/.cache/torch/checkpoints/jx_vit_base_p16_224-80ecf9dd.pth"
+# Backbone (ViT-JX) from timm releases
+BACKBONE_URL="https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_p16_224-80ecf9dd.pth"
+BACKBONE_FILE="jx_vit_base_p16_224-80ecf9dd.pth"
+BACKBONE_DIR="/app/TransReID/.cache/torch/checkpoints"
+BACKBONE_PATH="$BACKBONE_DIR/$BACKBONE_FILE"
 
-if [ -f "$MODEL_PATH" ]; then
-  echo "✅ Model already exists: $MODEL_PATH"
+# Fine-tuned TransReID model
+FINETUNE_URL="https://genfied.blob.core.windows.net/models/vit_base_msmt.pth"
+FINETUNE_FILE="vit_base_msmt.pth"
+FINETUNE_DIR="/app/TransReID/models"
+FINETUNE_PATH="$FINETUNE_DIR/$FINETUNE_FILE"
+
+# Ensure directories exist
+mkdir -p "$BACKBONE_DIR" "$FINETUNE_DIR"
+
+# Download backbone if missing
+if [ -f "$BACKBONE_PATH" ]; then
+  echo "✅ Backbone model already exists: $BACKBONE_PATH"
 else
-  echo "🔽 Downloading backbone model..."
-  mkdir -p $(dirname "$MODEL_PATH")
-  curl -L https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_p16_224-80ecf9dd.pth \
-    -o "$MODEL_PATH"
+  echo "🔽 Downloading backbone to $BACKBONE_PATH"
+  curl -L "$BACKBONE_URL" -o "$BACKBONE_PATH"
 fi
 
-# # Create the required directory for PyTorch checkpoints
-# mkdir -p /app/.cache/torch/checkpoints
-
-# # Download the vision transformer backbone weights
-# curl -L https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_p16_224-80ecf9dd.pth \
-#   -o /app/.cache/torch/checkpoints/jx_vit_base_p16_224-80ecf9dd.pth
-
-# echo "✅ Backbone model downloaded."
-
-echo "🔽 Downloading TransReID fine-tuned model..."
-FINE_TUNED_PATH="/app/models/vit_base_msmt.pth"
-
-if [ -f "$FINE_TUNED_PATH" ]; then
-  echo "✅ Fine-tuned model already exists: $FINE_TUNED_PATH"
+# Download fine-tuned if missing
+if [ -f "$FINETUNE_PATH" ]; then
+  echo "✅ Fine-tuned model already exists: $FINETUNE_PATH"
 else
-  echo "🔽 Downloading fine-tuned model..."
-  mkdir -p $(dirname "$FINE_TUNED_PATH")
-  curl -L -o "$FINE_TUNED_PATH" "https://genfied.blob.core.windows.net/models/vit_base_msmt.pth"
+  echo "🔽 Downloading fine-tuned model to $FINETUNE_PATH"
+  curl -L "$FINETUNE_URL" -o "$FINETUNE_PATH"
 fi
