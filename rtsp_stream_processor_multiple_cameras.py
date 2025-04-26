@@ -1805,10 +1805,10 @@ async def main():
     
     processor = None
     try:
-        # camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
+        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
         with open(args.config, 'r') as f:
             base_config = json.load(f)
-        # base_config['cameras'] = camera_config_remote.get('cameras', [])
+        base_config['cameras'] = camera_config_remote.get('cameras', [])
 
         system_config = base_config.get("system", {})
         buffer_config = base_config.get("buffer_settings", {})
