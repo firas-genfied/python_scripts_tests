@@ -75,7 +75,7 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     try:
         # Process the detection data directly
         formatted_data = format_detection_data(detection_data)
-        logger.info(f"Processed detection data for camera {detection_data[0].get('camera_id')}, frame {detection_data[0].get('frame_id')}")
+        logger.info(f"Processed detection data for camera {detection_data[0].get('camera_id')}, frame {detection_data[0].get('frame_id')}, time {detection_data[0].get('date_time')}")
     except Exception as e:
         logger.error(f"Failed to process detection data: {e}", exc_info=True)
         return False
@@ -86,7 +86,7 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
             async with aiohttp.ClientSession() as session:
                 async with session.post(DETECTION_ENDPOINT, json=formatted_data, timeout=10) as response:
                     if response.status == 200:
-                        logger.info(f"Data sent successfully for frame {detection_data[0].get('frame_id')}.")
+                        logger.info(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")
                         response_text = await response.text()
                         logger.debug(f"Response Text: {response_text}")
                         return True

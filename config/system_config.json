@@ -30,13 +30,13 @@
     },
     "cameras": [
       {
-        "rtsp_url": "http://takemotopiano.aa1.netvolante.jp:8190/nphMotionJpeg?Resolution=640x480&Quality=Standard&Framerate=30",
+        "rtsp_url": "rtsp://admin:admin123@4.232.129.207:8554/5/7",
         "camera_id": 1,
         "store_id": 1,
         "priority": 10
       },
       {
-        "rtsp_url": "http://takemotopiano.aa1.netvolante.jp:8190/nphMotionJpeg?Resolution=640x480&Quality=Standard&Framerate=30",
+        "rtsp_url": "rtsp://admin:admin123@4.232.129.207:8554/5/6",
         "camera_id": 2,
         "store_id": 1,
         "priority": 10
