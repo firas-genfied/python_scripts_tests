@@ -49,3 +49,10 @@ confluent-kafka
 #vectorDB
 pymilvus
 
+
+#kafka
+kafka-python
+confluent-kafka
+avro-python3
+msgpack
+aiokafka

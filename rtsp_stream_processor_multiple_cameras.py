@@ -60,79 +60,10 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|error_concealm
 
 MILVUS_CLIENTS = {}
 
-def get_time_window_list(image_batch):
-    """
-    Compute the batch time window (from and to timestamps) using list comprehension.
-    
-    Args:
-        image_batch: List of (image, metadata) tuples.
-    
-    Returns:
-        A tuple (from_timestamp, to_timestamp) in ISO format, or (None, None) if no valid timestamps.
-    """
-    timestamps = []
-    for _, metadata in image_batch:
-        ts_str = metadata.get('timestamp')
-        if ts_str:
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                timestamps.append(ts)
-            except Exception as e:
-                logger.error(f"Error parsing timestamp {ts_str}: {e}")
-    
-    if timestamps:
-        return min(timestamps).isoformat(), max(timestamps).isoformat()
-    else:
-        return None, None
+from kafka.admin import KafkaAdminClient
+import re
+from kafka import KafkaConsumer
 
-def get_time_window_single_pass(image_batch):
-    """
-    Compute the batch time window (from and to timestamps) in a single pass.
-    
-    Args:
-        image_batch: List of (image, metadata) tuples.
-    
-    Returns:
-        A tuple (from_timestamp, to_timestamp) in ISO format, or (None, None) if no valid timestamps.
-    """
-    min_ts = None
-    max_ts = None
-    for _, metadata in image_batch:
-        ts_str = metadata.get('timestamp')
-        if ts_str:
-            try:
-                ts = datetime.fromisoformat(ts_str)
-            except Exception as e:
-                logger.error(f"Error parsing timestamp {ts_str}: {e}")
-                continue
-            if min_ts is None or ts < min_ts:
-                min_ts = ts
-            if max_ts is None or ts > max_ts:
-                max_ts = ts
-    return (min_ts.isoformat() if min_ts else None, 
-            max_ts.isoformat() if max_ts else None)
-
-async def fetch_camera_config(url: str) -> dict:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            response.raise_for_status()  # raises an exception for non-200 responses
-            camera_list = await response.json()
-            # config = await response.json()
-            return {"cameras": camera_list}
-
-async def get_async_milvus_client_for_store(store_id: int) -> AsyncMilvusRouterClient:
-    """Get or create an AsyncMilvusRouterClient for a store"""
-    global MILVUS_CLIENTS
-    if store_id not in MILVUS_CLIENTS:
-        # Initialize with router URL from config
-        router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
-        client = AsyncMilvusRouterClient(
-            router_url=router_url,
-            store_id=store_id,
-            embedding_dim=768  # Match your model's embedding dimension
-        )
-        MILVUS_CLIENTS[store_id] = client
-    return MILVUS_CLIENTS[store_id]
 
 # Import needed to match original code
 class TrackState:
@@ -739,10 +670,10 @@ class CameraProcessor:
         return result
 
 
-class RTSPStreamProcessor:
-    """Manages processing for multiple RTSP camera streams"""
+class KafkaProcessor:
+    """Manages processing for multiple Kafka topics/partitions"""
     def __init__(self, num_processors = 2, batch_size=8, batch_interval=0.5, processing_fps=5,
-    gpu_processors=None, frame_buffer_config=None, thread_pool_size=8, send_fps = 5):
+        gpu_processors=None, frame_buffer_config=None, thread_pool_size=8, send_fps = 5):
         # self.gpu_processor = GPUBatchProcessor(max_batch_size=batch_size)
         set_memory_limit(fraction=0.9)
         self.num_processors = num_processors
@@ -782,7 +713,6 @@ class RTSPStreamProcessor:
         self.processing_busy = False
         self.last_process_time = time.time()
         # Dictionary to store camera stream info
-        self.camera_streams = {}
         self.running = True
 
         # Performance tracking
@@ -796,8 +726,15 @@ class RTSPStreamProcessor:
         self.task_manager = TaskManager()
         self.send_interval = 1.0 / send_fps
         self.last_send_time = time.time()
+
+        self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+        self.kafka_consumer_group   = os.getenv("KAFKA_CONSUMER_GROUP")
+        self.kafka_topic_pattern    = os.getenv("KAFKA_TOPIC_PATTERN")
+        logger.info(f"Kafka bootstrap={self.kafka_bootstrap_servers},"
+                    f"group={self.kafka_consumer_group}, "
+                    f"pattern={self.kafka_topic_pattern}")
         
-        logger.info(f"Initialized RTSPStreamProcessor with {len(self.gpu_processors)} GPU processors")
+        logger.info(f"Initialized KafkaProcessor with {len(self.gpu_processors)} GPU processors")
         
         # Log GPU device details
         for i, proc in enumerate(self.gpu_processors):
@@ -888,178 +825,7 @@ class RTSPStreamProcessor:
                 logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
         
         logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients {self.milvus_clients}")
-
-    def add_camera(self, rtsp_url, camera_id, store_id):
-        """Add a camera to be processed"""
-        logger.info(f"Adding camera {camera_id} in store {store_id} with URL {rtsp_url}")
-        self.camera_streams[camera_id] = {
-            'url': rtsp_url,
-            'store_id': store_id,
-            'camera_id': camera_id,
-            'frame_count': 0,
-            'capture': None,
-            'last_frame_time': 0,
-            'frame_interval': 1.0 / self.processing_fps  # Time between frames to process
-        }
     
-    def open_stream(self, camera_id):
-        """Open the RTSP stream for a camera"""
-        if camera_id not in self.camera_streams:
-            logger.error(f"Camera {camera_id} not in camera streams")
-            return False
-            
-        stream_info = self.camera_streams[camera_id]
-        
-        # If already open, close it first
-        if stream_info['capture'] is not None:
-            try:
-                stream_info['capture'].release()
-            except Exception as e:
-                logger.error(f"Error closing existing stream: {e}")
-        
-        # Configure OpenCV capture with RTSP transport
-        capture = cv2.VideoCapture(stream_info['url'], cv2.CAP_FFMPEG)
-        # capture.set(cv2.CAP_PROP_RTSP_TRANSPORT, cv2.CAP_RTSP_TRANSPORT_TCP)  # Force TCP transport
-        
-        # Set additional parameters for RTSP streaming
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Minimize buffer size to reduce latency
-        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000) 
-        
-        if not capture.isOpened():
-            logger.error(f"Failed to open RTSP stream: {stream_info['url']}")
-            capture.release() 
-            return False
-        
-        # Reset frame count and store the capture object
-        stream_info['frame_count'] = 0
-        stream_info['capture'] = capture
-        stream_info['last_frame_time'] = time.time()
-        
-        logger.info(f"Successfully opened RTSP stream for camera {camera_id}")
-        return True
-    
-    async def frame_reader_task(self, camera_id):
-        """Task to read frames from a specific camera stream"""
-        logger.info(f"Starting frame reader for camera {camera_id}")
-        
-        if camera_id not in self.camera_streams:
-            logger.error(f"Camera {camera_id} not found in camera streams")
-            return
-            
-        stream_info = self.camera_streams[camera_id]
-
-        # Connection retry variables
-        max_connection_retries = 5
-        connection_retry_count = 0
-        connection_retry_delay = 5  # seconds
-        
-        if not self.open_stream(camera_id):
-            logger.error(f"Failed to open stream for camera {camera_id}, retrying in 5 seconds")
-            connection_retry_count += 1
-            while connection_retry_count < max_connection_retries and not self.open_stream(camera_id):
-                logger.error(f"Retry {connection_retry_count}/{max_connection_retries} failed")
-                await asyncio.sleep(connection_retry_delay)
-                connection_retry_count += 1
-            if connection_retry_count >= max_connection_retries:
-                logger.error(f"Failed to open stream for camera {camera_id} after {max_connection_retries} attempts")
-                return
-        # Local frame counters for stats
-        frames_read = 0
-        frames_skipped = 0
-        last_stats_time = time.time()
-        consecutive_failures = 0
-        max_consecutive_failures = 10
-
-        while self.running:
-            try:
-                # Check time since last processed frame
-                current_time = time.time()
-                time_since_last_frame = current_time - stream_info['last_frame_time']
-                
-                # Skip if not enough time has passed (to maintain desired FPS)
-                if time_since_last_frame < stream_info['frame_interval']:
-                    await asyncio.sleep(0.01)  # Short sleep to avoid CPU spin
-                    continue
-
-                # Check buffer status - skip reading if buffer is getting very full
-                buffer_status = self.frame_buffer.get_buffer_status()
-                camera_buffer_size = buffer_status['per_camera'].get(camera_id, 0)
-                if camera_buffer_size >= buffer_status['max_size_per_camera'] * 0.9:
-                    # Buffer almost full, skip this frame to avoid memory issues
-                    frames_skipped += 1
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # Read frame from RTSP stream
-                ret, frame = stream_info['capture'].read()
-                
-                # Handle end of stream or error
-                if not ret:
-                    consecutive_failures += 1
-                    logger.warning(f"Failed to read frame from camera {camera_id}, reconnecting...")
-                    if consecutive_failures >= max_consecutive_failures:
-                        logger.warning(f"Reconnecting to camera {camera_id} after {consecutive_failures} consecutive failures")
-                        if not self.open_stream(camera_id):
-                            logger.error(f"Failed to reconnect to camera {camera_id}, retrying in 5 seconds")
-                            await asyncio.sleep(5)
-                            continue
-                        consecutive_failures = 0
-                    else:
-                        # Small delay before retry
-                        await asyncio.sleep(0.1)
-                        continue
-                consecutive_failures = 0
-                
-                # Update frame count and last frame time
-                stream_info['frame_count'] += 1
-                stream_info['last_frame_time'] = current_time
-                frames_read += 1
-                # Create metadata for this frame
-                metadata = {
-                    'store_id': stream_info['store_id'],
-                    'camera_id': camera_id,
-                    'frame_id': stream_info['frame_count'],
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'queued_time': time.time()  # Track when frame was added to buffer
-                }
-                await self.frame_buffer.add_frame(frame, metadata)
-                # Add to buffer for batch processing
-                # self.frame_buffer.append((frame, metadata))
-                
-                # Check if it's time to process a batch
-                buffer_status = self.frame_buffer.get_buffer_status()
-                if ((not self.processing_busy and (current_time - self.last_process_time >= self.batch_interval)) or 
-                    (buffer_status['total_frames'] >= self.gpu_processors[0].max_batch_size)):
-                    # self.processing_busy = True
-                    # asyncio.create_task(self.process_batch())
-                    # self.task_manager.create_task(self.process_batch(), category="batch_processing")
-                    # self.active_processing_tasks.add(task)
-                    # task.add_done_callback(self._task_done_callback)
-                    # await self.process_batch()
-                    self.task_manager.create_task(self.process_batch(), category="batch_processing")
-                    self.last_process_time = current_time
-
-                # Log reader statistics periodically
-                if current_time - last_stats_time > 30:  # Every 30 seconds
-                    fps_actual = frames_read / (current_time - last_stats_time)
-                    skip_rate = frames_skipped / max(1, frames_read + frames_skipped) * 100
-                    buffer_size = buffer_status['per_camera'].get(camera_id, 0)
-                    
-                    logger.info(f"Camera {camera_id} stats: fps={fps_actual:.2f}, "
-                                f"skip_rate={skip_rate:.1f}%, buffer_size={buffer_size}")
-                    
-                    # Reset counters
-                    frames_read = 0
-                    frames_skipped = 0
-                    last_stats_time = current_time
-
-                # Sleep briefly to avoid hogging CPU
-                await asyncio.sleep(0.01)
-                
-            except Exception as e:
-                logger.error(f"Error in frame reader for camera {camera_id}: {e}", exc_info=True)
-                await asyncio.sleep(1)  # Sleep before retrying
-
     def _task_done_callback(self, task):
         """Callback function when a processing task completes."""
         # Remove the task from our tracking set
@@ -1318,29 +1084,35 @@ class RTSPStreamProcessor:
     
     async def run(self):
         """Main method to run the processor"""
-        logger.info("Starting RTSP Stream Processor")
-        
-        # Get unique store IDs from all cameras
-        store_ids = set(stream_info['store_id'] for stream_info in self.camera_streams.values())
-        logger.info(f"Found {len(store_ids)} unique stores: {store_ids}")
+        logger.info("Starting Kafka Stream Processor")
+
+        # 1) Discover all store-topics at startup
+        admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap_servers)
+        all_topics = admin.list_topics()
+        pattern = re.compile(r"^store-([A-Za-z0-9]+)-frames$")
+        store_ids = {
+            m.group(1)
+            for t in all_topics
+            if (m := pattern.match(t))
+        }
+        logger.info(f"Discovered stores: {store_ids}")
         await self.initialize_milvus_clients(store_ids)
+
         await initialize_processors(self.gpu_processors)    
         await self.frame_buffer.start_monitors()
+
+        # Start the Kafka consumer loop instead of Kafka readers
+        self.task_manager.create_task(
+            self._kafka_consumer_loop(),
+            category="kafka_consumer"
+        )
+
         # Start the processing loop
         processing_task = self.task_manager.create_task(
             self._processing_loop(), 
             category="_processing_loop"
         )
-            # Start frame readers for all cameras
-        frame_readers = []
-        for camera_id in self.camera_streams:
-            reader_task = self.task_manager.create_task(
-                self.frame_reader_task(camera_id), 
-                category="frame_reader_task"
-            )
-            frame_readers.append(reader_task)
-
-        # Start health monitor
+        
         health_monitor = self.task_manager.create_task(
             self._health_monitor(), 
             category="_health_monitor"
@@ -1369,6 +1141,55 @@ class RTSPStreamProcessor:
             await self.task_manager.wait_for_all(timeout=5.0)
 
             logger.info("All resources cleaned up")
+
+    async def _kafka_consumer_loop(self):
+        """
+        Pull frames off Kafka topics matching ^store-[A-Za-z0-9]+-frames$
+        and inject into our frame_buffer exactly like the Kafka reader did.
+        """
+        pattern = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
+        
+        self.kafka_consumer = KafkaConsumer(
+            group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
+            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
+            auto_offset_reset="latest",
+        )
+        self.kafka_consumer.subscribe(pattern=pattern)
+
+        logger.info(f"Subscribed to Kafka topics with pattern: {pattern.pattern}")
+        loop = asyncio.get_running_loop()
+
+        # This will block, so run it in a threadpool
+        def poll_loop():
+            for msg in self.kafka_consumer:
+                # msg.topic: e.g. "store-001-frames"
+                # msg.key: b"camera-101"
+                # msg.value: raw JPEG/PNG bytes
+                store_id = msg.topic.split("-")[1]  # e.g. "001"
+                camera_id = msg.key.decode()
+                frame_bytes = msg.value
+                timestamp = dict(msg.headers).get("timestamp",
+                                    datetime.utcnow().isoformat())
+                metadata = {
+                    "store_id": store_id,
+                    "camera_id": camera_id,
+                    "frame_id": None,       # you can generate or embed in headers
+                    "timestamp": timestamp,
+                    "queued_time": time.time()
+                }
+
+                # Decode bytes → image
+                arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+                # Add to buffer (async)
+                asyncio.run_coroutine_threadsafe(
+                    self.frame_buffer.add_frame(frame, metadata),
+                    loop
+                )
+
+        # Schedule the blocking poll in the threadpool
+        await loop.run_in_executor(None, poll_loop)
 
 
     async def _processing_loop(self):
@@ -1420,16 +1241,18 @@ class RTSPStreamProcessor:
                         mem_stats = proc.get_memory_stats()
                         gpu_utils.append(f"GPU{i}:{mem_stats['allocated_mb']:.1f}/{mem_stats['peak_allocated_mb']:.1f}MB")
                 
+                camera_count = len(buffer_status['per_camera'])
+                
                 # Log health stats
                 logger.info(f"Health: RAM={memory_info.rss/1024/1024:.1f}MB, "
                            f"CPU={cpu_percent:.1f}%, "
                            f"BufferUtil={buffer_status['utilization_percent']:.1f}%, "
                            f"GPUMem=[{', '.join(gpu_utils)}], "
-                           f"CameraCount={len(self.camera_streams)}")
+                           f"CameraCount={camera_count}")
                 
                 # Check for cameras with empty buffers (potential issues)
                 for camera_id, buffer_count in buffer_status['per_camera'].items():
-                    if buffer_count == 0 and camera_id in self.camera_streams:
+                    if buffer_count == 0:
                         logger.warning(f"Camera {camera_id} has empty buffer, may be disconnected")
                 
             except Exception as e:
@@ -1437,28 +1260,27 @@ class RTSPStreamProcessor:
 
     async def stop(self):
         """Stop the processor"""
-        logger.info("Stopping RTSP Stream Processor")
+        logger.info("Stopping KAfka Processor")
         self.running = False
-        await self.task_manager.wait_for_all(timeout=5.0)
+        # Close Kafka consumer (if stored on self)
+        if getattr(self, "kafka_consumer", None) is not None:
+            try:
+                self.kafka_consumer.close()
+                logger.info("Kafka consumer closed")
+            except Exception as e:
+                logger.error(f"Error closing Kafka consumer: {e}")
         # Wait for all active processing tasks to complete
         # if self.active_processing_tasks:
         #     logger.info(f"Waiting for {len(self.active_processing_tasks)} active processing tasks to complete")
         #     await asyncio.gather(*self.active_processing_tasks, return_exceptions=True)
-            
         try:
             await self.frame_buffer.stop()
+            logger.info("Frame buffer stopped")
         except Exception as e:
             logger.error(f"Error stopping frame buffer: {e}")
-        # Release all camera captures
-        for camera_id, stream_info in self.camera_streams.items():
-            if stream_info['capture'] is not None:
-                try:
-                    stream_info['capture'].release()
-                    logger.info(f"Released camera {camera_id}")
-                except Exception as e:
-                    logger.error(f"Error releasing camera {camera_id}: {e}")
         
-        # Process any remaining frames
+        await self.task_manager.wait_for_all(timeout=5.0)
+
         if not self.processing_busy:
             try:
                 self.processing_busy = True
@@ -1467,333 +1289,21 @@ class RTSPStreamProcessor:
                 logger.warning("Timed out waiting for final batch processing")
             except Exception as e:
                 logger.error(f"Error in final batch processing: {e}")
-        self.thread_pool.shutdown(wait=False)
 
-        # Close all async Milvus clients
         for store_id, client in self.milvus_clients.items():
             try:
-                logger.info(f"Closing Milvus client for store {store_id}")
                 await client.close()
+                logger.info(f"Closed Milvus client for store {store_id}")
             except Exception as e:
                 logger.error(f"Error closing Milvus client for store {store_id}: {e}")
         
-        logger.info("RTSP Stream Processor successfully stopped")
-
-class FrameByFrameProcessor(RTSPStreamProcessor):
-    """Processes frames individually rather than in batches"""
-    
-    def __init__(self, processing_fps=5, gpu_processors=None, num_processors = 2, frame_buffer_config=None, thread_pool_size=8, send_fps = 1,):
-        # Call parent constructor but with batch_size=1
-        super().__init__(
-            batch_size=1, 
-            batch_interval=0.001, 
-            num_processors = num_processors,
-            processing_fps=processing_fps,
-            gpu_processors=gpu_processors,
-            frame_buffer_config=frame_buffer_config,
-            thread_pool_size=thread_pool_size,
-            send_fps = send_fps
-        )        
-        # Override the thread pool to be slightly larger
-        # self.thread_pool = ThreadPoolExecutor(max_workers=8)
-        logger.info("Initialized FrameByFrameProcessor for immediate frame processing")
-    
-    async def continuous_frame_processor(self):
-        """Continuously process frames from the buffer without creating new tasks each time."""
-        loop = asyncio.get_running_loop()
-        while self.running:
-            # Fetch a single frame (or a small batch) from the buffer.
-            frame_batch = await self.frame_buffer.get_next_batch(1, strategy='oldest')
-            if not frame_batch:
-                await asyncio.sleep(0.001)
-                continue
-
-            # Unpack the frame and metadata.
-            frame, metadata = frame_batch[0]
-            
-            # Select a GPU processor (for simplicity, we assume one processor here)
-            processor = self._select_processor_for_batch()
-            
-            # Process the frame on the GPU
-            metadata, detections, features = await loop.run_in_executor(
-                None,
-                lambda: processor.process_single_frame(frame, metadata)
-            )
-
-            # If no detections, skip to the next frame
-            if not detections:
-                continue
-
-            # Process with the camera-specific tracker on the CPU
-            cam_processor = self.get_camera_processor(metadata['camera_id'], metadata['store_id'])
-            result, annotated_frame = await loop.run_in_executor(
-                self.thread_pool,
-                cam_processor.process_frame,
-                frame,
-                metadata['frame_id'],
-                detections,
-                features,
-                metadata['timestamp']
-            )
-
-            # Ensure all required fields are present regardless of detection count
-            if "image_url" not in result or not result["image_url"]:
-                result["image_url"] = ""  # Default empty string if not already set
-
-            if "camera_id" not in result or not result["camera_id"]:
-                result["camera_id"] = ""  # Default empty string if not already set
-
-            if "is_organised" not in result:
-                result["is_organised"] = True  # Default to True
-                
-            # Make sure date_time is properly set
-            if "date_time" not in result or not result["date_time"]:
-                result["date_time"] = metadata["timestamp"]
-
-            if "persons" not in result:
-                result["persons"] = []
-                    
-
-            # Immediately dispatch the result
-            await send_detection_data([result])
-            logger.info(f"Processed frame {metadata['frame_id']} from camera {metadata['camera_id']}")
-
-    async def run(self):
-        """Optimized run method using a continuous frame processor."""
-        logger.info("Starting Optimized Frame-By-Frame Processor")
-        await initialize_processors(self.gpu_processors)
-        await self.frame_buffer.start_monitors()
-        # Start the optimized continuous processing loop once
-        self.task_manager.create_task(self.continuous_frame_processor(), category="continuous_processor")
-        # Optionally, start health monitoring or other background tasks
-        self.task_manager.create_task(self._health_monitor(), category="health_monitor")
-        await self.task_manager.wait_for_all(timeout=5.0)
-    
-    async def frame_reader_task(self, camera_id):
-        """Override the frame reader to process each frame immediately"""
-        logger.info(f"Starting frame-by-frame reader for camera {camera_id}")
-        
-        if camera_id not in self.camera_streams:
-            logger.error(f"Camera {camera_id} not found in camera streams")
-            return
-            
-        stream_info = self.camera_streams[camera_id]
-
-        # Try to open the stream initially with retries
-        connection_retry_count = 0
-        max_connection_retries = 5
-        connection_retry_delay = 5  # seconds
-        
-        if not self.open_stream(camera_id):
-            logger.error(f"Failed to open stream for camera {camera_id}, retrying...")
-            connection_retry_count += 1
-            
-            while connection_retry_count < max_connection_retries and not self.open_stream(camera_id):
-                logger.error(f"Retry {connection_retry_count}/{max_connection_retries} failed")
-                await asyncio.sleep(connection_retry_delay)
-                connection_retry_count += 1
-            
-            if connection_retry_count >= max_connection_retries:
-                logger.error(f"Failed to open stream for camera {camera_id} after {max_connection_retries} attempts")
-                return
-    
-            # Track stats
-        frames_read = 0
-        frames_processed = 0
-        frames_skipped = 0
-        last_stats_time = time.time()
-        consecutive_failures = 0
-        max_consecutive_failures = 10
-        
-        while self.running:
-            try:
-                # Check time since last processed frame
-                current_time = time.time()
-                time_since_last_frame = current_time - stream_info['last_frame_time']
-                
-                # Skip if not enough time has passed (to maintain desired FPS)
-                if time_since_last_frame < stream_info['frame_interval']:
-                    await asyncio.sleep(0.01)  # Short sleep to avoid CPU spin
-                    continue
-                
-                # Read frame from RTSP stream
-                ret, frame = stream_info['capture'].read()
-                
-                # Handle end of stream or error
-                if not ret:
-                    consecutive_failures += 1
-                    logger.warning(f"Failed to read frame from camera {camera_id},  ({consecutive_failures}/{max_consecutive_failures})")
-                    if not self.open_stream(camera_id):
-                        logger.error(f"Failed to reconnect to camera {camera_id}, retrying in 5 seconds")
-
-                    if consecutive_failures >= max_consecutive_failures:
-                        logger.warning(f"Reconnecting to camera {camera_id} after {consecutive_failures} consecutive failures")
-                        if not self.open_stream(camera_id):
-                            logger.error(f"Failed to reconnect to camera {camera_id}, retrying in {connection_retry_delay} seconds")
-                            await asyncio.sleep(connection_retry_delay)
-                            continue
-                        consecutive_failures = 0
-                    else:
-                        # Small delay before retry
-                        await asyncio.sleep(0.1)
-                        continue
-                
-                # Reset failure counter on successful read
-                consecutive_failures = 0
-                
-                # Update frame count and last frame time
-                stream_info['frame_count'] += 1
-                stream_info['last_frame_time'] = current_time
-                frames_read += 1
-                # Create metadata for this frame
-                metadata = {
-                    'store_id': stream_info['store_id'],
-                    'camera_id': camera_id,
-                    'frame_id': stream_info['frame_count'],
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'queued_time': time.time()
-                }
-                added = await self.frame_buffer.add_frame(frame, metadata)
-            
-                if added:
-                    # Process this frame immediately
-                    if not self.processing_busy:
-                        self.processing_busy = True
-                        # asyncio.create_task(self.process_single_frame())
-                        self.task_manager.create_task(self.process_single_frame(), category="process_single_frame")
-                        frames_processed += 1
-                    else:
-                        # If busy, skip individual processing and wait for batch
-                        frames_skipped += 1
-                
-                # Log reader statistics periodically
-                if current_time - last_stats_time > 30:  # Every 30 seconds
-                    fps_actual = frames_read / (current_time - last_stats_time)
-                    process_rate = frames_processed / max(1, frames_read) * 100
-                    skip_rate = frames_skipped / max(1, frames_read) * 100
-                    
-                    logger.info(f"Camera {camera_id} stats: fps={fps_actual:.2f}, "
-                                f"process_rate={process_rate:.1f}%, "
-                                f"skip_rate={skip_rate:.1f}%")
-                    
-                    # Reset counters
-                    frames_read = 0
-                    frames_processed = 0
-                    frames_skipped = 0
-                    last_stats_time = current_time
-                
-                # Sleep briefly to avoid hogging CPU
-                await asyncio.sleep(0.01)
-                
-            except Exception as e:
-                logger.error(f"Error in frame reader for camera {camera_id}: {e}", exc_info=True)
-                await asyncio.sleep(1)  # Sleep before retrying
-    
-    
-    async def process_single_frame(self):
-        """Process a single frame immediately"""
-        try:
-            # Create a batch with just this one frame
-            single_frame_batch = await self.frame_buffer.get_next_batch(1, strategy='oldest')
-
-            if not single_frame_batch:
-                self.processing_busy = False
-                return
-            frame, metadata = single_frame_batch[0]
-            # Select GPU processor using round-robin
-            processor = self.gpu_processors[self.current_processor_index]
-            self.current_processor_index = (self.current_processor_index + 1) % len(self.gpu_processors)
-            
-            # Process on selected GPU
-            loop = asyncio.get_running_loop()
-            metadata, detections, features = await loop.run_in_executor(
-                None,
-                lambda: processor.process_single_frame(frame, metadata)
-            )
-            
-            # # Should only have one result
-            # if not batch_results:
-            #     self.processing_busy = False
-            #     return
-                
-            # metadata, detections, features = batch_results[0]
-            
-            # Skip if no detections
-            if not detections:
-                self.processing_busy = False
-                return
-                
-            store_id = metadata['store_id']
-            camera_id = metadata['camera_id']
-            frame_id = metadata['frame_id']
-            timestamp = metadata['timestamp']
-            
-            # Get the original frame
-            # frame, _ = single_frame_batch[0]
-            
-            # Get camera processor
-            processor = self.get_camera_processor(camera_id, store_id)
-            
-            # Process with camera-specific tracker
-            # result, annotated_frame = await loop.run_in_executor(
-            result = await loop.run_in_executor(
-                self.thread_pool,
-                processor.process_frame,
-                frame,
-                frame_id,
-                detections,
-                features,
-                timestamp
-            )
-            
-            # Calculate processing latency
-            queued_time = metadata.get('queued_time', time.time())
-            total_latency = time.time() - queued_time
-            
-            # Track processing time for stats
-            self.stats["processing_times"].append(total_latency)
-            self.stats["frames_processed"] += 1
-            
-            # Add latency info to result
-            # result['processing_latency'] = total_latency
-            
-            # Send result
-            current_time = time.time()
-            if current_time - self.last_send_time >= self.send_interval:
-                success = await send_detection_data([result])
-                if not success:
-                    logger.warning(f"Failed to send detection data for frame {frame_id}")
-                self.last_send_time = current_time
-            else:
-                logger.info("Skipping send to maintain configured send rate")
-            
-            logger.info(f"Processed frame {frame_id} from camera {camera_id}: "
-                      f"{len(detections)} detections, latency: {total_latency*1000:.1f}ms")
-            
-            # Log processing stats periodically
-            current_time = time.time()
-            if current_time - self.stats["last_stats_time"] > self.stats["stats_interval"]:
-                self._log_processing_stats()
-                self.stats["last_stats_time"] = current_time
-            
-            # Check if there are more frames to process
-            buffer_status = self.frame_buffer.get_buffer_status()
-            if buffer_status['total_frames'] > 0:
-                # Process next frame immediately
-                # asyncio.create_task(self.process_single_frame())
-                self.task_manager.create_task(self.process_single_frame(), category="process_single_frame")
-            else:
-                self.processing_busy = False
-                
-        except Exception as e:
-            logger.error(f"Error in process_single_frame: {e}", exc_info=True)
-            self.processing_busy = False
-
+        self.thread_pool.shutdown(wait=False)
+        logger.info("Kafka Stream Processor successfully stopped")
 
 async def main():
-    """Main entry point for the RTSP processing service"""
-    parser = argparse.ArgumentParser(description='RTSP Stream Processor for Retail Analytics')
-    parser.add_argument('--config', default='camera_config.json', help='Path to camera configuration file')
+    """Main entry point for the Kafka processing service"""
+    parser = argparse.ArgumentParser(description='Kafka Stream Processor for Retail Analytics')
+    parser.add_argument('--config', default='system_config.json', help='Path to camera configuration file')
     parser.add_argument('--batch-size', type=int, default=8, help='Maximum number of frames to process in a batch')
     parser.add_argument('--batch-interval', type=float, default=0.5, help='Maximum time to wait before processing a batch (seconds)')
     parser.add_argument('--fps', type=float, default=5, help='Frames per second to process from each camera')
@@ -1801,21 +1311,19 @@ async def main():
     
     args = parser.parse_args()
     
-    logger.info("Starting RTSP Stream Processor service")
+    logger.info("Starting Kafka-backed Stream Processor service")
     
     processor = None
     try:
-        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
         with open(args.config, 'r') as f:
             base_config = json.load(f)
-        base_config['cameras'] = camera_config_remote.get('cameras', [])
 
         system_config = base_config.get("system", {})
         buffer_config = base_config.get("buffer_settings", {})
         gpu_config = system_config.get("gpu_config", {})
         memory_management = system_config.get("memory_management", {})
-        thread_pool_config = system_config.get("thread_pool", {})
-        thread_pool_size = thread_pool_config.get("max_workers", 8)
+        thread_pool_cfg = system_config.get("thread_pool", {})
+        thread_pool_size = thread_pool_cfg.get("max_workers", 8)
         send_fps = args.send_fps
         
 
@@ -1830,7 +1338,7 @@ async def main():
             num_processors = 2  # or any default value if GPUs are not enabled
             batch_size = args.batch_size
         
-        processor = RTSPStreamProcessor(
+        processor = KafkaProcessor(
             num_processors=num_processors,
             batch_size=batch_size,
             batch_interval=args.batch_interval,
@@ -1840,52 +1348,13 @@ async def main():
             send_fps = send_fps
         )
 
-        # Add each camera
-        try:
 
-            for camera in base_config['cameras']:
-                processor.add_camera(
-                    rtsp_url=camera['rtsp_url'],
-                    camera_id=camera['camera_id'],
-                    store_id=camera['store_id']
-                )
-        except Exception as e:
-            logger.error(f"Error loading camera configuration: {e}", exc_info=True)
-            # default_config = {
-            #     "cameras": [
-            #         {
-            #             "rtsp_url": "rtsp://admin:password123@192.168.1.101:554/stream1",
-            #             "camera_id": "camera-001",
-            #             "store_id": "store-001"
-            #         },
-            #         {
-            #             "rtsp_url": "rtsp://admin:password123@192.168.1.102:554/stream1",
-            #             "camera_id": "camera-002",
-            #             "store_id": "store-001"
-            #         }
-            #     ]
-            # }
+        # Create the KafkaProcessor with all relevant settings
 
-            # logger.info("Using default camera configuration:")
-            # for camera in default_config['cameras']:
-            #     logger.info(f"  - Camera {camera['camera_id']} in store {camera['store_id']}: {camera['rtsp_url']}")
-            #     processor.add_camera(
-            #         rtsp_url=camera['rtsp_url'],
-            #         camera_id=camera['camera_id'],
-            #         store_id=camera['store_id']
-            #     )
+        if processor is None:
+            logger.error("Processor was not initialized. Exiting.")
+            return
     
-    except Exception as e:
-        logger.error(f"Error reading the config file: {e}")
-
-        # Create the RTSPStreamProcessor with all relevant settings
-
-    if processor is None:
-        logger.error("Processor was not initialized. Exiting.")
-        return
-    
-    try:
-        # Run the processor
         await processor.run()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, shutting down")
@@ -1894,86 +1363,7 @@ async def main():
     finally:
         # Clean up
         await processor.stop()
-        logger.info("RTSP Stream Processor service stopped")
-
-# Modified main function to use the frame-by-frame processor
-async def frame_by_frame_main():
-    """Main entry point for frame-by-frame RTSP processing service"""
-    parser = argparse.ArgumentParser(description='Frame-by-Frame RTSP Stream Processor for Retail Analytics')
-    parser.add_argument('--config', default='camera_config.json', help='Path to camera configuration file')
-    parser.add_argument('--fps', type=float, default=30, help='Frames per second to process from each camera')
-    
-    args = parser.parse_args()
-    
-    logger.info("Starting Frame-by-Frame RTSP Stream Processor service")
-    processor = None
-    
-    # Create processor
-    # processor = FrameByFrameProcessor(processing_fps=args.fps)
-    
-    # Load camera configuration
-    try:
-        camera_config_remote = await fetch_camera_config("http://genfied-api.xperie.nz:8000/api/v1/ai-server/config")
-        with open(args.config, 'r') as f:
-            base_config = json.load(f)
-        base_config['cameras'] = camera_config_remote.get('cameras', [])
-
-        system_config = base_config.get("system", {})
-        buffer_config = base_config.get("buffer_settings", {})
-        gpu_config = system_config.get("gpu_config", {})
-        memory_management = system_config.get("memory_management", {})
-        thread_pool_config = system_config.get("thread_pool", {})
-        thread_pool_size = thread_pool_config.get("max_workers", 8)
-        send_fps = args.send_fps
-
-        # Determine GPU settings
-        if gpu_config.get("enabled", False):
-            # Use the number of devices listed in the gpu_config
-            num_processors = gpu_config.get("num_processors", 2)
-            # Override batch_size per GPU if provided, else use the command-line argument
-            batch_size = gpu_config.get("batch_size_per_gpu", args.batch_size)
-        else:
-            num_processors = 2  # or any default value if GPUs are not enabled
-            batch_size = args.batch_size
-        
-        processor = FrameByFrameProcessor(
-            num_processors=num_processors,
-            processing_fps=args.fps,
-            frame_buffer_config=buffer_config,
-            thread_pool_size=thread_pool_size,
-            send_fps = send_fps
-        )
-        try:
-            # Add each camera
-            for camera in base_config['cameras']:
-                processor.add_camera(
-                    rtsp_url=camera['rtsp_url'],
-                    camera_id=camera['camera_id'],
-                    store_id=camera['store_id']
-                )
-        except Exception as e:
-            logger.error(f"Error loading camera configuration: {e}", exc_info=True)
-
-    except Exception as e:
-        logger.error(f"Error loading camera configuration: {e}", exc_info=True)
-        # Use default configuration
-        # (Same default configuration as in the original code)
-
-    if processor is None:
-        logger.error("Processor was not initialized. Exiting.")
-        return
-        
-    try:
-        # Run the processor
-        await processor.run()
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received, shutting down")
-    except Exception as e:
-        logger.error(f"Error in main loop: {e}", exc_info=True)
-    finally:
-        # Clean up
-        await processor.stop()
-        logger.info("Frame-by-Frame RTSP Stream Processor service stopped")
+        logger.info("Kafka-backed Stream Processor service stopped")
 
 if __name__ == "__main__":
     asyncio.run(main())
