@@ -2,7 +2,9 @@ name: Build and Push to Amazon ECR
 
 on:
   push:
-    branches: [feature/milvusvectordb]
+    branches:
+      - feature/milvusvectordb
+      - feature/kafaintegration
 
 jobs:
   build-and-push:

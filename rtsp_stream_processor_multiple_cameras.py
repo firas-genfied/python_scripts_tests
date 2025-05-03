@@ -1153,10 +1153,24 @@ class KafkaProcessor:
             group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
             bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
             auto_offset_reset="latest",
+            enable_auto_commit=True,   # whether to commit offsets automatically
+            value_deserializer=lambda b: json.loads(b.decode("utf-8"))
         )
         self.kafka_consumer.subscribe(pattern=pattern)
 
+        self.kafka_consumer.poll(timeout_ms=0)
+
+        # 4. List & filter the topics, then log them
+        all_topics = self.kafka_consumer.topics()  # set of all topics in the cluster
+        matched = [t for t in all_topics if pattern.match(t)]
+        if matched:
+            logger.info(f"Kafka topics matching '{pattern.pattern}': {matched}")
+        else:
+            logger.warning(f"No topics found matching '{pattern.pattern}'")
+
+
         logger.info(f"Subscribed to Kafka topics with pattern: {pattern.pattern}")
+
         loop = asyncio.get_running_loop()
 
         # This will block, so run it in a threadpool
@@ -1166,8 +1180,11 @@ class KafkaProcessor:
                 # msg.key: b"camera-101"
                 # msg.value: raw JPEG/PNG bytes
                 store_id = msg.topic.split("-")[1]  # e.g. "001"
-                camera_id = msg.key.decode()
-                frame_bytes = msg.value
+                camera_id_key = msg.key.decode()
+                camera_id = int(camera_id_key.split("-")[1])
+                logger.info(f"Camera ID is {camera_id} of type {type(camera_id)}")
+                frame_data = msg.value
+                frame_bytes = bytes.fromhex(frame_data["frame"])
                 timestamp = dict(msg.headers).get("timestamp",
                                     datetime.utcnow().isoformat())
                 metadata = {
