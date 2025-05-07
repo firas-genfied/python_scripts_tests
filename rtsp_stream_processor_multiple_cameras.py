@@ -727,12 +727,13 @@ class KafkaProcessor:
         self.send_interval = 1.0 / send_fps
         self.last_send_time = time.time()
 
-        self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-        self.kafka_consumer_group   = os.getenv("KAFKA_CONSUMER_GROUP")
-        self.kafka_topic_pattern    = os.getenv("KAFKA_TOPIC_PATTERN")
+        self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVER")
+        logger.info(f"server is {self.kafka_bootstrap_servers}")
+        self.kafka_consumer_group = os.getenv("KAFKA_CONSUMER_GROUP")
+        self.KAFKA_TOPIC_PATTERN  = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
         logger.info(f"Kafka bootstrap={self.kafka_bootstrap_servers},"
                     f"group={self.kafka_consumer_group}, "
-                    f"pattern={self.kafka_topic_pattern}")
+                    f"pattern={self.KAFKA_TOPIC_PATTERN}")
         
         logger.info(f"Initialized KafkaProcessor with {len(self.gpu_processors)} GPU processors")
         
@@ -930,6 +931,10 @@ class KafkaProcessor:
                     # result, annotated_frame = await task
                     result = await task
 
+                    if result["no_of_people"] == 0:
+                        logger.debug(f"Skipping result with no people detected: camera_id={result['camera_id']}, frame_id={metadata['frame_id']}")
+                        continue
+
                     # Ensure all required fields are present regardless of detection count
                     if "image_url" not in result or not result["image_url"]:
                         result["image_url"] = ""  # Default empty string if not already set
@@ -1020,6 +1025,8 @@ class KafkaProcessor:
                     self.last_send_time = time.time()
                     results_to_send = []  # Clear the list after sending
                     # Wait for all send tasks to complete
+            else:
+                logger.info("No people detected in any frames, skipping API call")
             if send_tasks:
                 await asyncio.gather(*send_tasks)
 
@@ -1089,11 +1096,11 @@ class KafkaProcessor:
         # 1) Discover all store-topics at startup
         admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap_servers)
         all_topics = admin.list_topics()
-        pattern = re.compile(r"^store-([A-Za-z0-9]+)-frames$")
+        
         store_ids = {
             m.group(1)
             for t in all_topics
-            if (m := pattern.match(t))
+            if (m := self.KAFKA_TOPIC_PATTERN.match(t))
         }
         logger.info(f"Discovered stores: {store_ids}")
         await self.initialize_milvus_clients(store_ids)
@@ -1147,8 +1154,10 @@ class KafkaProcessor:
         Pull frames off Kafka topics matching ^store-[A-Za-z0-9]+-frames$
         and inject into our frame_buffer exactly like the Kafka reader did.
         """
-        pattern = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
-        
+        self.KAFKA_TOPIC_PATTERN = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
+        self.KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP")
+        self.KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+        logger.info(f"KAFKA_BOOTSTRAP_SERVERS, KAFKA_CONSUMER_GROUP, KAFKA_TOPIC_PATTERN are {self.KAFKA_BOOTSTRAP_SERVERS}, {self.KAFKA_CONSUMER_GROUP}, {self.KAFKA_TOPIC_PATTERN}")
         self.kafka_consumer = KafkaConsumer(
             group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
             bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
@@ -1156,20 +1165,20 @@ class KafkaProcessor:
             enable_auto_commit=True,   # whether to commit offsets automatically
             value_deserializer=lambda b: json.loads(b.decode("utf-8"))
         )
-        self.kafka_consumer.subscribe(pattern=pattern)
+        self.kafka_consumer.subscribe(pattern=self.KAFKA_TOPIC_PATTERN)
 
         self.kafka_consumer.poll(timeout_ms=0)
 
         # 4. List & filter the topics, then log them
         all_topics = self.kafka_consumer.topics()  # set of all topics in the cluster
-        matched = [t for t in all_topics if pattern.match(t)]
+        matched = [t for t in all_topics if self.KAFKA_TOPIC_PATTERN.match(t)]
         if matched:
-            logger.info(f"Kafka topics matching '{pattern.pattern}': {matched}")
+            logger.info(f"Kafka topics matching '{self.KAFKA_TOPIC_PATTERN.pattern}': {matched}")
         else:
-            logger.warning(f"No topics found matching '{pattern.pattern}'")
+            logger.warning(f"No topics found matching '{self.KAFKA_TOPIC_PATTERN.pattern}'")
 
 
-        logger.info(f"Subscribed to Kafka topics with pattern: {pattern.pattern}")
+        logger.info(f"Subscribed to Kafka topics with pattern: {self.KAFKA_TOPIC_PATTERN.pattern}")
 
         loop = asyncio.get_running_loop()
 
