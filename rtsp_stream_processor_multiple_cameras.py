@@ -1156,11 +1156,11 @@ class KafkaProcessor:
         """
         self.KAFKA_TOPIC_PATTERN = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
         self.KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP")
-        self.KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-        logger.info(f"KAFKA_BOOTSTRAP_SERVERS, KAFKA_CONSUMER_GROUP, KAFKA_TOPIC_PATTERN are {self.KAFKA_BOOTSTRAP_SERVERS}, {self.KAFKA_CONSUMER_GROUP}, {self.KAFKA_TOPIC_PATTERN}")
+        self.KAFKA_BOOTSTRAP_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVER")
+        logger.info(f"KAFKA_BOOTSTRAP_SERVERS, KAFKA_CONSUMER_GROUP, KAFKA_TOPIC_PATTERN are {self.KAFKA_BOOTSTRAP_SERVER}, {self.KAFKA_CONSUMER_GROUP}, {self.KAFKA_TOPIC_PATTERN}")
         self.kafka_consumer = KafkaConsumer(
             group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
-            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
+            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVER"),
             auto_offset_reset="latest",
             enable_auto_commit=True,   # whether to commit offsets automatically
             value_deserializer=lambda b: json.loads(b.decode("utf-8"))
