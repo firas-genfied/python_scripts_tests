@@ -79,12 +79,16 @@ RUN echo "Pip version:" && pip3 --version
 # Install Python dependencies from your curated requirements.txt
 # RUN pip3 install --no-cache-dir -r requirements.txt
 # Install pytorch packages first
-RUN --mount=type=cache,target=/root/.cache/pip pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu126 \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/tmp/pip-ephem-wheel-cache  \
+    pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu126 \
     torch==2.6.0+cu126 \
     torchvision==0.21.0+cu126 \
     torchaudio==2.6.0+cu126
     
-RUN --mount=type=cache,target=/root/.cache/pip pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/tmp/pip-ephem-wheel-cache \
+    pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt \
 && pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git' \
 && pip3 uninstall -y numpy scipy \
 && pip3 install --no-cache-dir numpy==1.26.4 
