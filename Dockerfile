@@ -81,7 +81,7 @@ RUN echo "Python version:" && python3 --version
 RUN echo "Pip version:" && pip3 --version
 
 # Install Python dependencies from your curated requirements.txt
-# RUN pip3 install --no-cache-dir -r requirements.txt
+# RUN pip3 install --no-cache-dir --ignore-installed -r requirements.txt
 # Install pytorch packages first
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/tmp/pip-ephem-wheel-cache  \
@@ -92,27 +92,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install base requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir -r /app/requirements/base_requirements.txt && \
+pip3 install --no-cache-dir --ignore-installed -r /app/requirements/base_requirements.txt && \
 pip cache purge
 
 # Install web framework requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir -r /app/requirements/web_requirements.txt && \
+pip3 install --no-cache-dir --ignore-installed -r /app/requirements/web_requirements.txt && \
 pip cache purge
 
 # Install vision requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir -r /app/requirements/vision_requirements.txt && \
+pip3 install --no-cache-dir --ignore-installed -r /app/requirements/vision_requirements.txt && \
 pip cache purge
 
 # Install machine learning requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir -r /app/requirements/ml_requirements.txt && \
+pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_requirements.txt && \
 pip cache purge
 
 # Install storage and messaging requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir -r /app/requirements/storage_requirements.txt && \
+pip3 install --no-cache-dir --ignore-installed -r /app/requirements/storage_requirements.txt && \
 pip cache purge
 
 RUN --mount=type=cache,target=/root/.cache/pip \
