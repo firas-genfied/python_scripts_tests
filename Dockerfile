@@ -138,9 +138,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git' && \
     pip cache purge
     
-RUN pip3 uninstall -y numpy scipy
-RUN pip3 install --no-cache-dir numpy==1.26.4
-RUN pip3 install --force-reinstall scipy
+RUN pip3 uninstall -y numpy || true
+RUN pip3 uninstall -y scipy || true
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/numpy* || true
+RUN rm -rf /usr/local/lib/python3.10/dist-packages/scipy* || true
+RUN pip3 cache purge
+RUN pip3 install --force-reinstall --ignore-installed --no-cache-dir numpy==1.26.4
+RUN pip3 install --force-reinstall --ignore-installed --no-cache-dir scipy
 
 #Split this so that we dont have to re-install everything
 COPY . /app
