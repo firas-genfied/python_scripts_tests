@@ -1,0 +1,8 @@
+# Storage and messaging
+azure-storage-blob==12.24.1
+pymilvus
+kafka-python
+confluent-kafka
+avro-python3
+msgpack
+aiokafka

@@ -1,0 +1,3 @@
+# Web framework for building APIs
+fastapi
+uvicorn==0.34.0

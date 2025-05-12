@@ -1,0 +1,6 @@
+# Environment management and core utilities
+python-dotenv==1.0.1
+tqdm==4.64.1
+aiohttp==3.11.11
+aiofiles==24.1.0
+numpy==1.26.4

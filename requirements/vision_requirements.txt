@@ -1,0 +1,6 @@
+# Computer vision & image processing
+opencv-python-headless==4.11.0.86
+ffmpeg-python==0.2.0
+ultralytics==8.3.69
+deepface==0.0.93
+mediapipe==0.10.21

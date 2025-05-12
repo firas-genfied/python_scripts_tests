@@ -122,6 +122,7 @@ tmp/
 *.gif
 *.txt
 !requirements.txt
+!requirements/*.txt
 
 # Specific unneeded files
 =4.6.0
