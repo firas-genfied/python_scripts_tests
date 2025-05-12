@@ -71,7 +71,11 @@ RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
 
 # Clone your repository (with submodules)
 # RUN git clone --recursive https://github.com/anuj018/ObjectTracking.git . 
-COPY requirements.txt /app/requirements.txt
+COPY requirements/base_requirements.txt /app/requirements/
+COPY requirements/web_requirements.txt /app/requirements/
+COPY requirements/vision_requirements.txt /app/requirements/
+COPY requirements/ml_requirements.txt /app/requirements/
+COPY requirements/storage_requirements.txt /app/requirements/
 
 RUN echo "Python version:" && python3 --version
 RUN echo "Pip version:" && pip3 --version
@@ -85,14 +89,38 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     torch==2.6.0+cu126 \
     torchvision==0.21.0+cu126 \
     torchaudio==2.6.0+cu126
-    
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/tmp/pip-ephem-wheel-cache \
-    pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt \
-&& pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git' \
-&& pip3 uninstall -y numpy scipy \
-&& pip3 install --no-cache-dir numpy==1.26.4 
 
+# Install base requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+pip3 install --no-cache-dir -r /app/requirements/base_requirements.txt && \
+pip cache purge
+
+# Install web framework requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+pip3 install --no-cache-dir -r /app/requirements/web_requirements.txt && \
+pip cache purge
+
+# Install vision requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+pip3 install --no-cache-dir -r /app/requirements/vision_requirements.txt && \
+pip cache purge
+
+# Install machine learning requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+pip3 install --no-cache-dir -r /app/requirements/ml_requirements.txt && \
+pip cache purge
+
+# Install storage and messaging requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+pip3 install --no-cache-dir -r /app/requirements/storage_requirements.txt && \
+pip cache purge
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git' && \
+    pip cache purge
+    
+RUN pip3 uninstall -y numpy scipy
+RUN pip3 install --no-cache-dir numpy==1.26.4
 RUN pip3 install --force-reinstall scipy
 
 #Split this so that we dont have to re-install everything
