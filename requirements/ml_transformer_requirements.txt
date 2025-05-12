@@ -1,0 +1,2 @@
+# Transformer models and utilities
+transformers==4.48.3

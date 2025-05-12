@@ -1,0 +1,4 @@
+# Additional ML libraries
+timm==1.0.14
+ollama==0.4.7
+tf-keras==2.18.0

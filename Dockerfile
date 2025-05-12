@@ -74,7 +74,9 @@ RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
 COPY requirements/base_requirements.txt /app/requirements/
 COPY requirements/web_requirements.txt /app/requirements/
 COPY requirements/vision_requirements.txt /app/requirements/
-COPY requirements/ml_requirements.txt /app/requirements/
+COPY requirements/ml_core_requirements.txt /app/requirements/
+COPY requirements/ml_transformer_requirements.txt /app/requirements/
+COPY requirements/ml_additional_requirements.txt /app/requirements/
 COPY requirements/storage_requirements.txt /app/requirements/
 
 RUN echo "Python version:" && python3 --version
@@ -93,26 +95,43 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install base requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
 pip3 install --no-cache-dir --ignore-installed -r /app/requirements/base_requirements.txt && \
+rm -rf /tmp/* && \
 pip cache purge
 
 # Install web framework requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
 pip3 install --no-cache-dir --ignore-installed -r /app/requirements/web_requirements.txt && \
+rm -rf /tmp/* && \
 pip cache purge
 
 # Install vision requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
 pip3 install --no-cache-dir --ignore-installed -r /app/requirements/vision_requirements.txt && \
+rm -rf /tmp/* && \
 pip cache purge
 
-# Install machine learning requirements
+# Install ML core requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_requirements.txt && \
-pip cache purge
+    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_core_requirements.txt && \
+    rm -rf /tmp/* && \
+    pip cache purge
+
+# Install ML transformer requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_transformer_requirements.txt && \
+    rm -rf /tmp/* && \
+    pip cache purge
+
+# Install ML additional requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_additional_requirements.txt && \
+    rm -rf /tmp/* && \
+    pip cache purge
 
 # Install storage and messaging requirements
 RUN --mount=type=cache,target=/root/.cache/pip \
 pip3 install --no-cache-dir --ignore-installed -r /app/requirements/storage_requirements.txt && \
+rm -rf /tmp/* && \
 pip cache purge
 
 RUN --mount=type=cache,target=/root/.cache/pip \
