@@ -95,6 +95,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN pip3 install --force-reinstall scipy
 
+#Split this so that we dont have to re-install everything
 COPY . /app
 
 COPY setup_models.sh /app/setup_models.sh
