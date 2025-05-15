@@ -12,7 +12,7 @@ from config import config
 
 # Configure Logging
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more detailed logs
+    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),        # Log to stdout
@@ -32,6 +32,8 @@ AUTH_REFRESH_INTERVAL = int(config.get("auth_refresh_interval", os.environ.get("
 if not DETECTION_ENDPOINT:
     logger.error("Detection endpoint not found in configuration.")
     sys.exit(1)
+else:
+    logger.info(f"DETECTION ENDPOINT IS {DETECTION_ENDPOINT}")
 
 if not AUTH_USERNAME or not AUTH_PASSWORD:
     logger.error("Authentication credentials not found in configuration or environment variables.")
@@ -72,7 +74,7 @@ def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     for frame_data in detection_data:
         # Format according to API requirements
         if frame_data.get("no_of_people", 0) == 0:
-            logger.debug(f"Skipping frame with no people detected: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
+            logger.info(f"Skipping frame with no people detected: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
             continue
         result = {
             "camera_id": frame_data.get("camera_id", ""),
@@ -99,7 +101,16 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     """
     global auth_manager
     if auth_manager is None:
+        logger.info("Auth manager not initialized, initializing now...")
         await initialize_auth()
+
+    # Check for required config variables
+    if not DETECTION_ENDPOINT:
+        logger.error("DETECTION_ENDPOINT is not set or empty")
+        return False
+    
+    logger.info(f"Will send data to endpoint: {DETECTION_ENDPOINT}")
+
     try:
         # Process the detection data directly
         formatted_data = format_detection_data(detection_data)
@@ -117,21 +128,39 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     for attempt in range(MAX_RETRIES):
         try:
             auth_headers = await auth_manager.get_auth_header()
+            logger.info(f"Using auth headers: {auth_headers}")
+            logger.debug(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
+            
             async with aiohttp.ClientSession() as session:
-                async with session.post(DETECTION_ENDPOINT, json=formatted_data, headers=auth_headers, timeout=10) as response:
+                logger.info("Creating POST request...")
+                async with session.post(
+                    DETECTION_ENDPOINT, 
+                    json=formatted_data, 
+                    headers=auth_headers, 
+                    timeout=10
+                ) as response:
+                    logger.info(f"Received response with status code: {response.status}")
+                    
+                    # Read and log the full response text
+                    response_text = await response.text()
+                    logger.info(f"Response Text: {response_text}")
+                    
+                    # Try to parse response as JSON if possible
+                    try:
+                        response_json = await response.json()
+                        logger.info(f"Response JSON: {json.dumps(response_json, indent=2)}")
+                    except Exception:
+                        logger.info("Response was not a valid JSON")
+                    
                     if response.status == 200:
                         logger.info(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")
-                        response_text = await response.text()
-                        logger.debug(f"Response Text: {response_text}")
                         return True
                     elif response.status == 401 or response.status == 403:
-                        logger.warning(f"Authentication error (status {response.status}). Refreshing token and retrying...")
+                        logger.error(f"Authentication error (status {response.status}). Refreshing token and retrying...")
                         await auth_manager.refresh_token()
                         continue
                     else:
                         logger.error(f"Failed to send data. Status: {response.status}")
-                        response_text = await response.text()
-                        logger.error(f"Response Text: {response_text}")
                         
                         # If this was the last attempt, return False
                         if attempt == MAX_RETRIES - 1:
@@ -156,77 +185,6 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     # If all retries failed
     return False
 
-
-async def send_detection_data_batches(detections_jsonfile_path: str):
-    """
-    Processes the raw JSON file and sends the formatted data to the detection API endpoint.
-    
-    Args:
-        detections_jsonfile_path (str): The path to the raw JSON file containing detections.
-    
-    Raises:
-        SystemExit: If sending data fails after retries.
-    """
-    global auth_manager
-    
-    # Ensure auth_manager is initialized
-    if auth_manager is None:
-        await initialize_auth()
-    
-    try:
-        # Process the raw JSON file to get formatted data
-        formatted_data: Dict[str, Any] = process_video_entries(detections_jsonfile_path)
-        logger.info(f"Processed data from '{detections_jsonfile_path}' successfully.")
-        
-    except Exception as e:
-        logger.error(f"Failed to process video entries: {e}", exc_info=True)
-        sys.exit(1)
-    
-    try:
-        # Get auth headers
-        auth_headers = await auth_manager.get_auth_header()
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                DETECTION_ENDPOINT, 
-                json=formatted_data,
-                headers=auth_headers
-            ) as response:
-                if response.status == 200:
-                    logger.info("Data sent successfully.")
-                    response_text = await response.text()
-                    logger.info(f"Response Text: {response_text}")
-                elif response.status == 401 or response.status == 403:
-                    # Auth error - refresh token and try again
-                    logger.warning("Authentication error. Refreshing token and retrying...")
-                    await auth_manager.refresh_token()
-                    auth_headers = await auth_manager.get_auth_header()
-                    
-                    # Retry with new token
-                    async with session.post(
-                        DETECTION_ENDPOINT, 
-                        json=formatted_data,
-                        headers=auth_headers
-                    ) as retry_response:
-                        if retry_response.status == 200:
-                            logger.info("Data sent successfully after token refresh.")
-                            retry_text = await retry_response.text()
-                            logger.info(f"Response Text: {retry_text}")
-                        else:
-                            logger.error(f"Failed to send data after token refresh. Status: {retry_response.status}")
-                            retry_text = await retry_response.text()
-                            logger.error(f"Response Text: {retry_text}")
-                else:
-                    logger.error(f"Failed to send data. Status: {response.status}")
-                    response_text = await response.text()
-                    logger.error(f"Response Text: {response_text}")
-    except aiohttp.ClientError as client_error:
-        logger.error(f"HTTP Client error occurred: {client_error}", exc_info=True)
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while sending data: {e}", exc_info=True)
-        sys.exit(1)
-
 async def main():
     """
     The main entry point for the script.
@@ -235,23 +193,42 @@ async def main():
         # Initialize authentication
         await initialize_auth()
         
-        # Define the path to your raw JSON file
-        # detections_jsonfile_path = "demo_video_snippet.json"  # Update this path as needed
-        
-        # Optionally, you can make the JSON file path configurable via environment variables or command-line arguments
-        
-        # await send_detection_data(detections_jsonfile_path)
+        # Create test detection data that matches the specified schema
         test_detection = [{
-            "store_id": 1,
             "camera_id": 1,
-            "frame_id": 1,
-            "timestamp": "2023-01-01T00:00:00Z",
-            "processed_timestamp": "2023-01-01T00:00:01Z",
-            "entity_coordinates": [],
-            "singles": 1,
-            "couples": 0,
-            "groups": 0,
-            "total_people": 1
+            "image_url": "https://example.com/detection1.jpg",
+            "is_organised": True,
+            "no_of_people": 3,
+            "date_time": "2025-03-28T21:00:53.555Z",
+            "persons": [
+                {
+                    "person_id": "person123",
+                    "coords": {
+                        "x": "0.5",
+                        "y": "0.7"
+                    },
+                    "type": "customer",
+                    "group_id": "group1"
+                },
+                {
+                    "person_id": "person456",
+                    "coords": {
+                        "x": "0.3",
+                        "y": "0.4"
+                    },
+                    "type": "employee",
+                    "group_id": "group2"
+                },
+                {
+                    "person_id": "person789",
+                    "coords": {
+                        "x": "0.7",
+                        "y": "0.2"
+                    },
+                    "type": "customer",
+                    "group_id": "group1"
+                }
+            ]
         }]
         
         # Send the test detection data

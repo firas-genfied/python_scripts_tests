@@ -1092,19 +1092,36 @@ class KafkaProcessor:
     async def run(self):
         """Main method to run the processor"""
         logger.info("Starting Kafka Stream Processor")
-
-        # 1) Discover all store-topics at startup
-        admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap_servers)
-        all_topics = admin.list_topics()
+        allowed_stores_str = os.getenv("STORE_IDS", "[]")
+        try:
+            store_ids = json.loads(allowed_stores_str)
+            logger.info(f"Using store IDs from ConfigMap: {store_ids}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse STORE_IDS '{allowed_stores_str}' as JSON: {e}")
+            # Fallback to comma-separated format
+            store_ids = [s.strip() for s in allowed_stores_str.split(",") if s.strip()]
+            logger.info(f"Parsed store IDs as comma-separated list: {store_ids}")
         
-        store_ids = {
-            m.group(1)
-            for t in all_topics
-            if (m := self.KAFKA_TOPIC_PATTERN.match(t))
-        }
-        logger.info(f"Discovered stores: {store_ids}")
-        await self.initialize_milvus_clients(store_ids)
+        # If store_ids is empty, try to discover from Kafka
+        if not store_ids:
+            logger.info("No store IDs configured, attempting discovery from Kafka")
+            try:
+                admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap_servers)
+                all_topics = admin.list_topics()
+                
+                pattern = re.compile(os.getenv("KAFKA_TOPIC_PATTERN", "^store-([0-9]+)$"))
+                discovered_store_ids = {
+                    m.group(1)
+                    for t in all_topics
+                    if (m := pattern.match(t))
+                }
+                logger.info(f"Discovered store IDs from Kafka: {discovered_store_ids}")
+                store_ids = list(discovered_store_ids)
+            except Exception as e:
+                logger.error(f"Failed to discover store IDs from Kafka: {e}")
+                store_ids = []
 
+        await self.initialize_milvus_clients(store_ids)
         await initialize_processors(self.gpu_processors)    
         await self.frame_buffer.start_monitors()
 
@@ -1151,13 +1168,44 @@ class KafkaProcessor:
 
     async def _kafka_consumer_loop(self):
         """
-        Pull frames off Kafka topics matching ^store-[A-Za-z0-9]+-frames$
-        and inject into our frame_buffer exactly like the Kafka reader did.
+        Pull frames off Kafka topics matching the pattern and filter to only those
+        listed in KAFKA_TOPICS or matching stores in STORE_IDS.
         """
         self.KAFKA_TOPIC_PATTERN = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
         self.KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP")
         self.KAFKA_BOOTSTRAP_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVER")
-        logger.info(f"KAFKA_BOOTSTRAP_SERVERS, KAFKA_CONSUMER_GROUP, KAFKA_TOPIC_PATTERN are {self.KAFKA_BOOTSTRAP_SERVER}, {self.KAFKA_CONSUMER_GROUP}, {self.KAFKA_TOPIC_PATTERN}")
+
+        allowed_topics_str = os.getenv("KAFKA_TOPICS", "[]")
+        allowed_stores_str = os.getenv("STORE_IDS", "[]")
+
+        # Parse allowed topics
+        try:
+            # Try parsing as JSON first
+            self.allowed_topics = json.loads(allowed_topics_str)
+            logger.info(f"Loaded allowed topics from config: {self.allowed_topics}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse KAFKA_TOPICS '{allowed_topics_str}' as JSON: {e}")
+            # Fall back to comma-separated format
+            self.allowed_topics = [t.strip() for t in allowed_topics_str.split(",") if t.strip()]
+            logger.info(f"Parsed allowed topics as comma-separated list: {self.allowed_topics}")
+
+        # Parse allowed stores
+        try:
+            # Try parsing as JSON first
+            self.allowed_stores = json.loads(allowed_stores_str)
+            logger.info(f"Loaded allowed stores from config: {self.allowed_stores}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse STORE_IDS '{allowed_stores_str}' as JSON: {e}")
+            # Fall back to comma-separated format
+            self.allowed_stores = [s.strip() for s in allowed_stores_str.split(",") if s.strip()]
+            logger.info(f"Parsed allowed stores as comma-separated list: {self.allowed_stores}")
+
+        logger.info(f"KAFKA_BOOTSTRAP_SERVERS={self.KAFKA_BOOTSTRAP_SERVER}, "
+                f"KAFKA_CONSUMER_GROUP={self.KAFKA_CONSUMER_GROUP}, "
+                f"KAFKA_TOPIC_PATTERN={self.KAFKA_TOPIC_PATTERN.pattern}")
+        logger.info(f"Allowed topics: {self.allowed_topics}")
+        logger.info(f"Allowed stores: {self.allowed_stores}")
+
         self.kafka_consumer = KafkaConsumer(
             group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
             bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVER"),
@@ -1165,52 +1213,106 @@ class KafkaProcessor:
             enable_auto_commit=True,   # whether to commit offsets automatically
             value_deserializer=lambda b: json.loads(b.decode("utf-8"))
         )
-        self.kafka_consumer.subscribe(pattern=self.KAFKA_TOPIC_PATTERN)
+        all_kafka_topics = self.kafka_consumer.topics()
+        filtered_topics = []
+
+        for topic in all_kafka_topics:
+            # First check if it matches our pattern
+            if not self.KAFKA_TOPIC_PATTERN.match(topic):
+                continue
+                
+            # Then check if we have explicit topic restrictions
+            if self.allowed_topics and topic not in self.allowed_topics:
+                # If we have allowed topics but this isn't one of them
+                # However, also check if we have allowed stores
+                if self.allowed_stores:
+                    # For topics like "store-001-frames", extract the store ID
+                    parts = topic.split("-")
+                    if len(parts) >= 2:
+                        store_id = parts[1]
+                        if store_id in self.allowed_stores:
+                            filtered_topics.append(topic)
+                            logger.info(f"Adding topic {topic} due to store ID {store_id} in allowed stores")
+            else:
+                # Topic is explicitly allowed or we have no restrictions
+                filtered_topics.append(topic)
+                logger.info(f"Adding topic {topic} - explicitly allowed or no restrictions")
+        
+        if not filtered_topics:
+            logger.warning("No topics matched after filtering! Check your KAFKA_TOPICS and STORE_IDS values.")
+
+        if filtered_topics:
+            logger.info(f"Subscribing to filtered topics: {filtered_topics}")
+            self.kafka_consumer.subscribe(topics=filtered_topics)
+        else:
+            logger.warning("No topics to subscribe to after filtering!")
+            # You might want to sleep and retry, or exit, depending on your application needs
+            await asyncio.sleep(30)
+            return
 
         self.kafka_consumer.poll(timeout_ms=0)
 
-        # 4. List & filter the topics, then log them
-        all_topics = self.kafka_consumer.topics()  # set of all topics in the cluster
-        matched = [t for t in all_topics if self.KAFKA_TOPIC_PATTERN.match(t)]
-        if matched:
-            logger.info(f"Kafka topics matching '{self.KAFKA_TOPIC_PATTERN.pattern}': {matched}")
+        # Log the actually assigned partitions
+        assigned_partitions = self.kafka_consumer.assignment()
+        if assigned_partitions:
+            assigned_topics = set(tp.topic for tp in assigned_partitions)
+            logger.info(f"Consumer assigned to topics: {assigned_topics}")
+            logger.info(f"Consumer assigned to partitions: {assigned_partitions}")
         else:
-            logger.warning(f"No topics found matching '{self.KAFKA_TOPIC_PATTERN.pattern}'")
-
-
-        logger.info(f"Subscribed to Kafka topics with pattern: {self.KAFKA_TOPIC_PATTERN.pattern}")
-
+            logger.warning("No partitions assigned to consumer!")
+        
         loop = asyncio.get_running_loop()
 
         # This will block, so run it in a threadpool
         def poll_loop():
-            for msg in self.kafka_consumer:
-                # msg.topic: e.g. "store-001-frames"
-                # msg.key: b"camera-101"
-                # msg.value: raw JPEG/PNG bytes
-                store_id = msg.topic.split("-")[1]  # e.g. "001"
-                camera_id_key = msg.key.decode()
-                camera_id = int(camera_id_key.split("-")[1])
-                logger.info(f"Camera ID is {camera_id} of type {type(camera_id)}")
-                frame_data = msg.value
-                frame_bytes = bytes.fromhex(frame_data["frame"])
-                timestamp = dict(msg.headers).get("timestamp",
-                                    datetime.utcnow().isoformat())
-                metadata = {
-                    "store_id": store_id,
-                    "camera_id": camera_id,
-                    "frame_id": None,       # you can generate or embed in headers
-                    "timestamp": timestamp,
-                    "queued_time": time.time()
-                }
-
-                # Decode bytes → image
-                arr = np.frombuffer(frame_bytes, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-                # Add to buffer (async)
+            try:
+                for msg in self.kafka_consumer:
+                    # Extract store_id from topic: e.g. "store-001-frames" → "001"
+                    topic_parts = msg.topic.split("-")
+                    if len(topic_parts) >= 2:
+                        store_id = topic_parts[1]
+                    else:
+                        logger.warning(f"Unexpected topic format: {msg.topic}, using topic as store_id")
+                        store_id = msg.topic
+                        
+                    # Extract camera_id from message key: e.g. b"camera-101" → 101
+                    camera_id_key = msg.key.decode()
+                    try:
+                        camera_id = int(camera_id_key.split("-")[1])
+                    except (IndexError, ValueError) as e:
+                        logger.warning(f"Failed to parse camera_id from key '{camera_id_key}': {e}")
+                        camera_id = 0  # Default value
+                        
+                    # Process the frame data
+                    frame_data = msg.value
+                    try:
+                        frame_bytes = bytes.fromhex(frame_data["frame"])
+                        timestamp = dict(msg.headers).get("timestamp", datetime.utcnow().isoformat())
+                        
+                        metadata = {
+                            "store_id": store_id,
+                            "camera_id": camera_id,
+                            "frame_id": frame_data.get("frame_id", None),
+                            "timestamp": timestamp,
+                            "queued_time": time.time()
+                        }
+                        
+                        # Decode bytes → image
+                        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+                        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        
+                        # Add to buffer (async)
+                        asyncio.run_coroutine_threadsafe(
+                            self.frame_buffer.add_frame(frame, metadata),
+                            loop
+                        )
+                    except Exception as e:
+                        logger.error(f"Error processing message from topic {msg.topic}: {e}")
+            except Exception as e:
+                logger.error(f"Error in Kafka consumer loop: {e}", exc_info=True)
+                # Signal that the loop has exited so it can be restarted
                 asyncio.run_coroutine_threadsafe(
-                    self.frame_buffer.add_frame(frame, metadata),
+                    self._handle_consumer_error(),
                     loop
                 )
 

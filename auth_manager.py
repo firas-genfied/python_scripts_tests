@@ -32,10 +32,15 @@ class AuthManager:
     
     async def start(self):
         """Start the token manager and fetch initial token"""
-        await self.refresh_token()
-        # Start background refresh task
-        self.refresh_task = asyncio.create_task(self._refresh_loop())
-        logger.info("Authentication manager started")
+        logger.info("Starting authentication manager")
+        try:
+            await self.refresh_token()
+            # Start background refresh task
+            self.refresh_task = asyncio.create_task(self._refresh_loop())
+            logger.info("Authentication manager started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start authentication manager: {e}")
+            raise
     
     async def stop(self):
         """Stop the token refresh background task"""
@@ -64,22 +69,72 @@ class AuthManager:
         """Fetch a new authentication token"""
         async with self.lock:
             try:
+                # Prepare payload with grant_type for OAuth2
+                payload = {
+                    "grant_type": "password",
+                    "username": self.username,
+                    "password": self.password
+                }
+                
+                # Prepare headers
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json'
+                }
+                
+                # Log authentication attempt details
+                logger.info(f"Authentication attempt details:")
+                logger.info(f"Auth URL: {self.auth_url}")
+                logger.info(f"Username provided: {self.username}")
+                logger.info(f"Password length: {len(self.password)}")
+                logger.info(f"Payload keys: {list(payload.keys())}")
+                
                 async with aiohttp.ClientSession() as session:
-                    payload = {"username": self.username, "password": self.password}
-                    async with session.post(self.auth_url, json=payload) as response:
+                    async with session.post(
+                        self.auth_url, 
+                        data=payload,  # Use data for form-urlencoded
+                        headers=headers
+                    ) as response:
+                        # Log response details
+                        logger.info(f"Response status: {response.status}")
+                        
+                        # Read response text for logging
+                        response_text = await response.text()
+                        logger.info(f"Raw response text: {response_text}")
+                        
+                        # Successful authentication
                         if response.status == 200:
-                            data = await response.json()
-                            self.access_token = data.get("access_token")
-                            self.token_type = data.get("token_type", "Bearer")
-                            self.token_expiry = time.time() + self.refresh_interval
-                            logger.info("Authentication token refreshed successfully")
-                            return True
-                        else:
-                            error_text = await response.text()
-                            logger.error(f"Failed to refresh token. Status: {response.status}, Response: {error_text}")
+                            try:
+                                data = await response.json()
+                                self.access_token = data.get("access_token")
+                                self.token_type = data.get("token_type", "Bearer").lower()
+                                
+                                # Set token expiry (use refresh interval or token's expiration if available)
+                                self.token_expiry = time.time() + self.refresh_interval
+                                
+                                logger.info("Authentication successful")
+                                logger.info(f"Token type: {self.token_type}")
+                                logger.info(f"Token present: {bool(self.access_token)}")
+                                
+                                return True
+                            except Exception as json_error:
+                                logger.error(f"JSON parsing error: {json_error}")
+                                return False
+                        
+                        # Handle rate limiting or authentication errors
+                        elif response.status == 429:
+                            logger.error("Rate limited: Too many authentication attempts")
                             return False
+                        elif response.status == 401 or response.status == 403:
+                            logger.error("Authentication failed: Invalid credentials")
+                            return False
+                        else:
+                            logger.error(f"Authentication failed. Status: {response.status}")
+                            logger.error(f"Response text: {response_text}")
+                            return False
+            
             except Exception as e:
-                logger.error(f"Error obtaining authentication token: {e}")
+                logger.error(f"Comprehensive authentication error: {e}", exc_info=True)
                 raise
     
     async def get_auth_header(self) -> Dict[str, str]:
