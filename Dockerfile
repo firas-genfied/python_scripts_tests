@@ -159,6 +159,26 @@ FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
 ENV BASE_DIR=/app
 WORKDIR /app
 
+# Install Python in the runtime image
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgl1-mesa-glx \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make sure python3 points to python3.10
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+# Also set up a python symlink for compatibility
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
 # 1) copy only the runtime artifacts
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /app /app
