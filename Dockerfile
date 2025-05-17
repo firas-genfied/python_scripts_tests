@@ -1,9 +1,6 @@
-# syntax = docker/dockerfile:1.3
-
-
 # Use the provided NVIDIA CUDA base image with cuDNN 8 on Ubuntu 20.04
 # FROM nvidia/cuda:12.6.0-cudnn8-runtime-ubuntu22.04
-FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
 
 # Set noninteractive mode for apt-get
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,9 +27,7 @@ RUN apt-get update \
     libxext6 \
     libxrender-dev \
     libgl1-mesa-glx \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
+    ffmpeg
 # Install Python 3.10, pip, and related packages along with other system dependencies
 # RUN apt-get install -y --no-install-recommends \
 #     python3.10 \
@@ -68,127 +63,39 @@ RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
 # Set working directory
 
 # Copy your code into the container
+COPY . /app
 
 # Clone your repository (with submodules)
 # RUN git clone --recursive https://github.com/anuj018/ObjectTracking.git . 
-COPY requirements/base_requirements.txt /app/requirements/
-COPY requirements/web_requirements.txt /app/requirements/
-COPY requirements/vision_requirements.txt /app/requirements/
-COPY requirements/ml_core_requirements.txt /app/requirements/
-COPY requirements/ml_transformer_requirements.txt /app/requirements/
-COPY requirements/ml_additional_requirements.txt /app/requirements/
-COPY requirements/storage_requirements.txt /app/requirements/
 
 RUN echo "Python version:" && python3 --version
 RUN echo "Pip version:" && pip3 --version
 
 # Install Python dependencies from your curated requirements.txt
-# RUN pip3 install --no-cache-dir --ignore-installed -r requirements.txt
+# RUN pip3 install --no-cache-dir -r requirements.txt
 # Install pytorch packages first
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/tmp/pip-ephem-wheel-cache  \
-    pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu126 \
+RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu126 \
     torch==2.6.0+cu126 \
     torchvision==0.21.0+cu126 \
     torchaudio==2.6.0+cu126
-
-# Install base requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir --ignore-installed -r /app/requirements/base_requirements.txt && \
-rm -rf /tmp/* && \
-pip cache purge
-
-# Install web framework requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir --ignore-installed -r /app/requirements/web_requirements.txt && \
-rm -rf /tmp/* && \
-pip cache purge
-
-# Install vision requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir --ignore-installed -r /app/requirements/vision_requirements.txt && \
-rm -rf /tmp/* && \
-pip cache purge
-
-# Install ML core requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_core_requirements.txt && \
-    rm -rf /tmp/* && \
-    pip cache purge
-
-# Install ML transformer requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_transformer_requirements.txt && \
-    rm -rf /tmp/* && \
-    pip cache purge
-
-# Install ML additional requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir --ignore-installed -r /app/requirements/ml_additional_requirements.txt && \
-    rm -rf /tmp/* && \
-    pip cache purge
-
-# Install storage and messaging requirements
-RUN --mount=type=cache,target=/root/.cache/pip \
-pip3 install --no-cache-dir --ignore-installed -r /app/requirements/storage_requirements.txt && \
-rm -rf /tmp/* && \
-pip cache purge
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git' && \
-    pip cache purge
     
-RUN pip3 uninstall -y numpy || true
-RUN pip3 uninstall -y scipy || true
-RUN rm -rf /usr/local/lib/python3.10/dist-packages/numpy* || true
-RUN rm -rf /usr/local/lib/python3.10/dist-packages/scipy* || true
-RUN pip3 cache purge
-RUN pip3 install --force-reinstall --ignore-installed --no-cache-dir numpy==1.26.4
-RUN pip3 install --force-reinstall --ignore-installed --no-cache-dir scipy
+RUN pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt
 
-#Split this so that we dont have to re-install everything
-COPY . /app
+# Install Detectron2 from GitHub
+RUN pip3 install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git'
+
+# make sure numpy & scipy are at known‐good versions
+RUN pip3 uninstall -y numpy scipy
+RUN pip3 install numpy==1.26.4
+RUN pip3 install --force-reinstall scipy
 
 COPY setup_models.sh /app/setup_models.sh
 RUN chmod +x /app/setup_models.sh && /app/setup_models.sh
 
-####################################
-# STAGE 2: runtime
-####################################
-FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
-ENV BASE_DIR=/app
-WORKDIR /app
-
-# Install Python in the runtime image
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-dev \
-    python3-pip \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgl1-mesa-glx \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-# Make sure python3 points to python3.10
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-
-# Also set up a python symlink for compatibility
-RUN ln -sf /usr/bin/python3 /usr/bin/python
-
-# 1) copy only the runtime artifacts
-COPY --from=builder /usr/local /usr/local
-COPY --from=builder /app /app
-
-# 2) cleanup any apt/temp files
-RUN apt-get clean \
- && rm -rf /var/lib/apt/lists/* /root/.cache
-
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python3", "rtsp_stream_processor_multiple_cameras.py", "--config", "/app/config/camera_config.json"]
