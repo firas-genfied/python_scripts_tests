@@ -76,11 +76,18 @@ class AsyncMilvusRouterClient:
     async def insert_embedding(self, track_id, embedding, store_id, camera_id, timestamp):
         """
         Insert a single embedding
-        
         Returns:
-            bool: True if successful, False otherwise
+        bool: True if successful, False otherwise
         """
         try:
+            if isinstance(track_id, tuple) and len(track_id) > 0:
+                track_id = track_id[0]
+                
+            # If track_id is None, generate a new one or return False
+            if track_id is None:
+                logger.error("Cannot insert embedding with None track_id")
+                return False
+                
             # Ensure embedding is in the correct format
             if isinstance(embedding, np.ndarray):
                 embedding = embedding.tolist()
@@ -101,18 +108,19 @@ class AsyncMilvusRouterClient:
             # Send request to router
             client = await self._get_client()
             response = await client.post(
-                f"{self.router_url}/insert", 
+                f"{self.router_url}/insert",
                 json=data
             )
             
             if response.status_code == 200:
+                logger.info(f"[Milvus] Inserted feature for track_id {track_id}.")
                 return True
             else:
                 logger.error(f"Insert failed with status {response.status_code}: {response.text}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Error inserting embedding: {e}")
+            logger.error(f"Error inserting embedding: {str(e)}", exc_info=True)  # Include the error message and stack trace
             return False
             
     async def insert_embeddings_batch(
@@ -259,7 +267,15 @@ class AsyncMilvusRouterClient:
             List of feature embeddings (numpy arrays)
         """
         store_id = store_id if store_id is not None else self.store_id
+
+        if isinstance(track_id, tuple) and len(track_id) > 0:
+            track_id = track_id[0]
         
+        # If track_id is None, return empty list
+        if track_id is None:
+            logger.info(f"Cannot retrieve features for None track_id")
+            return []
+            
         try:
             client = await self._get_client()
             response = await client.get(

@@ -43,7 +43,7 @@ class AsyncTracker:
         self._next_id = 1
         self.milvus_client = milvus_client
         self.max_iou_distance = max_iou_distance
-        logger.info(f"Successfully receievd milvus client from processor to upate values for store {self.milvus_client.store_id}")
+        logger.debug(f"Successfully receievd milvus client from processor to upate values for store {self.milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
 
@@ -112,6 +112,9 @@ class AsyncTracker:
                 store_filter=self.store_id
             )
 
+            if not isinstance(assigned_ids, set):
+                assigned_ids = set(assigned_ids)
+
             # Filter and sort
             unassigned_matches = [
                 (track_id, distance)
@@ -122,7 +125,7 @@ class AsyncTracker:
 
             for track_id, distance in unassigned_matches[:max_candidates]:
                 if distance < distance_threshold:
-                    logger.info(f"[Milvus] Best unassigned match: track_id={track_id}, distance={distance}")
+                    logger.debug(f"[Milvus] Best unassigned match: track_id={track_id}, distance={distance}")
                     return track_id, distance
 
             logger.info("[Milvus] No unassigned track ID below threshold.")
@@ -147,7 +150,7 @@ class AsyncTracker:
         for track_id, track_list in tracks_by_id.items():
             if len(track_list) > 1:
                 # Multiple tracks with the same ID found
-                logger.info(f"Found {len(track_list)} duplicate tracks for ID {track_id}")
+                logger.debug(f"Found {len(track_list)} duplicate tracks for ID {track_id}")
                 
                 # Sort by n_hits (descending) to keep the one with highest count
                 track_list.sort(key=lambda t: t.hits, reverse=True)
@@ -156,7 +159,7 @@ class AsyncTracker:
                 best_track = track_list[0]
                 tracks_to_keep.append(best_track)
                 
-                logger.info(f"Keeping track with ID {track_id} and n_hits={best_track.hits}, " 
+                logger.debug(f"Keeping track with ID {track_id} and n_hits={best_track.hits}, " 
                             f"removing {len(track_list)-1} duplicates")
             else:
                 # Just one track with this ID, no duplicates
@@ -195,7 +198,7 @@ class AsyncTracker:
         # Check if we're in the startup grace period (first 10 seconds / 250 frames)
         startup_grace_period = self._frame_count < 251
         if startup_grace_period:
-            logger.info(f"In startup grace period (frame {self._frame_count}/250): allowing new IDs anywhere in frame")
+            logger.debug(f"In startup grace period (frame {self._frame_count}/250): allowing new IDs anywhere in frame")
         
         # Find all overlapping pairs of detections
         for i in range(num_dets):
@@ -226,9 +229,9 @@ class AsyncTracker:
         matches, unmatched_tracks, unmatched_detections = self._match(detections)
         
         # Create a dict mapping track_idx to track object for easier reference
-        logger.info(f"length of self.tracks is {len(self.tracks)}")
+        logger.debug(f"length of self.tracks is {len(self.tracks)}")
         track_idx_to_track = {idx: self.tracks[idx] for idx in range(len(self.tracks))}
-        logger.info("track_idx_to_track is: " + ", ".join([f"{k}: {v.track_id}" for k, v in track_idx_to_track.items()]))
+        logger.debug("track_idx_to_track is: " + ", ".join([f"{k}: {v.track_id}" for k, v in track_idx_to_track.items()]))
 
 
         # Group the track objects by their track.track_id
@@ -237,7 +240,7 @@ class AsyncTracker:
             tracks_by_id[track.track_id].append(track)
         
         # Log the grouping: print each track ID and the number of objects for that ID.
-        logger.info("track_idx_to_track grouped by track.track_id: " +
+        logger.debug("track_idx_to_track grouped by track.track_id: " +
                     ", ".join([f"{tid}: {len(lst)}" for tid, lst in tracks_by_id.items()]))
 
         
@@ -253,18 +256,18 @@ class AsyncTracker:
                 if not track.features:
                     track.update(self.kf, detection)
                     await self._insert_feature_into_milvus(track, detection)
-                    logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
+                    logger.debug(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
                     continue
 
                 # Otherwise, calculate the distance from the detection feature to the track's latest feature.
                 distance = calculate_cosine_distance(detection.feature, track.features[-1])
-                logger.info(f"Distance for track_id {track.track_id} with detection {detection_idx} is {distance}")
+                logger.debug(f"Distance for track_id {track.track_id} with detection {detection_idx} is {distance}")
 
                 # If the distance is below threshold, update the track:
                 if distance < self.matching_threshold:
                     track.update(self.kf, detection)
                     await self._insert_feature_into_milvus(track, detection)
-                    logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
+                    logger.debug(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                     if detection_idx in unmatched_detections:
                         unmatched_detections.remove(detection_idx)
                     # if track_idx in unmatched_tracks:
@@ -277,18 +280,18 @@ class AsyncTracker:
             # if not track.features:
             #     # First update with this feature
             #     track.update(self.kf, detection)
-            #     logger.info(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
+            #     logger.debug(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
             #     continue
             
             # # Calculate distance to check if this is a good match
             # distance = calculate_cosine_distance(detection.feature, track.features[-1])
-            # logger.info(f"distance for id {track_idx} whose track id is {track.track_id}, with detection is {distance}")
+            # logger.debug(f"distance for id {track_idx} whose track id is {track.track_id}, with detection is {distance}")
             
             # # If this is a good match (distance below threshold), update track directly
             # if distance < self.matching_threshold:
             #     # Update the track directly
             #     track.update(self.kf, detection)
-            #     logger.info(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
+            #     logger.debug(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                 
                 # Remove this detection and track from further processing
                 if detection_idx in unmatched_detections:
@@ -330,7 +333,7 @@ class AsyncTracker:
             for db_id, db_distance, is_visible in database_matches:
                 if db_distance <= self.matching_threshold:  # Only add if within threshold
                     potential_matches[det_idx].append((db_id, db_distance, is_visible))
-                    logger.info(f"Potential match: detection {det_idx} with database ID {db_id}, distance {db_distance}, visible: {is_visible}")
+                    logger.debug(f"Potential match: detection {det_idx} with database ID {db_id}, distance {db_distance}, visible: {is_visible}")
         
         # Step 4: Process detections based on whether they are part of overlapping groups or not
         assigned_detections = set()
@@ -376,17 +379,17 @@ class AsyncTracker:
             # If detection is entering, assign new ID
             if det_idx in entering_detections:
                 # Force new ID for entering detections
-                logger.info(f"Overlapping detection with bbox {bbox} is entering the store. Assigning new ID.")
+                logger.debug(f"Overlapping detection with bbox {bbox} is entering the store. Assigning new ID.")
                 new_id = self._next_id
                 assigned_ids.add(new_id)
                 assigned_detections.add(det_idx)
                 final_assignments[det_idx] = (new_id, True)
-                logger.info(f"Assigning det id {det_idx} to track id {new_id} because overlapping box in entering state")
+                logger.debug(f"Assigning det id {det_idx} to track id {new_id} because overlapping box in entering state")
                 self._next_id += 1
                 continue
             
             # Use more comprehensive matching specifically for overlapping detections
-            logger.info(f"Matching overlapping detection {bbox} with global database.")
+            logger.debug(f"Matching overlapping detection {bbox} with global database.")
             matched_track_id = await self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
             
             # Check if this ID is already assigned in this frame
@@ -401,12 +404,12 @@ class AsyncTracker:
                 current_distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
                 existing_distance = await self._calculate_distance_to_id(existing_detection.feature, matched_track_id)
                 
-                logger.info(f"Distance comparison: Current detection ({det_idx}): {current_distance}, " +
+                logger.debug(f"Distance comparison: Current detection ({det_idx}): {current_distance}, " +
                         f"Existing detection ({existing_det_idx}): {existing_distance}")
                 
                 if current_distance < existing_distance:
                     # Current detection has a better match - reassign the existing detection
-                    logger.info(f"Current detection {det_idx} has a better match with ID {matched_track_id}. " +
+                    logger.debug(f"Current detection {det_idx} has a better match with ID {matched_track_id}. " +
                             f"Reassigning detection {existing_det_idx}.")
                     
                     # Remove the existing assignment
@@ -417,22 +420,29 @@ class AsyncTracker:
                     # The existing detection will be processed again later
                 else:
                     # Existing detection has a better match - find an alternative for the current detection
-                    logger.info(f"Existing detection {existing_det_idx} has a better match with ID {matched_track_id}. " +
+                    logger.debug(f"Existing detection {existing_det_idx} has a better match with ID {matched_track_id}. " +
                             f"Finding alternative for detection {det_idx}.")
                     
                     # Find the next best match from the database
-                    matched_track_id = await self._find_next_best_match(detection.feature, bbox, assigned_ids)
-                    
-                    if matched_track_id is not None:
-                        logger.info(f"Found alternative match: track_id {matched_track_id}")
+                    result = await self._find_next_best_match(detection.feature, bbox, assigned_ids)
+                    if isinstance(result, tuple) and len(result) == 2:
+                        matched_track_id, distance = result
                     else:
-                        logger.info("No good alternative match found. Will assign new ID.")
+                        # Handle unexpected return format
+                        matched_track_id = None
+                        distance = float('inf')
+                        logger.warning(f"Unexpected return format from _find_next_best_match: {result}")
+
+                    if matched_track_id is not None:
+                        logger.debug(f"Found alternative match: track_id {matched_track_id}")
+                    else:
+                        logger.debug("No good alternative match found. Will assign new ID.")
             
             # After competition resolution, process the final assignment
             if matched_track_id is not None:
                 # For center detections: enforce using existing ID
                 if det_idx in center_detections and matched_track_id not in active_track_ids and not startup_grace_period:
-                    logger.info(f"Center detection matched with inactive ID {matched_track_id}. Ensuring it is a good match.")
+                    logger.debug(f"Center detection matched with inactive ID {matched_track_id}. Ensuring it is a good match.")
                     # Verify this is a sufficiently good match
                     distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
                     if distance > self.matching_threshold * 1.5:  # Relax threshold a bit for center detections
@@ -440,18 +450,18 @@ class AsyncTracker:
                         alternative_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                         if alternative_id is not None:
                             matched_track_id = alternative_id
-                            logger.info(f"Using better alternative active ID {matched_track_id} for center detection.")
+                            logger.debug(f"Using better alternative active ID {matched_track_id} for center detection.")
                 
                 # Assign track ID
                 assigned_ids.add(matched_track_id)
                 assigned_detections.add(det_idx)
-                logger.info(f"track ID {matched_track_id} was not an already assigned ID and is not a final assignment yet")
+                logger.debug(f"track ID {matched_track_id} was not an already assigned ID and is not a final assignment yet")
                 
                 # For existing tracks, mark as update (False)
                 # For new tracks from the database, mark as new (True)
                 is_new_track = matched_track_id not in active_track_ids
                 final_assignments[det_idx] = (matched_track_id, is_new_track)
-                logger.info(f"Assigned ID {matched_track_id} to overlapping detection {det_idx} (new track: {is_new_track}) and is now final")
+                logger.debug(f"Assigned ID {matched_track_id} to overlapping detection {det_idx} (new track: {is_new_track}) and is now final")
             else:
                 # No match found - check if new ID is allowed
                 if det_idx in center_detections and not startup_grace_period:
@@ -459,7 +469,7 @@ class AsyncTracker:
                     alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                     
                     if alt_id is not None:
-                        logger.info(f"Center detection {det_idx} gets forced match with ID {alt_id}")
+                        logger.debug(f"Center detection {det_idx} gets forced match with ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     else:
                         try:
@@ -470,19 +480,19 @@ class AsyncTracker:
                             alt_id = self._next_id
 
                         # Fallback to oldest ID if no good match
-                        logger.info(f"Center detection {det_idx} gets fallback ID {alt_id}")
+                        logger.debug(f"Center detection {det_idx} gets fallback ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     
                     assigned_detections.add(det_idx)
                     assigned_ids.add(alt_id)
-                    logger.info(f"Adding {alt_id} to assigned IDs dict and is a final assignment")
+                    logger.debug(f"Adding {alt_id} to assigned IDs dict and is a final assignment")
                 else:
                     # Can assign new ID
                     new_id = self._next_id
                     assigned_ids.add(new_id)
                     assigned_detections.add(det_idx)
                     final_assignments[det_idx] = (new_id, True)
-                    logger.info(f"Assigned new ID {new_id} to overlapping detection {det_idx} and is a final assignment")
+                    logger.debug(f"Assigned new ID {new_id} to overlapping detection {det_idx} and is a final assignment")
                     self._next_id += 1
         
         # SECOND: For remaining non-overlapping detections, use competition-based approach
@@ -516,7 +526,7 @@ class AsyncTracker:
                 final_assignments[det_idx] = (track_id, is_new_track)
                 assigned_detections.add(det_idx)
                 assigned_ids.add(track_id)
-                logger.info(f"ID competition winner: detection {det_idx} gets track_id {track_id} with distance {distance}")
+                logger.debug(f"ID competition winner: detection {det_idx} gets track_id {track_id} with distance {distance}")
         
         # Now handle remaining unassigned detections
         for det_idx in unassigned_non_overlapping:
@@ -555,7 +565,7 @@ class AsyncTracker:
                 final_assignments[det_idx] = (best_available_id, is_new_track)
                 assigned_ids.add(best_available_id)
                 assigned_detections.add(det_idx)
-                logger.info(f"Alternative match: detection {det_idx} gets track_id {best_available_id} with distance {best_distance}")
+                logger.debug(f"Alternative match: detection {det_idx} gets track_id {best_available_id} with distance {best_distance}")
             else:
                 # No good match available
                 if is_center and not startup_grace_period:
@@ -563,7 +573,7 @@ class AsyncTracker:
                     alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
                     
                     if alt_id is not None:
-                        logger.info(f"Center detection {det_idx} forced to use existing ID {alt_id}")
+                        logger.debug(f"Center detection {det_idx} forced to use existing ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     else:
                         # Fallback to oldest ID
@@ -573,7 +583,7 @@ class AsyncTracker:
                         except Exception as e:
                             logger.error(f"Error fetching all track IDs from Milvus: {e}")
                             alt_id = self._next_id
-                        logger.info(f"Center detection {det_idx} gets fallback ID {alt_id}")
+                        logger.debug(f"Center detection {det_idx} gets fallback ID {alt_id}")
                         final_assignments[det_idx] = (alt_id, False)
                     
                     assigned_detections.add(det_idx)
@@ -584,9 +594,9 @@ class AsyncTracker:
                     final_assignments[det_idx] = (new_id, True)  # New ID
                     assigned_ids.add(new_id)
                     assigned_detections.add(det_idx)
-                    logger.info(f"No good match found: detection {det_idx} gets new track_id {new_id}")
+                    logger.debug(f"No good match found: detection {det_idx} gets new track_id {new_id}")
                     if is_center and startup_grace_period:
-                        logger.info(f"  (Note: Allowing new ID below threshold because in startup grace period)")
+                        logger.debug(f"  (Note: Allowing new ID below threshold because in startup grace period)")
                     self._next_id += 1
         
         # Step 5: Collect all track modifications for batch application

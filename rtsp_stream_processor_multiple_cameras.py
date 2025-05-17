@@ -76,7 +76,7 @@ class GPUBatchProcessor:
     def __init__(self, max_batch_size=8, device=None, model_config=None):
         self.max_batch_size = max_batch_size
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {self.device}")
+        logger.debug(f"Using device: {self.device}")
         self.model_config = model_config or {}
         self.context_id = self.model_config.get("context_id", 0)
         self.stream = torch.cuda.Stream(device=self.device)
@@ -90,14 +90,14 @@ class GPUBatchProcessor:
         self.model_config = model_config or {}
         # Initialize the segmentation model (Detectron2)
         self.seg_predictor = setup_predictor()
-        logger.info("Segmentation model initialized")
+        logger.debug("Segmentation model initialized")
         
         self.model = make_model(cfg, num_class=1041, camera_num=0, view_num=0).to(self.device)
         self.model.load_param(cfg.TEST.WEIGHT)
         self.model.eval()
         self.transform = build_transforms(cfg, is_train=False)
         self.extract_features = extract_features
-        logger.info("TransReID model initialized")
+        logger.debug("TransReID model initialized")
 
         # Initialize stats tracking
         self.stats = {
@@ -112,7 +112,7 @@ class GPUBatchProcessor:
         # If using half-precision (FP16)
         self.use_half_precision = self.model_config.get("half_precision", False)
         if self.use_half_precision and self.device.type == "cuda":
-            logger.info("Using half precision (FP16)")
+            logger.debug("Using half precision (FP16)")
             self.model = self.model.half()
         
         # Update GPU memory stats
@@ -306,7 +306,7 @@ class GPUBatchProcessor:
             List of (metadata, detections, features) tuples
         """
         start_time = time.time()
-        # logger.info(f"Processing batch of {len(image_batch)} images on GPU")
+        # logger.debug(f"Processing batch of {len(image_batch)} images on GPU")
         batch_results = []
         timestamps = []
         total_people = 0
@@ -453,7 +453,7 @@ class GPUBatchProcessor:
             
             mem_stats = self.get_memory_stats()
             
-            logger.info(f"GPU {self.device} stats: "
+            logger.debug(f"GPU {self.device} stats: "
                        f"avg_batch_time={avg_batch_time:.3f}s, "
                        f"avg_frame_time={avg_frame_time:.3f}s, "
                        f"avg_people={avg_people_per_frame:.1f}, "
@@ -493,8 +493,8 @@ class GPUBatchProcessor:
 class CameraProcessor:
     """Handles per-camera tracking and processing"""
     def __init__(self, camera_id, store_id, milvus_client):
-        logger.info("Inside CameraProcessor Constructor")
-        logger.info(f"Received milvus client for store {milvus_client.store_id}")
+        logger.debug("Inside CameraProcessor Constructor")
+        logger.debug(f"Received milvus client for store {milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
         # Initialize tracker and status tracking
@@ -626,7 +626,7 @@ class CameraProcessor:
                 self.person_status[track.track_id] = {"status": "", "group_id": ""}
             
             if is_final:
-                logger.info(f"Finalizing status of {track.track_id} to {classification_type}")
+                logger.debug(f"Finalizing status of {track.track_id} to {classification_type}")
                 self.person_status[track.track_id]["status"] = classification_type if classification_type else ""
                 self.person_status[track.track_id]["group_id"] = str(group_id) if group_id is not None else ""
             else:
@@ -728,7 +728,7 @@ class KafkaProcessor:
         self.last_send_time = time.time()
 
         self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVER")
-        logger.info(f"server is {self.kafka_bootstrap_servers}")
+        logger.debug(f"server is {self.kafka_bootstrap_servers}")
         self.kafka_consumer_group = os.getenv("KAFKA_CONSUMER_GROUP")
         self.KAFKA_TOPIC_PATTERN  = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
         logger.info(f"Kafka bootstrap={self.kafka_bootstrap_servers},"
@@ -739,7 +739,7 @@ class KafkaProcessor:
         
         # Log GPU device details
         for i, proc in enumerate(self.gpu_processors):
-            logger.info(f"GPU processor {i}: device={proc.device}")
+            logger.debug(f"GPU processor {i}: device={proc.device}")
         
         self.milvus_clients = {}
     
@@ -898,9 +898,9 @@ class KafkaProcessor:
                     continue
                 
                 # Get camera processor
-                logger.info("About to get_camera_processor for %s/%s", camera_id, store_id) 
+                logger.debug("About to get_camera_processor for %s/%s", camera_id, store_id) 
                 processor = self.get_camera_processor(camera_id, store_id)
-                logger.info(f"processor.milvus_client.store_id is {processor.milvus_client.store_id}")
+                logger.debug(f"processor.milvus_client.store_id is {processor.milvus_client.store_id}")
                 # Create task for CPU processing
                 # task = loop.run_in_executor(
                 #     self.thread_pool,
@@ -980,24 +980,24 @@ class KafkaProcessor:
 
                     # Add latency info to result
                     # result['processing_latency'] = total_latency
-                    logger.info(f"Processed frame {frame_id} from camera {result['camera_id']} "
+                    logger.debug(f"Processed frame {frame_id} from camera {result['camera_id']} "
                                f"with {result['no_of_people']} people (latency: {total_latency*1000:.1f}ms)")
                     current_time = time.time()
                     if current_time - self.last_send_time >= self.send_interval:
                         payload_str = json.dumps(results_to_send, indent=2)
-                        logger.info("About to send detection payload:\n%s", payload_str)
+                        logger.debug("About to send detection payload:\n%s", payload_str)
                         send_task = asyncio.create_task(send_detection_data(results_to_send))
                         send_tasks.append(send_task)
                         self.last_send_time = current_time
                     else:
-                        logger.info("Skipping send to maintain configured send rate")
+                        logger.debug("Skipping send to maintain configured send rate")
                 except Exception as task_error:
                     logger.error(f"Error processing task: {task_error}", exc_info=True)
 
             # After collecting all results
             if results_to_send:
                 payload_str = json.dumps(results_to_send, indent=2)
-                logger.info("About to send detection payload:\n%s", payload_str)
+                logger.debug("About to send detection payload:\n%s", payload_str)
                 success = await send_detection_data(results_to_send)
                 if not success:
                     logger.warning("Failed to send batch of results after multiple attempts")
@@ -1007,19 +1007,19 @@ class KafkaProcessor:
                 current_time = time.time()
                 if current_time - self.last_send_time >= self.send_interval:
                     payload_str = json.dumps(results_to_send, indent=2)
-                    logger.info("About to send detection payload:\n%s", payload_str)
+                    logger.debug("About to send detection payload:\n%s", payload_str)
                     send_task = asyncio.create_task(send_detection_data(results_to_send))
                     send_tasks.append(send_task)
                     self.last_send_time = current_time
-                    logger.info(f"Sent final batch of {len(results_to_send)} results")
+                    logger.debug(f"Sent final batch of {len(results_to_send)} results")
                     results_to_send = []  # Clear the list after sending
                 else:
                     # If we need to respect the interval, schedule the send for later
                     wait_time = self.send_interval - (current_time - self.last_send_time)
-                    logger.info(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
+                    logger.debug(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
                     await asyncio.sleep(wait_time)
                     payload_str = json.dumps(results_to_send, indent=2)
-                    logger.info("About to send detection payload:\n%s", payload_str)
+                    logger.debug("About to send detection payload:\n%s", payload_str)
                     send_task = asyncio.create_task(send_detection_data(results_to_send))
                     send_tasks.append(send_task)
                     self.last_send_time = time.time()
@@ -1038,7 +1038,7 @@ class KafkaProcessor:
             
             # Calculate batch processing time
             batch_time = time.time() - batch_start_time
-            logger.info(f"Batch processing completed in {batch_time:.3f}s")
+            logger.debug(f"Batch processing completed in {batch_time:.3f}s")
             
             # Schedule next batch immediately if frames are available
             buffer_status = self.frame_buffer.get_buffer_status()
@@ -1070,7 +1070,7 @@ class KafkaProcessor:
             mem_stats = proc.get_memory_stats()
             gpu_mem_stats.append(f"GPU{i}:{mem_stats['allocated_mb']:.1f}MB")
         
-        logger.info(f"Processing stats: frames={self.stats['frames_processed']}, "
+        logger.debug(f"Processing stats: frames={self.stats['frames_processed']}, "
                    f"avg_latency={avg_latency*1000:.1f}ms, p95_latency={p95_latency*1000:.1f}ms, "
                    f"buffer={buffer_status['total_frames']}/{buffer_status['max_total_size']} "
                    f"({buffer_status['utilization_percent']:.1f}%), "
@@ -1151,7 +1151,7 @@ class KafkaProcessor:
             logger.error(f"Error in main task loop: {e}")
         finally:
             # Clean up resources
-            logger.info("Cleaning up resources...")
+            logger.debug("Cleaning up resources...")
 
             # Close all Milvus clients
             for store_id, client in self.milvus_clients.items():
@@ -1372,7 +1372,7 @@ class KafkaProcessor:
                 camera_count = len(buffer_status['per_camera'])
                 
                 # Log health stats
-                logger.info(f"Health: RAM={memory_info.rss/1024/1024:.1f}MB, "
+                logger.debug(f"Health: RAM={memory_info.rss/1024/1024:.1f}MB, "
                            f"CPU={cpu_percent:.1f}%, "
                            f"BufferUtil={buffer_status['utilization_percent']:.1f}%, "
                            f"GPUMem=[{', '.join(gpu_utils)}], "
