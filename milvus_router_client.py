@@ -12,7 +12,7 @@ logger = logging.getLogger("async-milvus-router-client")
 class AsyncMilvusRouterClient:
     """Asynchronous client for interacting with the Milvus Router API from tracker code"""
     
-    def __init__(self, router_url, store_id, connection_timeout=10, 
+    def __init__(self, router_url, store_id, connection_timeout=30, 
                  embedding_dim=768, batch_size=100, max_retries=3):
         """
         Initialize client that connects to the Milvus Router instead of directly to Milvus
@@ -75,54 +75,108 @@ class AsyncMilvusRouterClient:
     
     async def insert_embedding(self, track_id, embedding, store_id, camera_id, timestamp):
         """
-        Insert a single embedding
+        Insert a single embedding with retry logic for timeouts
+        
         Returns:
-        bool: True if successful, False otherwise
+            bool: True if successful, False otherwise
         """
-        try:
-            if isinstance(track_id, tuple) and len(track_id) > 0:
-                track_id = track_id[0]
-                
-            # If track_id is None, generate a new one or return False
-            if track_id is None:
-                logger.error("Cannot insert embedding with None track_id")
-                return False
-                
-            # Ensure embedding is in the correct format
-            if isinstance(embedding, np.ndarray):
-                embedding = embedding.tolist()
-                
-            if len(embedding) != self.embedding_dim:
-                logger.error(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
-                return False
-                
-            # Prepare request data
-            data = {
-                "track_id": track_id,
-                "embedding": embedding,
-                "store_id": store_id,
-                "camera_id": camera_id,
-                "timestamp": timestamp
-            }
+        # Process track_id if it's a tuple
+        if isinstance(track_id, tuple) and len(track_id) > 0:
+            track_id = track_id[0]
             
-            # Send request to router
-            client = await self._get_client()
-            response = await client.post(
-                f"{self.router_url}/insert",
-                json=data
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"[Milvus] Inserted feature for track_id {track_id}.")
-                return True
-            else:
-                logger.error(f"Insert failed with status {response.status_code}: {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error inserting embedding: {str(e)}", exc_info=True)  # Include the error message and stack trace
+        # If track_id is None, return False
+        if track_id is None:
+            logger.error("Cannot insert embedding with None track_id")
             return False
+        
+        # Ensure embedding is in the correct format
+        if isinstance(embedding, np.ndarray):
+            embedding = embedding.tolist()
             
+        if len(embedding) != self.embedding_dim:
+            logger.error(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
+            return False
+        
+        # Prepare request data
+        data = {
+            "track_id": track_id,
+            "embedding": embedding,
+            "store_id": store_id,
+            "camera_id": camera_id,
+            "timestamp": timestamp
+        }
+        
+        # Implement retry logic with exponential backoff
+        for attempt in range(self.max_retries):
+            try:
+                # Get client and record start time
+                start_time = time.time()
+                client = await self._get_client()
+                
+                # Set per-request timeout that can be longer for insert operations
+                timeout = httpx.Timeout(30.0, connect=10.0)
+                
+                # Send request to router with extended timeout
+                response = await client.post(
+                    f"{self.router_url}/insert",
+                    json=data,
+                    timeout=timeout
+                )
+                
+                # Log the request duration
+                duration = time.time() - start_time
+                
+                if response.status_code == 200:
+                    logger.info(f"[Milvus] Inserted feature for track_id {track_id} (took {duration:.3f}s)")
+                    return True
+                else:
+                    logger.error(f"Insert failed with status {response.status_code}: {response.text} (took {duration:.3f}s)")
+                    
+                    # For certain status codes, we might want to retry
+                    if response.status_code >= 500:  # Server errors
+                        retry_delay = self._calculate_retry_delay(attempt)
+                        logger.warning(f"Server error, retrying in {retry_delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # For other status codes, don't retry
+                    return False
+                    
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as timeout_error:
+                # Handle timeout specifically with retry
+                retry_delay = self._calculate_retry_delay(attempt)
+                logger.warning(f"Timeout on attempt {attempt+1}/{self.max_retries} for track_id {track_id}: {timeout_error}")
+                logger.warning(f"Retrying in {retry_delay:.2f}s...")
+                await asyncio.sleep(retry_delay)
+                continue
+                
+            except Exception as e:
+                # Log other exceptions in detail
+                logger.error(f"Error inserting embedding for track_id {track_id}: {str(e)}", exc_info=True)
+                
+                # For certain exceptions we may want to retry
+                if isinstance(e, (httpx.NetworkError, ConnectionError)):
+                    retry_delay = self._calculate_retry_delay(attempt)
+                    logger.warning(f"Network error, retrying in {retry_delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                    
+                # For other exceptions, don't retry
+                return False
+        
+        # If we've exhausted all retries
+        logger.error(f"Failed to insert embedding for track_id {track_id} after {self.max_retries} attempts")
+        return False
+
+def _calculate_retry_delay(self, attempt):
+    """Calculate retry delay with exponential backoff and jitter"""
+    base_delay = 0.5
+    max_delay = 10.0
+    # Exponential backoff with jitter
+    delay = min(max_delay, base_delay * (2 ** attempt))
+    # Add jitter (±20%)
+    jitter = delay * 0.2 * (random.random() * 2 - 1)
+    return delay + jitter
     async def insert_embeddings_batch(
         self,
         track_ids,
