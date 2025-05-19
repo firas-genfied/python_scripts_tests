@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Tuple, Union, Optional
 import time
 from collections import defaultdict
+import random
 
 # Configure logging
 logger = logging.getLogger("async-milvus-router-client")
@@ -168,15 +169,16 @@ class AsyncMilvusRouterClient:
         logger.error(f"Failed to insert embedding for track_id {track_id} after {self.max_retries} attempts")
         return False
 
-def _calculate_retry_delay(self, attempt):
-    """Calculate retry delay with exponential backoff and jitter"""
-    base_delay = 0.5
-    max_delay = 10.0
-    # Exponential backoff with jitter
-    delay = min(max_delay, base_delay * (2 ** attempt))
-    # Add jitter (±20%)
-    jitter = delay * 0.2 * (random.random() * 2 - 1)
-    return delay + jitter
+    def _calculate_retry_delay(self, attempt):
+        """Calculate retry delay with exponential backoff and jitter"""
+        base_delay = 0.5
+        max_delay = 10.0
+        # Exponential backoff with jitter
+        delay = min(max_delay, base_delay * (2 ** attempt))
+        # Add jitter (±20%)
+        jitter = delay * 0.2 * (random.random() * 2 - 1)
+        return delay + jitter
+
     async def insert_embeddings_batch(
         self,
         track_ids,
