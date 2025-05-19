@@ -18,6 +18,7 @@ import random
 from typing import Dict, List, Tuple, Any, Optional, Union
 import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import httpx
 import redis
@@ -1096,12 +1097,44 @@ router = ShardedMilvusRouter(
 @app.on_event("startup")
 async def startup():
     """Initialize router on application startup"""
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                logger.info(f"Loaded configuration from {config_path}")
+            # Initialize shards from config
+            if "shards" in config:
+                for shard_id, shard_data in config["shards"].items():
+                    shard_config = ShardConfig(**shard_data)
+                    router.sharding_manager.shard_configs[shard_id] = shard_config
+                    logger.info(f"Added shard {shard_id}: {shard_config.host}:{shard_config.port}")
+                
+            # Initialize store-to-shard mappings
+            if "store_mappings" in config:
+                for store_id, shard_id in config["store_mappings"].items():
+                    router.sharding_manager.store_to_shard[store_id] = shard_id
+                logger.info(f"Mapped {len(config['store_mappings'])} stores to shards")
+                
+             # Log the configuration
+            logger.info(f"Router initialized with {len(router.sharding_manager.shard_configs)} shards and {len(router.sharding_manager.store_to_shard)} store mappings")
+        except Exception as e:
+            logger.error(f"Error loading configuration: {e}", exc_info=True)
+    else:
+        logger.info(f"No config file found at {config_path}, using environment variables or defaults")
     await router.start()
 
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup router on application shutdown"""
     await router.stop()
+
+@app.get("/health")
+async def health_check():
+    """
+    A simple liveness probe for your router.
+    """
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 # API Endpoints
 @app.post("/insert")
@@ -1128,6 +1161,35 @@ async def delete_track(request: DeleteRequest):
 async def get_topology():
     """Get the current sharding topology"""
     return await router.get_topology()
+
+# Add this to your milvus_sharding_router.py
+
+@app.get("/test_connection/{store_id}")
+async def test_connection(store_id: int):
+    """Test connection to the Milvus shard for a specific store"""
+    try:
+        # Get connection details
+        connection_alias, shard_id = await router._get_connection_for_store(store_id)
+        shard_config = router.connection_pool.shard_info[shard_id]
+        
+        # Try to list collections as a test
+        collection_list = utility.list_collections(using=connection_alias)
+        
+        return {
+            "success": True,
+            "store_id": store_id,
+            "shard_id": shard_id,
+            "host": shard_config.host,
+            "port": shard_config.port,
+            "collections": collection_list
+        }
+    except Exception as e:
+        logger.error(f"Connection test failed: {e}")
+        return {
+            "success": False,
+            "store_id": store_id,
+            "error": str(e)
+        }
 
 @app.get("/features/{track_id}/{store_id}")
 async def get_features(track_id: int, store_id: int):
