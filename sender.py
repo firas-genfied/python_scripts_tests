@@ -129,7 +129,7 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
         try:
             auth_headers = await auth_manager.get_auth_header()
             logger.info(f"Using auth headers: {auth_headers}")
-            logger.debug(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
+            logger.info(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
             
             async with aiohttp.ClientSession() as session:
                 logger.info("Creating POST request...")

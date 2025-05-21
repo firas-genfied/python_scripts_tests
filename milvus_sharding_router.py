@@ -381,7 +381,22 @@ class MilvusCollectionManager:
         collection = Collection(self.collection_name, using=connection_alias)
         
         if operation == "insert":
-            return collection.insert(**kwargs)
+            partition_name = kwargs.pop('partition_name', None)
+            if partition_name:
+                partitions = collection.partitions
+                partition_names = [p.name for p in partitions]
+                 if partition_name not in partition_names:
+                    try:
+                        collection.create_partition(partition_name)
+                        logger.info(f"Created partition {partition_name} in collection {self.collection_name}")
+                    except Exception as e:
+                        logger.warning(f"Error creating partition {partition_name}: {e}")
+
+                return collection.insert(partition_name=partition_name, **kwargs)
+            else:
+                # Insert to default partition
+                return collection.insert(**kwargs)
+
         elif operation == "search":
             return collection.search(**kwargs)
         elif operation == "query":
@@ -614,53 +629,67 @@ class ShardedMilvusRouter:
         try:
             # Group embeddings by store_id for efficiency
             store_groups = defaultdict(list)
-            
+            results = {}
+            all_shard_ids = set()
             for i in range(len(request.track_ids)):
                 store_id = request.store_ids[i]
                 store_groups[store_id].append(i)
                 
-            results = {}
-            
             # Process each store's data separately
             for store_id, indices in store_groups.items():
-                connection_alias, shard_id = await self._get_connection_for_store(store_id)
-                
-                # Prepare data for this store
-                track_ids = [request.track_ids[i] for i in indices]
-                embeddings = []
-                for i in indices:
-                    emb = request.embeddings[i]
-                    if isinstance(emb, np.ndarray):
-                        embeddings.append(emb.tolist())
-                    else:
-                        embeddings.append(emb)
-                # embeddings = [request.embeddings[i] for i in indices]
-                store_ids = [request.store_ids[i] for i in indices]
-                camera_ids = [request.camera_ids[i] for i in indices]
-                timestamps = [request.timestamps[i] for i in indices]
-                
-                data = [track_ids, embeddings, store_ids, camera_ids, timestamps]
-                
-                # Execute insert operation
-                store_result = await self.collection_manager.execute_operation(
-                    connection_alias=connection_alias,
-                    shard_id=shard_id,
-                    operation="insert",
-                    data=data
-                )
-                
-                # Flush to ensure data is committed
-                await self.collection_manager.execute_operation(
-                    connection_alias=connection_alias,
-                    shard_id=shard_id,
-                    operation="flush"
-                )
-                
-                results[store_id] = {
+                try:
+                    connection_alias, shard_id = await self._get_connection_for_store(store_id)
+                    
+                    # Prepare data for this store
+                    track_ids = [request.track_ids[i] for i in indices]
+                    embeddings = []
+                    for i in indices:
+                        emb = request.embeddings[i]
+                        if isinstance(emb, np.ndarray):
+                            embeddings.append(emb.tolist())
+                        else:
+                            embeddings.append(emb)
+                    # embeddings = [request.embeddings[i] for i in indices]
+                    store_ids = [request.store_ids[i] for i in indices]
+                    camera_ids = [request.camera_ids[i] for i in indices]
+                    timestamps = [request.timestamps[i] for i in indices]
+
+                    partition_name = f"stores_{store_id}_to_{store_id}"
+                    data = [None,track_ids, embeddings, store_ids, camera_ids, timestamps]
+                    
+                    # Execute insert operation
+                    store_result = await self.collection_manager.execute_operation(
+                        connection_alias=connection_alias,
+                        shard_id=shard_id,
+                        operation="insert",
+                        data=data,
+                        partition_name=partition_name
+                    )
+                    all_shard_ids.add(shard_id)
+                    
+                    results[store_id] = {
                     "shard_id": shard_id,
                     "insert_count": len(indices)
-                }
-                
+                    }
+                except Exception as store_error:
+                    logger.error(f"Error inserting data for store {store_id}: {store_error}")
+                    results[store_id] = {
+                        "shard_id": shard_id,
+                        "insert_count": 0,
+                        "success": False,
+                        "error": str(store_error)
+                    }
+
+            for shard_id in all_shard_ids:
+                try:
+                    connection_alias = await self.connection_pool.get_connection_alias(shard_id)
+                    await self.collection_manager.execute_operation(
+                        connection_alias=connection_alias,
+                        shard_id=shard_id,
+                        operation="flush"
+                    )
+                except Exception as flush_error:
+                    logger.error(f"Error flushing shard {shard_id}: {flush_error}")
             return {
                 "success": True,
                 "results": results,

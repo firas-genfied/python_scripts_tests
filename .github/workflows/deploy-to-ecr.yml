@@ -16,24 +16,24 @@ jobs:
         with:
           fetch-depth: 0
           submodules: 'recursive'
-      - name: Free disk space
-        run: |
-          # Remove large packages
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          # Remove unnecessary apt packages - using a different approach
-          sudo apt-get remove -y mono-devel || true
-          sudo apt-get remove -y ghc* || true
-          sudo apt-get remove -y dotnet* || true
-          sudo apt-get remove -y azure-cli google-cloud-sdk firefox powershell || true
-          sudo apt-get remove -y google-chrome-stable microsoft-edge-stable || true
-          sudo apt-get remove -y llvm-* || true
-          sudo apt-get autoremove -y
-          sudo apt-get clean
-          # Show available space
-          df -h
+      # - name: Free disk space
+      #   run: |
+      #     # Remove large packages
+      #     sudo rm -rf /usr/share/dotnet
+      #     sudo rm -rf /opt/ghc
+      #     sudo rm -rf /usr/local/share/boost
+      #     sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+      #     # Remove unnecessary apt packages - using a different approach
+      #     sudo apt-get remove -y mono-devel || true
+      #     sudo apt-get remove -y ghc* || true
+      #     sudo apt-get remove -y dotnet* || true
+      #     sudo apt-get remove -y azure-cli google-cloud-sdk firefox powershell || true
+      #     sudo apt-get remove -y google-chrome-stable microsoft-edge-stable || true
+      #     sudo apt-get remove -y llvm-* || true
+      #     sudo apt-get autoremove -y
+      #     sudo apt-get clean
+      #     # Show available space
+      #     df -h
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:

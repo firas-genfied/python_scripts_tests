@@ -12,6 +12,7 @@ import os
 from collections import defaultdict
 from milvus_read_client import MilvusReIDClient
 from .tracker_utils import calculate_cosine_distance, compute_iou, overlap_ratio_single_box, is_entering_store_percent
+import time
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
@@ -46,7 +47,16 @@ class AsyncTracker:
         logger.debug(f"Successfully receievd milvus client from processor to upate values for store {self.milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
-
+        self._feature_batch = {
+            'track_ids': [],
+            'embeddings': [],
+            'store_ids': [],
+            'camera_ids': [],
+            'timestamps': []
+        } #Created for batch fetaure insertion. Instead of inserting the features everytime a track gets confirmed/created, we store them temporarily and insert them in batches.
+        self._batch_size = 20
+        self._batch_interval = 1.0  # Maximum seconds between flush
+        self._last_batch_time = time.time()
         # Load or create the global database
         self.retired_ids = set()
 
@@ -65,26 +75,63 @@ class AsyncTracker:
     
     async def _insert_feature_into_milvus(self, track, detection):
         """
-        Insert the detection's feature into Milvus for a confirmed track.
+        Add feature to batch for later insertion.
 
         Args:
             track: The Track object being updated
             detection: The Detection object with the new feature
         """
         if track.state == TrackState.Confirmed and detection.feature is not None:
-            try:
-                camera_id = getattr(detection, "camera_id", 0)
-                timestamp = getattr(detection, "timestamp", 0)
-                await self.milvus_client.insert_embedding(
-                    track_id=track.track_id,
-                    embedding=detection.feature,
-                    store_id=self.store_id,
-                    camera_id=self.camera_id,
-                    timestamp=timestamp
-                )
-                logger.info(f"[Milvus] Inserted feature for track_id {track.track_id}.")
-            except Exception as e:
-                logger.error(f"[Milvus] Failed to insert feature for track_id {track.track_id}: {e}")
+            camera_id = getattr(detection, "camera_id", 0)
+            timestamp = getattr(detection, "timestamp", 0)
+            self._feature_batch['track_ids'].append(track.track_id)
+            self._feature_batch['embeddings'].append(detection.feature)
+            self._feature_batch['store_ids'].append(self.store_id)
+            self._feature_batch['camera_ids'].append(camera_id)
+            self._feature_batch['timestamps'].append(timestamp)
+            # Check if batch should be sent
+            current_len = len(self._feature_batch['track_ids'])
+            logger.info(f"current length of batches of features to be inserted: {current_len}")
+            if (current_len >= self._batch_size or
+                time.time() - self._last_batch_time > self._batch_interval):
+                logger.info("flushing data now")
+                await self._flush_feature_batch()
+    
+    async def _flush_feature_batch(self):
+        """Flush the feature batch to Milvus"""
+        if not self._feature_batch['track_ids']:
+            return  # Empty batch
+            
+        batch_size = len(self._feature_batch['track_ids'])
+        start_time = time.time()
+        try:
+            await self.milvus_client.insert_embeddings_batch(
+                track_ids=self._feature_batch['track_ids'],
+                embeddings=self._feature_batch['embeddings'],
+                store_ids=self._feature_batch['store_ids'],
+                camera_ids=self._feature_batch['camera_ids'],
+                timestamps=self._feature_batch['timestamps']
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"[Milvus] Batch inserted {batch_size} features in {elapsed:.3f}s ({batch_size/elapsed:.1f} features/sec)")
+        except Exception as e:
+            logger.error(f"[Milvus] Failed to batch insert {batch_size} features: {e}")
+        
+        # Reset batch
+        self._feature_batch = {
+            'track_ids': [],
+            'embeddings': [],
+            'store_ids': [],
+            'camera_ids': [],
+            'timestamps': []
+        }
+        self._last_batch_time = time.time()
+
+    # Add cleanup method
+    async def cleanup(self):
+        """Clean up and flush any remaining features"""
+        await self._flush_feature_batch()
+
 
     def predict(self):
         """Propagate track state distributions one time step forward."""
@@ -495,6 +542,9 @@ class AsyncTracker:
                     logger.debug(f"Assigned new ID {new_id} to overlapping detection {det_idx} and is a final assignment")
                     self._next_id += 1
         
+        # Add a conditional flush if batch is above a certain size
+        if len(self._feature_batch['track_ids']) >= self._batch_size // 2:
+            await self._flush_feature_batch()
         # SECOND: For remaining non-overlapping detections, use competition-based approach
         # For each track ID, find the detection that has the best match score
         id_to_best_detection = {}  # {track_id: (detection_idx, distance)}
@@ -718,6 +768,11 @@ class AsyncTracker:
         
         if features:
             self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
+        
+        # Check if it's time to flush the batch by time
+        current_time = time.time()
+        if current_time - self._last_batch_time > self._batch_interval:
+            await self._flush_feature_batch()
 
     async def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
