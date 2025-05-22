@@ -385,7 +385,7 @@ class MilvusCollectionManager:
             if partition_name:
                 partitions = collection.partitions
                 partition_names = [p.name for p in partitions]
-                 if partition_name not in partition_names:
+                if partition_name not in partition_names:
                     try:
                         collection.create_partition(partition_name)
                         logger.info(f"Created partition {partition_name} in collection {self.collection_name}")
