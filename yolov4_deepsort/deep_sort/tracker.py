@@ -54,8 +54,23 @@ class AsyncTracker:
             'camera_ids': [],
             'timestamps': []
         } #Created for batch fetaure insertion. Instead of inserting the features everytime a track gets confirmed/created, we store them temporarily and insert them in batches.
-        self._batch_size = 20
-        self._batch_interval = 1.0  # Maximum seconds between flush
+        try:
+            self._batch_size = int(os.environ.get("MILVUS_BATCH_SIZE", "20"))
+            self._batch_interval = float(os.environ.get("MILVUS_BATCH_INTERVAL", "1.0"))
+             # Validate values
+            if self._batch_size < 1:
+                logger.warning(f"Invalid MILVUS_BATCH_SIZE: {self._batch_size}, using default 20")
+                self._batch_size = 20
+
+            if self._batch_interval < 0.1:
+                logger.warning(f"Invalid MILVUS_BATCH_INTERVAL: {self._batch_interval}, using default 1.0")
+                self._batch_interval = 1.0
+            logger.info(f"Milvus batch configuration: size={self._batch_size}, interval={self._batch_interval}s")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error parsing batch configuration from environment: {e}")
+            logger.info("Using default batch configuration: size=20, interval=1.0s")
+            self._batch_size = 20
+            self._batch_interval = 1.0
         self._last_batch_time = time.time()
         # Load or create the global database
         self.retired_ids = set()
