@@ -12,7 +12,7 @@ from config import config
 
 # Configure Logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
+    level=logging.INFO,  # Changed to DEBUG for more detailed logs
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),        # Log to stdout
@@ -33,7 +33,7 @@ if not DETECTION_ENDPOINT:
     logger.error("Detection endpoint not found in configuration.")
     sys.exit(1)
 else:
-    logger.info(f"DETECTION ENDPOINT IS {DETECTION_ENDPOINT}")
+    logger.debug(f"DETECTION ENDPOINT IS {DETECTION_ENDPOINT}")
 
 if not AUTH_USERNAME or not AUTH_PASSWORD:
     logger.error("Authentication credentials not found in configuration or environment variables.")
@@ -56,7 +56,7 @@ async def initialize_auth():
         refresh_interval=AUTH_REFRESH_INTERVAL
     )
     await auth_manager.start()
-    logger.info("Authentication initialized")
+    logger.debug("Authentication initialized")
 
 def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     """
@@ -74,7 +74,7 @@ def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     for frame_data in detection_data:
         # Format according to API requirements
         if frame_data.get("no_of_people", 0) == 0:
-            logger.info(f"Skipping frame with no people detected: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
+            logger.debug(f"Skipping frame with no people detected: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
             continue
         result = {
             "camera_id": frame_data.get("camera_id", ""),
@@ -101,7 +101,7 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     """
     global auth_manager
     if auth_manager is None:
-        logger.info("Auth manager not initialized, initializing now...")
+        logger.debug("Auth manager not initialized, initializing now...")
         await initialize_auth()
 
     # Check for required config variables
@@ -109,17 +109,17 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
         logger.error("DETECTION_ENDPOINT is not set or empty")
         return False
     
-    logger.info(f"Will send data to endpoint: {DETECTION_ENDPOINT}")
+    logger.debug(f"Will send data to endpoint: {DETECTION_ENDPOINT}")
 
     try:
         # Process the detection data directly
         formatted_data = format_detection_data(detection_data)
         if not formatted_data:
-            logger.info("No frames with people detected, skipping API call")
+            logger.debug("No frames with people detected, skipping API call")
             return True
-        logger.info(f"Sending {len(formatted_data)} frames with people detected")
+        logger.debug(f"Sending {len(formatted_data)} frames with people detected")
         first_frame = formatted_data[0]
-        logger.info(f"Processed detection data for camera {first_frame.get('camera_id')} with {first_frame.get('no_of_people')} people, frame {first_frame.get('frame_id')}, time {first_frame.get('date_time')}")
+        logger.debug(f"Processed detection data for camera {first_frame.get('camera_id')} with {first_frame.get('no_of_people')} people, frame {first_frame.get('frame_id')}, time {first_frame.get('date_time')}")
     except Exception as e:
         logger.error(f"Failed to process detection data: {e}", exc_info=True)
         return False
@@ -128,32 +128,32 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     for attempt in range(MAX_RETRIES):
         try:
             auth_headers = await auth_manager.get_auth_header()
-            logger.info(f"Using auth headers: {auth_headers}")
-            logger.info(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
+            logger.debug(f"Using auth headers: {auth_headers}")
+            logger.debug(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
             
             async with aiohttp.ClientSession() as session:
-                logger.info("Creating POST request...")
+                logger.debug("Creating POST request...")
                 async with session.post(
                     DETECTION_ENDPOINT, 
                     json=formatted_data, 
                     headers=auth_headers, 
                     timeout=10
                 ) as response:
-                    logger.info(f"Received response with status code: {response.status}")
+                    logger.debug(f"Received response with status code: {response.status}")
                     
                     # Read and log the full response text
                     response_text = await response.text()
-                    logger.info(f"Response Text: {response_text}")
+                    logger.debug(f"Response Text: {response_text}")
                     
                     # Try to parse response as JSON if possible
                     try:
                         response_json = await response.json()
-                        logger.info(f"Response JSON: {json.dumps(response_json, indent=2)}")
+                        logger.debug(f"Response JSON: {json.dumps(response_json, indent=2)}")
                     except Exception:
-                        logger.info("Response was not a valid JSON")
+                        logger.debug("Response was not a valid JSON")
                     
                     if response.status == 200:
-                        logger.info(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")
+                        logger.debug(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")
                         return True
                     elif response.status == 401 or response.status == 403:
                         logger.error(f"Authentication error (status {response.status}). Refreshing token and retrying...")
@@ -167,19 +167,19 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
                             return False
                             
                         # Otherwise wait before retrying
-                        logger.info(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+                        logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
                         await asyncio.sleep(RETRY_DELAY)
         except aiohttp.ClientError as client_error:
             logger.error(f"HTTP Client error occurred: {client_error}", exc_info=True)
             if attempt == MAX_RETRIES - 1:
                 return False
-            logger.info(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+            logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
             await asyncio.sleep(RETRY_DELAY)
         except Exception as e:
             logger.error(f"An unexpected error occurred while sending data: {e}", exc_info=True)
             if attempt == MAX_RETRIES - 1:
                 return False
-            logger.info(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+            logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
             await asyncio.sleep(RETRY_DELAY)
     
     # If all retries failed
@@ -235,7 +235,7 @@ async def main():
         success = await send_detection_data(test_detection)
         
         if success:
-            logger.info("Test data sent successfully.")
+            logger.debug("Test data sent successfully.")
         else:
             logger.error("Failed to send test data after multiple attempts.")
             sys.exit(1)
@@ -253,7 +253,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Script interrupted by user.")
+        logger.debug("Script interrupted by user.")
     except Exception as e:
         logger.error(f"An unhandled exception occurred: {e}", exc_info=True)
         sys.exit(1)

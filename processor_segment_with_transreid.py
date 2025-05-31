@@ -24,7 +24,7 @@ from utils.detection_utils import has_left_store_percent, is_entering_store_perc
 from ultralytics import YOLO
 from status_checker import improved_human_status
 from PIL import Image
-BASE_DIR = os.getenv("BASE_DIR", "/app")
+BASE_DIR = os.getenv("BASE_DIR", "/home/azureuser/workstation/genfied/ObjectTracking")
 cfg.merge_from_file(os.path.join(BASE_DIR, "TransReID/configs/Market/vit_transreid.yml"))
 cfg.TEST.WEIGHT = os.path.join(BASE_DIR, "TransReID/models/vit_base_msmt.pth")
 cfg.MODEL.PRETRAIN_PATH = os.path.join(BASE_DIR, "TransReID/.cache/torch/checkpoints/jx_vit_base_p16_224-80ecf9dd.pth")
@@ -125,7 +125,7 @@ def setup_predictor():
 
 
 class Segmentation_DeepSort:
-    def __init__(self, camera_id, store_id, milvus_client, info_flag=True):
+    def __init__(self, camera_id, store_id, milvus_client, store_cache, info_flag=True):
         # Initialize YOLOv8 model
         self.seg_predictor = setup_predictor()
         # Initialize DeepSORT
@@ -136,8 +136,9 @@ class Segmentation_DeepSort:
         self.camera_id = camera_id
         self.store_id = store_id
         self.milvus_client = milvus_client
+        self.store_cache = store_cache
         logger.info(f"passing milvus_client to the tracker for store {self.milvus_client.store_id}")
-        self.tracker = AsyncTracker(self.metric, camera_id, store_id, self.milvus_client)
+        self.tracker = AsyncTracker(self.metric, camera_id, store_id, self.milvus_client, self.store_cache)
         
         # Flag for detailed information
         self.info_flag = info_flag

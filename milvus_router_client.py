@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple, Union, Optional
 import time
 from collections import defaultdict
 import random
+import os
 
 # Configure logging
 logger = logging.getLogger("async-milvus-router-client")
@@ -13,8 +14,8 @@ logger = logging.getLogger("async-milvus-router-client")
 class AsyncMilvusRouterClient:
     """Asynchronous client for interacting with the Milvus Router API from tracker code"""
     
-    def __init__(self, router_url, store_id, connection_timeout=30, 
-                 embedding_dim=768, batch_size=100, max_retries=3):
+    def __init__(self, router_url, store_id, connection_timeout=5, 
+                 embedding_dim=768, batch_size=100, max_retries=2):
         """
         Initialize client that connects to the Milvus Router instead of directly to Milvus
         
@@ -32,17 +33,42 @@ class AsyncMilvusRouterClient:
         self.embedding_dim = embedding_dim
         self.batch_size = batch_size
         self.max_retries = max_retries
+
+        # ADD: Global request limiter
+        self._max_concurrent = int(os.environ.get("MILVUS_MAX_CONCURRENT", "8"))
+        self._min_interval = float(os.environ.get("MILVUS_MIN_INTERVAL", "0.01"))
+        self._request_semaphore = asyncio.Semaphore(self._max_concurrent)
+        self._last_request_time = 0
+        self._min_request_interval = 0.01  # 10ms between requests
         
         # Create the HTTP client during initialization
         self._http_client = None
         
-        logger.info(f"Initialized AsyncMilvusRouterClient for store_id={store_id}, router={router_url}")
+        logger.info(f"Initialized AsyncMilvusRouterClient for store_id={self.store_id}, router={router_url}")
+
+    async def _rate_limited_request(self, operation):
+        async with self._request_semaphore:
+            # HIGH-VOLUME FIX: Minimal interval - we need throughput for 10s of cameras
+            now = time.time()
+            time_since_last = now - self._last_request_time
+            min_interval = 0.01  # FIXED: 10ms is reasonable for high volume
+            
+            if time_since_last < min_interval:
+                await asyncio.sleep(min_interval - time_since_last)
+            
+            self._last_request_time = time.time()
+            return await operation()
     
     async def _get_client(self):
         """Get or create the HTTP client for async operations"""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(
                 timeout=self.connection_timeout,
+                limits=httpx.Limits(
+                    max_keepalive_connections=20,  # Keep connections alive
+                    max_connections=50,
+                    keepalive_expiry=30.0
+                ),
                 headers={"Content-Type": "application/json"}
             )
         return self._http_client
@@ -81,93 +107,60 @@ class AsyncMilvusRouterClient:
         Returns:
             bool: True if successful, False otherwise
         """
-        # Process track_id if it's a tuple
-        if isinstance(track_id, tuple) and len(track_id) > 0:
-            track_id = track_id[0]
+        async def _insert_operation():
+            # Process track_id if it's a tuple
+            if isinstance(track_id, tuple) and len(track_id) > 0:
+                track_id = track_id[0]
+            else:
+                track_id = track_id
+                
+            # If track_id is None, return False
+            if track_id is None:
+                logger.error("Cannot insert embedding with None track_id")
+                return False
             
-        # If track_id is None, return False
-        if track_id is None:
-            logger.error("Cannot insert embedding with None track_id")
-            return False
-        
-        # Ensure embedding is in the correct format
-        if isinstance(embedding, np.ndarray):
-            embedding = embedding.tolist()
+            # Ensure embedding is in the correct format
+            if isinstance(embedding, np.ndarray):
+                embedding = embedding.tolist()
+            else:
+                embedding_list = embedding
+                
+            if len(embedding) != self.embedding_dim:
+                logger.error(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
+                return False
             
-        if len(embedding) != self.embedding_dim:
-            logger.error(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
-            return False
-        
-        # Prepare request data
-        data = {
-            "track_id": track_id,
-            "embedding": embedding,
-            "store_id": store_id,
-            "camera_id": camera_id,
-            "timestamp": timestamp
-        }
-        
-        # Implement retry logic with exponential backoff
-        for attempt in range(self.max_retries):
+            # Prepare request data
+            data = {
+                "track_id": track_id,
+                "embedding": embedding,
+                "store_id": store_id,
+                "camera_id": camera_id,
+                "timestamp": timestamp
+            }
+
             try:
-                # Get client and record start time
-                start_time = time.time()
                 client = await self._get_client()
-                
-                # Set per-request timeout that can be longer for insert operations
-                timeout = httpx.Timeout(30.0, connect=10.0)
-                
+                                
                 # Send request to router with extended timeout
                 response = await client.post(
                     f"{self.router_url}/insert",
-                    json=data,
-                    timeout=timeout
+                    json=data
                 )
-                
-                # Log the request duration
-                duration = time.time() - start_time
-                
+                                
                 if response.status_code == 200:
-                    logger.info(f"[Milvus] Inserted feature for track_id {track_id} (took {duration:.3f}s)")
+                    logger.info(f"[Milvus] Inserted feature for track_id {track_id}")
                     return True
                 else:
-                    logger.error(f"Insert failed with status {response.status_code}: {response.text} (took {duration:.3f}s)")
-                    
-                    # For certain status codes, we might want to retry
-                    if response.status_code >= 500:  # Server errors
-                        retry_delay = self._calculate_retry_delay(attempt)
-                        logger.warning(f"Server error, retrying in {retry_delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    
-                    # For other status codes, don't retry
+                    logger.error(f"Insert failed with status {response.status_code}: {response.text}")
                     return False
                     
-            except (httpx.ReadTimeout, httpx.ConnectTimeout) as timeout_error:
-                # Handle timeout specifically with retry
-                retry_delay = self._calculate_retry_delay(attempt)
-                logger.warning(f"Timeout on attempt {attempt+1}/{self.max_retries} for track_id {track_id}: {timeout_error}")
-                logger.warning(f"Retrying in {retry_delay:.2f}s...")
-                await asyncio.sleep(retry_delay)
-                continue
                 
             except Exception as e:
                 # Log other exceptions in detail
                 logger.error(f"Error inserting embedding for track_id {track_id}: {str(e)}", exc_info=True)
-                
-                # For certain exceptions we may want to retry
-                if isinstance(e, (httpx.NetworkError, ConnectionError)):
-                    retry_delay = self._calculate_retry_delay(attempt)
-                    logger.warning(f"Network error, retrying in {retry_delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
-                    await asyncio.sleep(retry_delay)
-                    continue
-                    
                 # For other exceptions, don't retry
                 return False
-        
-        # If we've exhausted all retries
-        logger.error(f"Failed to insert embedding for track_id {track_id} after {self.max_retries} attempts")
-        return False
+        return await self._rate_limited_request(_insert_operation)
 
     def _calculate_retry_delay(self, attempt):
         """Calculate retry delay with exponential backoff and jitter"""
@@ -194,61 +187,64 @@ class AsyncMilvusRouterClient:
         Returns:
             int: Number of successfully inserted embeddings
         """
-        if not track_ids or len(track_ids) == 0:
-            logger.warning("No embeddings provided for batch insert")
-            return 0
+        async def _batch_insert_operation():
+            if not track_ids or len(track_ids) == 0:
+                logger.warning("No embeddings provided for batch insert")
+                return 0
             
-        # Validate input lists have same length
-        if not (len(track_ids) == len(embeddings) == len(store_ids) == len(camera_ids) == len(timestamps)):
-            logger.error("All input lists must have the same length for batch insert")
-            return 0
+            # Validate input lists have same length
+            if not (len(track_ids) == len(embeddings) == len(store_ids) == len(camera_ids) == len(timestamps)):
+                logger.error("All input lists must have the same length for batch insert")
+                return 0
             
-        # Convert numpy arrays to lists
-        processed_embeddings = []
-        for emb in embeddings:
-            if isinstance(emb, np.ndarray):
-                processed_embeddings.append(emb.tolist())
-            else:
-                processed_embeddings.append(emb)
-        
-        batch_size = batch_size or self.batch_size
-        total_records = len(track_ids)
-        inserted_count = 0
-        
-        try:
-            client = await self._get_client()
-            
-            # Process in batches
-            for i in range(0, total_records, batch_size):
-                end_idx = min(i + batch_size, total_records)
-                
-                # Prepare batch data
-                batch_data = {
-                    "track_ids": track_ids[i:end_idx],
-                    "embeddings": processed_embeddings[i:end_idx],
-                    "store_ids": store_ids[i:end_idx],
-                    "camera_ids": camera_ids[i:end_idx],
-                    "timestamps": timestamps[i:end_idx]
-                }
-                
-                # Send batch to router
-                response = await client.post(
-                    f"{self.router_url}/batch_insert",
-                    json=batch_data
-                )
-                
-                if response.status_code == 200:
-                    batch_result = response.json()
-                    inserted_count += batch_result.get("total_inserted", 0)
+            # Convert numpy arrays to lists
+            processed_embeddings = []
+            for emb in embeddings:
+                if isinstance(emb, np.ndarray):
+                    processed_embeddings.append(emb.tolist())
                 else:
-                    logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                    processed_embeddings.append(emb)
+
+            batch_size = batch_size or self.batch_size
+            total_records = len(track_ids)
+            inserted_count = 0
+        
+            try:
+                client = await self._get_client()
+
+                # Process in batches
+                for i in range(0, total_records, batch_size):
+                    end_idx = min(i + batch_size, total_records)
+
+                    # Prepare batch data
+                    batch_data = {
+                        "track_ids": track_ids[i:end_idx],
+                        "embeddings": processed_embeddings[i:end_idx],
+                        "store_ids": store_ids[i:end_idx],
+                        "camera_ids": camera_ids[i:end_idx],
+                        "timestamps": timestamps[i:end_idx]
+                    }
+
+                    # Send batch to router
+                    response = await client.post(
+                        f"{self.router_url}/batch_insert",
+                        json=batch_data
+                    )
+                
+                    if response.status_code == 200:
+                        batch_result = response.json()
+                        inserted_count += batch_result.get("total_inserted", 0)
+                    else:
+                        logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
             
-            logger.info(f"Successfully inserted {inserted_count} embeddings in batches")
-            return inserted_count
+                logger.info(f"Successfully inserted {inserted_count} embeddings in batches")
+                return inserted_count
             
-        except Exception as e:
-            logger.error(f"Error in batch insert: {e}")
-            return inserted_count
+            except Exception as e:
+                logger.error(f"Error in batch insert: {e}")
+                return inserted_count
+
+        return await self._rate_limited_request(_batch_insert_operation)
     
     async def search_embedding(
         self,
@@ -267,53 +263,66 @@ class AsyncMilvusRouterClient:
         Returns:
             List of tuples: [(track_id, distance), ...]
         """
-        store_id = store_filter if store_filter is not None else self.store_id
-        max_retries = max_retries or self.max_retries
-        
-        # Convert numpy array to list
-        if isinstance(query_embedding, np.ndarray):
-            query_embedding = query_embedding.tolist()
+        async def _search_operation():
+            store_id = store_filter if store_filter is not None else self.store_id
+            max_retries = max_retries or self.max_retries
             
-        # Prepare request data
-        data = {
-            "embedding": query_embedding,
-            "store_id": store_id,
-            "top_k": top_k
-        }
-        
-        if camera_filter is not None:
-            data["camera_filter"] = camera_filter
-            
-        if min_similarity > 0:
-            data["min_similarity"] = min_similarity
-        
-        client = await self._get_client()
-            
-        # Execute with retry logic
-        for attempt in range(max_retries):
-            try:
-                response = await client.post(
-                    f"{self.router_url}/track/search",
-                    json=data
-                )
+            # Convert numpy array to list
+            if isinstance(query_embedding, np.ndarray):
+                query_embedding = query_embedding.tolist()
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    return result.get("results", [])
-                else:
-                    logger.error(f"Search attempt {attempt+1}/{max_retries} failed with status {response.status_code}: {response.text}")
+            # Prepare request data
+            data = {
+                "embedding": query_embedding,
+                "store_id": store_id,
+                "top_k": top_k
+            }
+            
+            if camera_filter is not None:
+                data["camera_filter"] = camera_filter
+                
+            if min_similarity > 0:
+                data["min_similarity"] = min_similarity
+            
+            client = await self._get_client()
+                
+            # Execute with retry logic
+            for attempt in range(max_retries):
+                try:
+                    response = await client.post(
+                        f"{self.router_url}/track/search",
+                        json=data,
+                        timeout = 3.0
+                    )
                     
-            except Exception as e:
-                logger.error(f"Search attempt {attempt+1}/{max_retries} failed: {e}")
-                
-            # Retry with exponential backoff (use asyncio.sleep instead of time.sleep)
-            if attempt < max_retries - 1:
-                backoff = retry_delay * (2 ** attempt)
-                logger.info(f"Retrying in {backoff:.2f} seconds...")
-                await asyncio.sleep(backoff)
-                
-        logger.error("All search attempts failed")
-        return []
+                    if response.status_code == 200:
+                        result = response.json()
+                        return result.get("results", [])
+                    elif response.status_code < 500:
+                        logger.debug(f"Search client error {response.status_code} - not retrying")
+                        return []
+                    else:
+                        logger.error(f"Search attempt {attempt+1}/{max_retries} failed with status {response.status_code}: {response.text}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1)
+                            continue
+
+                except asyncio.TimeoutError:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                except Exception as e:
+                    logger.error(f"Search attempt {attempt+1}/{max_retries} failed: {e}")
+                    # Retry with exponential backoff (use asyncio.sleep instead of time.sleep)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.05)
+                        continue
+                    
+            logger.error("All search attempts failed")
+            return []
+
+        return await self._rate_limited_request(_search_operation)
     
     async def get_features_by_track_id(self, track_id, store_id=None):
         """
@@ -322,34 +331,36 @@ class AsyncMilvusRouterClient:
         Returns:
             List of feature embeddings (numpy arrays)
         """
-        store_id = store_id if store_id is not None else self.store_id
+        async def _get_features_operation():
+            effective_store_id = store_id if store_id is not None else self.store_id
 
-        if isinstance(track_id, tuple) and len(track_id) > 0:
-            track_id = track_id[0]
-        
-        # If track_id is None, return empty list
-        if track_id is None:
-            logger.info(f"Cannot retrieve features for None track_id")
-            return []
+            if isinstance(track_id, tuple) and len(track_id) > 0:
+                track_id = track_id[0]
             
-        try:
-            client = await self._get_client()
-            response = await client.get(
-                f"{self.router_url}/track/features/{track_id}/{store_id}"
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                # Convert list features to numpy arrays
-                features = [np.array(f, dtype=np.float32) for f in result.get("features", [])]
-                return features
-            else:
-                logger.error(f"Get features failed with status {response.status_code}: {response.text}")
+            # If track_id is None, return empty list
+            if track_id is None:
+                logger.info(f"Cannot retrieve features for None track_id")
                 return []
                 
-        except Exception as e:
-            logger.error(f"Error retrieving features for track_id={track_id}: {e}")
-            return []
+            try:
+                client = await self._get_client()
+                response = await client.get(
+                    f"{self.router_url}/track/features/{track_id}/{effective_store_id}"
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    # Convert list features to numpy arrays
+                    features = [np.array(f, dtype=np.float32) for f in result.get("features", [])]
+                    return features
+                else:
+                    logger.error(f"Get features failed with status {response.status_code}: {response.text}")
+                    return []
+                    
+            except Exception as e:
+                logger.error(f"Error retrieving features for track_id={track_id}: {e}")
+                return []
+        return await self._rate_limited_request(_get_features_operation)
     
     async def get_all_track_features(self, store_id, limit=100):
         """
@@ -358,30 +369,51 @@ class AsyncMilvusRouterClient:
         Returns:
             Dict mapping track_ids to lists of feature embeddings
         """
-        store_id = store_id if store_id is not None else self.store_id
-        safe_limit = min(limit, 16384)
-        try:
-            client = await self._get_client()
-            response = await client.get(
-                f"{self.router_url}/track/allfeatures/{store_id}?limit={limit}"
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
+        async def _get_all_features_operation():
+            effective_store_id = store_id if store_id is not None else self.store_id
+            safe_limit = min(limit, 16384)
+            try:
+                client = await self._get_client()
+                response = await client.get(
+                    f"{self.router_url}/track/allfeatures/{effective_store_id}?limit={limit}"
+                )
                 
-                # Convert to dict of numpy arrays
-                feature_map = {}
-                for track_id_str, embeddings in result.items():
-                    track_id = int(track_id_str)
-                    feature_map[track_id] = [np.array(emb, dtype=np.float32) for emb in embeddings]
-                
-                return feature_map
-            else:
-                logger.error(f"Get all features failed with status {response.status_code}: {response.text}")
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Convert to dict of numpy arrays
+                    feature_map = {}
+                    for track_id_str, embeddings in result.items():
+                        track_id = int(track_id_str)
+                        feature_map[track_id] = [np.array(emb, dtype=np.float32) for emb in embeddings]
+                    
+                    return feature_map
+                else:
+                    logger.error(f"Get all features failed with status {response.status_code}: {response.text}")
+                    return {}
+                    
+            except Exception as e:
+                logger.error(f"Failed to query embeddings: {e}")
                 return {}
-                
-        except Exception as e:
-            logger.error(f"Failed to query embeddings: {e}")
+        return await self._rate_limited_request(_get_all_features_operation)
+
+    async def _get_all_features_without_rate_limit(self, store_id, limit=100):
+        """Internal method to get all features without rate limiting"""
+        safe_limit = min(limit, 16384)
+        
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.router_url}/track/allfeatures/{store_id}?limit={safe_limit}"
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            feature_map = {}
+            for track_id_str, embeddings in result.items():
+                track_id = int(track_id_str)
+                feature_map[track_id] = [np.array(emb, dtype=np.float32) for emb in embeddings]
+            return feature_map
+        else:
             return {}
     
     async def get_all_track_ids(self, store_id):
@@ -391,17 +423,19 @@ class AsyncMilvusRouterClient:
         Returns:
             List of unique track IDs
         """
-        store_id = store_id if store_id is not None else self.store_id
-        
-        try:
-            # Get all track features and extract just the keys
-            feature_map = await self.get_all_track_features(store_id)
-            track_ids = list(feature_map.keys())
-            return track_ids
-                
-        except Exception as e:
-            logger.error(f"Error fetching track_ids for store_id {store_id}: {e}")
-            return []
+        async def _get_ids_operation():
+            effective_store_id = store_id if store_id is not None else self.store_id
+            
+            try:
+                # Get all track features and extract just the keys
+                feature_map = await self._get_all_features_without_rate_limit(effective_store_id)
+                track_ids = list(feature_map.keys())
+                return track_ids
+                    
+            except Exception as e:
+                logger.error(f"Error fetching track_ids for store_id {effective_store_id}: {e}")
+                return []
+        return await self._rate_limited_request(_get_ids_operation)
     
     async def delete_track(self, track_id, store_id):
         """
@@ -410,32 +444,34 @@ class AsyncMilvusRouterClient:
         Returns:
             bool: True if successful, False otherwise
         """
-        store_id = store_id if store_id is not None else self.store_id
-        
-        try:
-            # Prepare request data
-            data = {
-                "track_id": track_id,
-                "store_id": store_id
-            }
+        async def _delete_operation():
+            effective_store_id = store_id if store_id is not None else self.store_id
             
-            # Send delete request to router
-            client = await self._get_client()
-            response = await client.post(
-                f"{self.router_url}/delete",
-                json=data
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("deleted", False)
-            else:
-                logger.error(f"Delete failed with status {response.status_code}: {response.text}")
-                return False
+            try:
+                # Prepare request data
+                data = {
+                    "track_id": track_id,
+                    "store_id": effective_store_id
+                }
                 
-        except Exception as e:
-            logger.error(f"Failed to delete track_id={track_id}, store_id={store_id}: {e}")
-            return False
+                # Send delete request to router
+                client = await self._get_client()
+                response = await client.post(
+                    f"{self.router_url}/delete",
+                    json=data
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("deleted", False)
+                else:
+                    logger.error(f"Delete failed with status {response.status_code}: {response.text}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Failed to delete track_id={track_id}, store_id={effective_store_id}: {e}")
+                return False
+        return await self._rate_limited_request(_delete_operation)
     
     async def find_next_best_match(self, feature, assigned_ids, max_candidates=5, distance_threshold=0.7):
         """
@@ -450,63 +486,195 @@ class AsyncMilvusRouterClient:
         Returns:
             Tuple[int or None, float]: (track_id, distance) or (None, inf) if no good match found
         """
-        try:
-            # Perform general search
-            results = await self.search_embedding(
-                query_embedding=feature,
-                store_filter=self.store_id,
-                top_k=max_candidates * 2  # Get more results for filtering
-            )
+        async def _find_match_operation():
+            try:
+                # Perform general search
+                results = await self.search_embedding(
+                    query_embedding=feature,
+                    store_filter=self.store_id,
+                    top_k=max_candidates * 2  # Get more results for filtering
+                )
 
-            # Filter out assigned IDs and keep only those below threshold
-            unassigned_matches = []
-            for track_id, distance in results:
-                if track_id not in assigned_ids and distance < distance_threshold:
-                    unassigned_matches.append((track_id, distance))
-            
-            # Sort by distance and return best match
-            unassigned_matches.sort(key=lambda x: x[1])
-            
-            if unassigned_matches:
-                best_track_id, best_distance = unassigned_matches[0]
-                logger.info(f"Found unassigned match: track_id={best_track_id}, distance={best_distance}")
-                return best_track_id, best_distance
-            
-            logger.info(f"No suitable unassigned match found below threshold {distance_threshold}")
-            return None, float('inf')
-        except Exception as e:
-            logger.error(f"Error finding next best match: {e}")
-            return None, float('inf')
+                # Filter out assigned IDs and keep only those below threshold
+                unassigned_matches = []
+                for track_id, distance in results:
+                    if track_id not in assigned_ids and distance < distance_threshold:
+                        unassigned_matches.append((track_id, distance))
+                
+                # Sort by distance and return best match
+                unassigned_matches.sort(key=lambda x: x[1])
+                
+                if unassigned_matches:
+                    best_track_id, best_distance = unassigned_matches[0]
+                    logger.info(f"Found unassigned match: track_id={best_track_id}, distance={best_distance}")
+                    return best_track_id, best_distance
+                
+                logger.info(f"No suitable unassigned match found below threshold {distance_threshold}")
+                return None, float('inf')
+            except Exception as e:
+                logger.error(f"Error finding next best match: {e}")
+                return None, float('inf')
+        return await self._rate_limited_request(_find_match_operation)
             
     # Batch processing methods
     
     async def search_embeddings_batch(self, embeddings_list, top_k=5, store_id=None):
-        """
-        Search for multiple embeddings in parallel
+        """HIGH-VOLUME FIX: Optimized batch search for 10s of cameras at 5-10 FPS"""
         
-        Args:
-            embeddings_list: List of embedding vectors to search for
-            top_k: Maximum number of results to return for each query
-            store_id: Store ID to filter by (defaults to client's store_id)
+        async def _batch_search_operation():
+            effective_store_id = store_id if store_id is not None else self.store_id
             
-        Returns:
-            List of search results (one per input embedding)
-        """
-        store_id = store_id if store_id is not None else self.store_id
+            if not embeddings_list:
+                return []
+            
+            # HIGH-VOLUME FIX: Larger threshold before fallback - batch is more efficient
+            if len(embeddings_list) > 15:  # FIXED: Allow larger batches for efficiency
+                logger.debug(f"Very large batch ({len(embeddings_list)} items), splitting into chunks")
+                # Split into manageable chunks
+                chunk_size = 10
+                all_results = []
+                for i in range(0, len(embeddings_list), chunk_size):
+                    chunk = embeddings_list[i:i + chunk_size]
+                    chunk_results = await self.search_embeddings_batch(chunk, top_k, effective_store_id)
+                    all_results.extend(chunk_results)
+                    # Small delay between chunks
+                    if i + chunk_size < len(embeddings_list):
+                        await asyncio.sleep(0.02)  # 20ms between chunks
+                return all_results
+
+            processed_embeddings = []
+            for embedding in embeddings_list:
+                if isinstance(embedding, np.ndarray):
+                    processed_embeddings.append(embedding.tolist())
+                else:
+                    processed_embeddings.append(embedding)
+
+            batch_data = {
+                "embeddings": processed_embeddings,
+                "store_id": effective_store_id,
+                "top_k": top_k
+            }
+            
+            try:
+                client = await self._get_client()
+                
+                # HIGH-VOLUME FIX: Try batch twice with short timeout, then fallback
+                for attempt in range(2):
+                    try:
+                        response = await client.post(
+                            f"{self.router_url}/batch_search",
+                            json=batch_data,
+                            timeout=5.0  # 5 second timeout for batches
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            return result.get("results", [])
+                        elif response.status_code >= 500 and attempt == 0:
+                            # Server error - quick retry once
+                            await asyncio.sleep(0.1)
+                            continue
+                        else:
+                            break
+                            
+                    except asyncio.TimeoutError:
+                        if attempt == 0:
+                            await asyncio.sleep(0.1)
+                            continue
+                        else:
+                            break
+                            
+                # Fallback to smart individual/micro-batch processing
+                logger.debug(f"Batch search failed, using fallback for {len(embeddings_list)} items")
+                return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
+                    
+            except Exception as e:
+                logger.debug(f"Batch search error: {e}, using fallback")
+                return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
         
-        # Create tasks for all searches
-        tasks = []
-        for embedding in embeddings_list:
-            task = self.search_embedding(
-                query_embedding=embedding, 
-                top_k=top_k, 
-                store_filter=store_id
-            )
-            tasks.append(task)
-            
-        # Run all searches in parallel
-        results = await asyncio.gather(*tasks)
+        return await self._rate_limited_request(_batch_search_operation)
+
+    # Add this helper method to handle fallbacks
+    async def _fallback_individual_searches(self, embeddings_list, top_k, store_id):
+        """Fallback: perform individual searches when batch fails"""
+        results = []
+        effective_store_id = store_id if store_id is not None else self.store_id
+        micro_batch_size = 3
+        for i in range(0, len(embeddings_list), micro_batch_size):
+            micro_batch = embeddings_list[i:i + micro_batch_size]
+            if len(micro_batch) == 1:
+                try:
+                    individual_result = await self._individual_search_without_rate_limit(
+                    micro_batch[0], top_k, effective_store_id
+                    )
+                    results.append(individual_result)
+                except Exception as e:
+                    logger.debug(f"Individual search failed: {e}")
+                    results.append([])
+            else:
+                try:
+                    processed_embeddings = []
+                    for embedding in micro_batch:
+                        if isinstance(embedding, np.ndarray):
+                            processed_embeddings.append(embedding.tolist())
+                        else:
+                            processed_embeddings.append(embedding)
+                    batch_data = {
+                        "embeddings": processed_embeddings,
+                        "store_id": effective_store_id,
+                        "top_k": top_k
+                    }   
+                    client = await self._get_client()
+                    response = await client.post(f"{self.router_url}/batch_search", json=batch_data, timeout=2.0)
+                    if response.status_code == 200:
+                        batch_results = response.json().get("results", [])
+                        results.extend(batch_results)
+                    else:
+                        # Fall back to individual for this micro-batch
+                        for embedding in micro_batch:
+                            try:
+                                individual_result = await self._individual_search_without_rate_limit(
+                                    embedding, top_k, effective_store_id
+                                )
+                                results.append(individual_result)
+                            except:
+                                results.append([])
+                except:
+                    # Fall back to individual for this micro-batch
+                    for embedding in micro_batch:
+                        try:
+                            individual_result = await self._individual_search_without_rate_limit(
+                                embedding, top_k, effective_store_id
+                            )
+                            results.append(individual_result)
+                        except:
+                            results.append([])
+            if i + micro_batch_size < len(embeddings_list):
+                await asyncio.sleep(0.05)
         return results
+
+
+    async def _individual_search_without_rate_limit(self, embedding, top_k, store_id):
+        """Individual search without rate limiting (for internal use only)"""
+        effective_store_id = store_id if store_id is not None else self.store_id
+        if isinstance(embedding, np.ndarray):
+            embedding = embedding.tolist()
+            
+        data = {
+            "embedding": embedding,
+            "store_id": effective_store_id,
+            "top_k": top_k
+        }
+        
+        client = await self._get_client()
+        response = await client.post(f"{self.router_url}/track/search", json=data)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("results", [])
+        else:
+            return []
+
     
     async def insert_embeddings_concurrent(self, track_ids, embeddings, store_ids, camera_ids, timestamps):
         """

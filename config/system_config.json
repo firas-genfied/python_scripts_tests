@@ -4,9 +4,9 @@
          "enabled": true,
          "devices": [0],
          "memory_limit_mb_per_gpu": 4096,
-         "batch_size_per_gpu": 30,
+         "batch_size_per_gpu": 32,
          "load_balancing": "memory_based",
-         "num_processors": 2
+         "num_processors": 1
        },
        "thread_pool": {
          "max_workers": 8
@@ -20,6 +20,9 @@
        "batch_interval": 0.3, 
        "processing_fps": 5,
        "mode": "batch" 
+    },
+    "result_database": {
+      "send_fps": 1
     },
     "buffer_settings": {
        "max_size_per_camera": 60,
@@ -63,7 +66,7 @@
        },
        "result_sending": {
          "endpoint": "http://analytics-server:8080/api/results",
-         "batch_size": 10, 
+         "batch_size": 4, 
          "timeout": 5.0, 
          "retry_count": 3
        }

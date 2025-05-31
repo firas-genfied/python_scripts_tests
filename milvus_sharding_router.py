@@ -12,7 +12,6 @@ This router sits between client applications and Milvus shards, providing:
 import os
 import time
 import asyncio
-import logging
 import json
 import random
 from typing import Dict, List, Tuple, Any, Optional, Union
@@ -62,6 +61,12 @@ class SearchRequest(BaseModel):
     camera_filter: Optional[int] = None
     min_similarity: float = 0.0
 
+class BatchSearchRequest(BaseModel):
+    embeddings: List[List[float]]
+    store_id: int
+    top_k: int = 5
+    min_similarity: float = 0.0
+
 class DeleteRequest(BaseModel):
     track_id: int
     store_id: int
@@ -80,6 +85,7 @@ class StoreShardMapping(BaseModel):
 class TopologyResponse(BaseModel):
     shards: Dict[str, ShardConfig]
     store_mappings: Dict[str, str]
+
 
 class ConnectionPool:
     """Manages and pools connections to Milvus shards"""
@@ -164,10 +170,12 @@ class ConnectionPool:
                     if current_time - self.connections[shard_id][connection_alias] > max_idle_time:
                         try:
                             connections.disconnect(connection_alias)
-                            del self.connections[shard_id][connection_alias]
-                            logger.info(f"Closed stale connection to shard {shard_id}: {connection_alias}")
+                            if connection_alias in connections.list_connections():
+                                logger.warning(f"Connection {connection_alias} still exists after disconnect")
                         except Exception as e:
-                            logger.error(f"Error closing connection {connection_alias}: {e}")
+                            logger.error(f"Force cleanup connection {connection_alias}: {e}")
+                         finally:
+                            self.connections[shard_id].pop(connection_alias, None)
 
 class ShardingManager:
     """Manages store-to-shard mapping and shard topology"""
@@ -765,6 +773,62 @@ class ShardedMilvusRouter:
             logger.error(f"Search error: {e}")
             raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+    # Add this method to the ShardedMilvusRouter class
+    async def search_embeddings_batch(self, request: BatchSearchRequest):
+        """Search for similar embeddings in batch"""
+        try:
+            connection_alias, shard_id = await self._get_connection_for_store(request.store_id)
+            
+            # Prepare search parameters
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64}
+            }
+            
+            # Prepare filter expression
+            expr = f"store_id == {request.store_id}"
+            
+            # Convert embeddings to numpy array
+            query_embeddings = np.array(request.embeddings)
+            
+            # Execute batch search operation
+            results = await self.collection_manager.execute_operation(
+                connection_alias=connection_alias,
+                shard_id=shard_id,
+                operation="search",
+                data=query_embeddings,
+                anns_field="embedding",
+                param=search_params,
+                limit=request.top_k,
+                expr=expr,
+                output_fields=["track_id", "store_id", "camera_id", "timestamp"]
+            )
+            
+            # Process results for each query
+            batch_results = []
+            for query_results in results:
+                query_matches = []
+                for hit in query_results:
+                    # Convert distance to similarity
+                    similarity = 1.0 - hit.distance
+                    
+                    # Only include results above minimum similarity threshold
+                    if similarity >= request.min_similarity:
+                        # For tracker compatibility, return (track_id, distance) tuples
+                        query_matches.append((hit.entity.get("track_id"), hit.distance))
+                
+                batch_results.append(query_matches)
+            
+            return {
+                "success": True,
+                "shard_id": shard_id,
+                "results": batch_results
+            }
+            
+        except Exception as e:
+            logger.error(f"Batch search error: {e}")
+            raise HTTPException(status_code=500, detail=f"Batch search failed: {str(e)}")
+
     async def search_embedding_for_tracker(self, query_embedding, store_id, top_k=10):
         """
         Search for similar embeddings specifically optimized for tracker usage.
@@ -1047,6 +1111,7 @@ class ShardedMilvusRouter:
                     track_id_int = int(track_id)
                 except Exception as e:
                     logger.error(f"Cannot convert track ID '{track_id}' to integer: {e}")
+                    continue
                 embeddings = []
                 for f in features_data:
                     logger.debug(f"Track {track_id_int}, feature entry type: {type(f)}, value: {f}")
@@ -1180,6 +1245,12 @@ async def insert_embeddings_batch(request: BatchEmbeddingRequest):
 async def search_embedding(request: SearchRequest):
     """Search for similar embeddings"""
     return await router.search_embedding(request)
+
+# Add this API endpoint at the bottom with other endpoints
+@app.post("/batch_search")
+async def search_embeddings_batch(request: BatchSearchRequest):
+    """Search for multiple embeddings in a single batch"""
+    return await router.search_embeddings_batch(request)
 
 @app.post("/delete")
 async def delete_track(request: DeleteRequest):

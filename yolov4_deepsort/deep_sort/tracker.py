@@ -24,29 +24,36 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+from typing import List, Dict, Tuple, Union, Optional  # Add List to existing import
 
 
 class AsyncTracker:
     """
-    This is the Asynchronous multi-target tracker.
+    This is the Asynchronous multi-target tracker with shared store cache.
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, camera_id, store_id, milvus_client, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
+    def __init__(self, metric, camera_id, store_id, milvus_client, store_cache=None, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
         self.metric = metric
         self.max_age = max_age
         self.n_init = n_init
         self.matching_threshold = matching_threshold  # Set the matching threshold
-        # logger.info(f"MATCHING THRESHOLD IS {self.matching_threshold}")
-        # logger.info(f"METRIC MATCHING THRESHOLD IS {self.metric.matching_threshold}")
+        self.store_id = store_id
+        self.store_cache = store_cache
+        self.use_shared_cache = False
+        if self.use_shared_cache:
+            logger.info(f"[Tracker-{camera_id}] Using shared store cache for store {self.store_id}")
+        else:
+            logger.warning(f"[Tracker-{camera_id}] No shared cache provided, will use individual queries")
+        # logger.debug(f"MATCHING THRESHOLD IS {self.matching_threshold}")
+        # logger.debug(f"METRIC MATCHING THRESHOLD IS {self.metric.matching_threshold}")
         self.kf = kalman_filter_anuj.KalmanFilter(dt = 1/25)
         self.tracks = []
         self._next_id = 1
         self.milvus_client = milvus_client
         self.max_iou_distance = max_iou_distance
-        logger.debug(f"Successfully receievd milvus client from processor to upate values for store {self.milvus_client.store_id}")
+        logger.debug(f"Successfully receievd milvus client from processor to upate values for store {self.store_id}")
         self.camera_id = camera_id
-        self.store_id = store_id
         self._feature_batch = {
             'track_ids': [],
             'embeddings': [],
@@ -55,7 +62,7 @@ class AsyncTracker:
             'timestamps': []
         } #Created for batch fetaure insertion. Instead of inserting the features everytime a track gets confirmed/created, we store them temporarily and insert them in batches.
         try:
-            self._batch_size = int(os.environ.get("MILVUS_BATCH_SIZE", "20"))
+            self._batch_size = int(os.environ.get("MILVUS_BATCH_SIZE", "50"))
             self._batch_interval = float(os.environ.get("MILVUS_BATCH_INTERVAL", "1.0"))
              # Validate values
             if self._batch_size < 1:
@@ -65,28 +72,49 @@ class AsyncTracker:
             if self._batch_interval < 0.1:
                 logger.warning(f"Invalid MILVUS_BATCH_INTERVAL: {self._batch_interval}, using default 1.0")
                 self._batch_interval = 1.0
-            logger.info(f"Milvus batch configuration: size={self._batch_size}, interval={self._batch_interval}s")
+            logger.debug(f"Milvus batch configuration: size={self._batch_size}, interval={self._batch_interval}s")
         except (ValueError, TypeError) as e:
             logger.error(f"Error parsing batch configuration from environment: {e}")
-            logger.info("Using default batch configuration: size=20, interval=1.0s")
+            logger.debug("Using default batch configuration: size=20, interval=1.0s")
             self._batch_size = 20
             self._batch_interval = 1.0
         self._last_batch_time = time.time()
         # Load or create the global database
         self.retired_ids = set()
 
+    async def _search_with_shared_cache(self, features: List[np.ndarray], exclude_ids: set = None,
+                                        threshold: float = None, top_k: int = 10):
+            """
+            Perform batch search using shared store cache.
+            """
+            if not self.use_shared_cache:
+                # Fallback to regular Milvus search
+                return await self.milvus_client.search_embeddings_batch(
+                    embeddings_list=features,
+                    top_k=top_k,
+                    store_id=self.store_id
+                )
+            
+            # Use shared cache for batch search
+            return await self.store_cache.batch_search_in_cache(
+                features=features,
+                exclude_ids=exclude_ids,
+                threshold=threshold,
+                top_k=top_k
+            )
+
     async def mark_track_as_left(self, track):
         """Mark a track as left and retire its ID."""
         try:
             await self.milvus_client.delete_track(track_id=track.track_id, store_id=self.store_id)
-            logger.info(f"Deleted track {track.track_id} from Milvus collection.")
+            logger.debug(f"Deleted track {track.track_id} from Milvus collection.")
         except Exception as e:
             logger.error(f"Error deleting track {track.track_id} from Milvus: {e}")
         
         self.retired_ids.add(track.track_id)
         # Mark the track as deleted so it will be removed from active tracking
         track.state = TrackState.Deleted
-        logger.info(f"Track {track.track_id} retired and removed from global database.")
+        logger.debug(f"Track {track.track_id} retired and removed from global database.")
     
     async def _insert_feature_into_milvus(self, track, detection):
         """
@@ -106,10 +134,10 @@ class AsyncTracker:
             self._feature_batch['timestamps'].append(timestamp)
             # Check if batch should be sent
             current_len = len(self._feature_batch['track_ids'])
-            logger.info(f"current length of batches of features to be inserted: {current_len}")
+            logger.debug(f"current length of batches of features to be inserted: {current_len}")
             if (current_len >= self._batch_size or
                 time.time() - self._last_batch_time > self._batch_interval):
-                logger.info("flushing data now")
+                logger.debug("flushing data now")
                 await self._flush_feature_batch()
     
     async def _flush_feature_batch(self):
@@ -128,7 +156,7 @@ class AsyncTracker:
                 timestamps=self._feature_batch['timestamps']
             )
             elapsed = time.time() - start_time
-            logger.info(f"[Milvus] Batch inserted {batch_size} features in {elapsed:.3f}s ({batch_size/elapsed:.1f} features/sec)")
+            logger.debug(f"[Milvus] Batch inserted {batch_size} features in {elapsed:.3f}s ({batch_size/elapsed:.1f} features/sec)")
         except Exception as e:
             logger.error(f"[Milvus] Failed to batch insert {batch_size} features: {e}")
         
@@ -190,7 +218,7 @@ class AsyncTracker:
                     logger.debug(f"[Milvus] Best unassigned match: track_id={track_id}, distance={distance}")
                     return track_id, distance
 
-            logger.info("[Milvus] No unassigned track ID below threshold.")
+            logger.debug("[Milvus] No unassigned track ID below threshold.")
             return None, float('inf')
 
         except Exception as e:
@@ -232,7 +260,7 @@ class AsyncTracker:
 
     async def update(self, detections):
         """
-        Comprehensive update method with location constraint for new ID creation.
+        Comprehensive update method using shared store cache for searches with location constraint for new ID creation.
         Includes an exception for the first 250 frames (10 seconds) to handle abrupt camera startup.
         
         Combines robust features from original competition-based matching while maintaining
@@ -242,6 +270,7 @@ class AsyncTracker:
         to choose the best match for detections in the center/bottom of the frame,
         EXCEPT during the first 250 frames where new IDs are allowed anywhere.
         """
+        milvus_ops_count = 0
         # Step 1: Identify potentially overlapping detections
         self._deduplicate_tracks()
         overlap_threshold = 0.25  # IoU threshold
@@ -279,7 +308,7 @@ class AsyncTracker:
                 overlap_B, fraction_B = overlap_ratio_single_box(box_j, box_i, ratio_threshold=0.30)
                 
                 if (iou > overlap_threshold) or overlap_A or overlap_B:
-                    logger.info(f"Detected overlap between boxes {box_i} and {box_j}: IoU={iou:.2f}, fractions: {fraction_A:.2f}, {fraction_B:.2f}")
+                    logger.debug(f"Detected overlap between boxes {box_i} and {box_j}: IoU={iou:.2f}, fractions: {fraction_A:.2f}, {fraction_B:.2f}")
                     
                     if j not in overlap_groups:
                         overlap_groups[j] = []
@@ -288,6 +317,31 @@ class AsyncTracker:
                     overlap_groups[j].append(i)
         
         # Step 2: Run the standard matching cascade first
+        # Update metric first
+        logger.debug(f"Before metric update: Available samples: {list(self.metric.samples.keys())}")
+        active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
+        features_to_add = []
+        targets_to_add = []
+        
+        for track in self.tracks:
+            if not track.is_confirmed():
+                continue
+            if track.features:  # Only process tracks that have features
+                features_to_add.extend(track.features)
+                targets_to_add.extend([track.track_id] * len(track.features))
+
+        if features_to_add and targets_to_add:
+            self.metric.partial_fit(np.asarray(features_to_add), np.asarray(targets_to_add), active_targets)
+            # Now we can safely clear the features since they're in the metric
+            for track in self.tracks:
+                if track.is_confirmed() and track.features:
+                    track.features = []
+        else:
+            logger.debug("No features to update metric with")
+
+        logger.debug(f"Before _match: Available metric samples: {list(self.metric.samples.keys())}")
+        logger.debug(f"Active tracks: {[(t.track_id, t.is_confirmed(), len(t.features)) for t in self.tracks]}")
+
         matches, unmatched_tracks, unmatched_detections = self._match(detections)
         
         # Create a dict mapping track_idx to track object for easier reference
@@ -328,6 +382,13 @@ class AsyncTracker:
                 # If the distance is below threshold, update the track:
                 if distance < self.matching_threshold:
                     track.update(self.kf, detection)
+                    # Immediately update metric for this track
+                    if track.is_confirmed() and detection.feature is not None:
+                        self.metric.partial_fit(
+                            np.array([detection.feature]),
+                            np.array([track.track_id]),
+                            [track.track_id]
+                        )
                     await self._insert_feature_into_milvus(track, detection)
                     logger.debug(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                     if detection_idx in unmatched_detections:
@@ -338,22 +399,6 @@ class AsyncTracker:
                                 if track_obj.track_id == track.track_id and idx in unmatched_tracks:
                                     unmatched_tracks.remove(idx)
                                 
-            # # Skip tracks with no features or initialize them
-            # if not track.features:
-            #     # First update with this feature
-            #     track.update(self.kf, detection)
-            #     logger.debug(f"Initial feature update for track_id {track.track_id} with detection {detection_idx}")
-            #     continue
-            
-            # # Calculate distance to check if this is a good match
-            # distance = calculate_cosine_distance(detection.feature, track.features[-1])
-            # logger.debug(f"distance for id {track_idx} whose track id is {track.track_id}, with detection is {distance}")
-            
-            # # If this is a good match (distance below threshold), update track directly
-            # if distance < self.matching_threshold:
-            #     # Update the track directly
-            #     track.update(self.kf, detection)
-            #     logger.debug(f"Direct update for good match: track_id {track.track_id} with detection {detection_idx}, distance {distance}")
                 
                 # Remove this detection and track from further processing
                 if detection_idx in unmatched_detections:
@@ -365,6 +410,11 @@ class AsyncTracker:
         potential_matches = {}  # {detection_idx: [(track_id, distance, is_visible), ...]}
         entering_detections = set()  # Track which detections are entering
         center_detections = set()    # Detections below the new ID threshold
+
+        # Collect features for batch search
+        search_features = []
+        search_indices = []
+
         
         # Process all remaining detections to find ALL potential ID matches
         for det_idx in unmatched_detections:
@@ -375,7 +425,7 @@ class AsyncTracker:
             entering, fraction = is_entering_store_percent(bbox, line_y=108, threshold=0.60)
             
             if entering:
-                logger.info(f"Detection with bbox {bbox} is entering the store (fraction: {fraction}).")
+                logger.debug(f"Detection with bbox {bbox} is entering the store (fraction: {fraction}).")
                 # Mark this detection as entering
                 entering_detections.add(det_idx)
                 continue
@@ -383,41 +433,100 @@ class AsyncTracker:
             # Check if this detection is below the threshold line (and we're not in startup period)
             if bbox[1] > new_id_y_threshold and not startup_grace_period:
                 center_detections.add(det_idx)
-                logger.info(f"Detection with bbox {bbox} is below threshold y={new_id_y_threshold}, must use existing ID.")
+                logger.debug(f"Detection with bbox {bbox} is below threshold y={new_id_y_threshold}, must use existing ID.")
             
-            # For non-entering detections, find all potential ID matches from the database
-            database_matches = await self._find_all_potential_matches(detection.feature, bbox)
+
+            search_features.append(detection.feature)
+            search_indices.append(det_idx)
+
+        # Step 4: PERFORM BATCH SEARCH for all unmatched detections at once
+        potential_matches = {}  # {detection_idx: [(track_id, distance, is_visible), ...]}
+
+        if search_features:
+            logger.info(f"Performing batch search for {len(search_features)} unmatched detections")
+            milvus_ops_count += 1
+            if self.use_shared_cache:
+                logger.info(f"SEARCHING IN CACHE FIRST")
+                # Search in shared cache first
+                cache_results = await self.store_cache.batch_search_in_cache(
+                    features=search_features,
+                    exclude_ids=set(),  # Don't exclude any IDs initially
+                    threshold=self.matching_threshold,
+                    top_k=20
+                )
+                
+                # If we need more results, fall back to Milvus
+                batch_results = []
+                for i, (cache_result, feature) in enumerate(zip(cache_results, search_features)):
+                    if len(cache_result) < 1:  # Need more candidates
+                        logger.info("len(cache_result) < 1")
+                        milvus_ops_count += 1
+                        # Search Milvus for additional results
+                        milvus_result = await self.milvus_client.search_embedding(
+                            query_embedding=feature,
+                            top_k=10,
+                            store_filter=self.store_id
+                        )
+                        
+                        # Merge results
+                        seen_ids = {r[0] for r in cache_result}
+                        for track_id, distance in milvus_result:
+                            if track_id not in seen_ids:
+                                cache_result.append((track_id, distance))
+                        
+                        # Re-sort merged results
+                        cache_result.sort(key=lambda x: x[1])
+                        cache_result = cache_result[:20]
+                    logger.info(f"Using the cache data")
+                    batch_results.append(cache_result)
+            else:
             
-            if det_idx not in potential_matches:
-                potential_matches[det_idx] = []
+
+                batch_results = await self.milvus_client.search_embeddings_batch(
+                    embeddings_list = search_features,
+                    top_k = 20,
+                    store_id = self.store_id
+                )
+
+                # Process batch results
+                for i, (det_idx, results) in enumerate(zip(search_indices, batch_results)):
+                    potential_matches[det_idx] = []
+
+                    # Check visible tracks for this detection
+                    visible_matches = []
+                    for track in self.tracks:
+                        if track.is_confirmed() and track.time_since_update <= 1 and track.features:
+                            distance = calculate_cosine_distance(search_features[i], track.features[-1])
+                            if distance < self.matching_threshold:
+                                visible_matches.append((track.track_id, distance, True))
+                    
+                    visible_ids = {vm[0] for vm in visible_matches}
+                    milvus_matches = [(track_id, distance, False) 
+                                for track_id, distance in results 
+                                if track_id not in visible_ids and distance < self.matching_threshold]
+
+                    all_matches = visible_matches + milvus_matches
+                    all_matches.sort(key=lambda x: x[1])
+                    potential_matches[det_idx] = all_matches[:10]  # Keep top 10 matches
+                    logger.debug(f"Detection {det_idx} has {len(potential_matches[det_idx])} potential matches")
             
-            # Add all database matches to potential matches list
-            for db_id, db_distance, is_visible in database_matches:
-                if db_distance <= self.matching_threshold:  # Only add if within threshold
-                    potential_matches[det_idx].append((db_id, db_distance, is_visible))
-                    logger.debug(f"Potential match: detection {det_idx} with database ID {db_id}, distance {db_distance}, visible: {is_visible}")
-        
-        # Step 4: Process detections based on whether they are part of overlapping groups or not
+        # Step 5: Process detections based on whether they are part of overlapping groups or not
         assigned_detections = set()
         assigned_ids = set()
         final_assignments = {}  # {det_idx: (track_id, is_new)}
-        
+
         # Keep track of which track IDs are already active in the current frame
         active_track_ids = set(track.track_id for track in self.tracks if track.is_confirmed())
-        logger.info(f"active track ids are {active_track_ids}")
-        
-        # For matched detections, track the assigned IDs
+        logger.debug(f"active track ids are {active_track_ids}")
+
         for track_idx, detection_idx in matches:
             if detection_idx not in unmatched_detections:  # Only consider successful matches
                 track_id = track_idx_to_track[track_idx].track_id
                 assigned_ids.add(track_id)
                 assigned_detections.add(detection_idx)
                 final_assignments[detection_idx] = (track_id, track_id not in active_track_ids)
-                logger.info(f"Final assignment: track ID {track_id} assigned to detection {detection_idx}. Is it an active track: {track_id not in active_track_ids}")
+                logger.debug(f"Final assignment: track ID {track_id} assigned to detection {detection_idx}")
 
-                logger.info(f"track ID {track_id} with det id {detection_idx} was matched in the matching cascade process but not a final assignment")
-        
-        # FIRST: Process overlapping detections separately with special handling
         overlap_detections = set()
         for det_idx in unmatched_detections:
             if det_idx in overlap_groups and len(overlap_groups[det_idx]) > 0:
@@ -450,113 +559,51 @@ class AsyncTracker:
                 self._next_id += 1
                 continue
             
-            # Use more comprehensive matching specifically for overlapping detections
-            logger.debug(f"Matching overlapping detection {bbox} with global database.")
-            matched_track_id = await self._match_with_global_database_all_tracks_considered(detection.feature, bbox)
-            
-            # Check if this ID is already assigned in this frame
-            if matched_track_id is not None and matched_track_id in assigned_ids:
-                logger.warning(f"ID {matched_track_id} already assigned in this frame. Competition check needed.")
+            if det_idx in potential_matches and potential_matches[det_idx]:
+                matched_track_id = None
+                for track_id, distance, is_visible in potential_matches[det_idx]:
+                    if track_id not in assigned_ids:
+                        matched_track_id = track_id
+                        break
                 
-                # Find which detection already has this ID
-                existing_det_idx = next(d_idx for d_idx, (t_id, _) in final_assignments.items() if t_id == matched_track_id)
-                existing_detection = detections[existing_det_idx]
-                
-                # Calculate distances for both detections to this ID
-                current_distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
-                existing_distance = await self._calculate_distance_to_id(existing_detection.feature, matched_track_id)
-                
-                logger.debug(f"Distance comparison: Current detection ({det_idx}): {current_distance}, " +
-                        f"Existing detection ({existing_det_idx}): {existing_distance}")
-                
-                if current_distance < existing_distance:
-                    # Current detection has a better match - reassign the existing detection
-                    logger.debug(f"Current detection {det_idx} has a better match with ID {matched_track_id}. " +
-                            f"Reassigning detection {existing_det_idx}.")
-                    
-                    # Remove the existing assignment
-                    assigned_detections.remove(existing_det_idx)
-                    del final_assignments[existing_det_idx]
-                    
-                    # We'll keep the matched_track_id for the current detection
-                    # The existing detection will be processed again later
-                else:
-                    # Existing detection has a better match - find an alternative for the current detection
-                    logger.debug(f"Existing detection {existing_det_idx} has a better match with ID {matched_track_id}. " +
-                            f"Finding alternative for detection {det_idx}.")
-                    
-                    # Find the next best match from the database
-                    result = await self._find_next_best_match(detection.feature, bbox, assigned_ids)
-                    if isinstance(result, tuple) and len(result) == 2:
-                        matched_track_id, distance = result
-                    else:
-                        # Handle unexpected return format
-                        matched_track_id = None
-                        distance = float('inf')
-                        logger.warning(f"Unexpected return format from _find_next_best_match: {result}")
-
-                    if matched_track_id is not None:
-                        logger.debug(f"Found alternative match: track_id {matched_track_id}")
-                    else:
-                        logger.debug("No good alternative match found. Will assign new ID.")
-            
-            # After competition resolution, process the final assignment
-            if matched_track_id is not None:
-                # For center detections: enforce using existing ID
-                if det_idx in center_detections and matched_track_id not in active_track_ids and not startup_grace_period:
-                    logger.debug(f"Center detection matched with inactive ID {matched_track_id}. Ensuring it is a good match.")
-                    # Verify this is a sufficiently good match
-                    distance = await self._calculate_distance_to_id(detection.feature, matched_track_id)
-                    if distance > self.matching_threshold * 1.5:  # Relax threshold a bit for center detections
-                        # If not a good match, find the best available active ID
-                        alternative_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
-                        if alternative_id is not None:
-                            matched_track_id = alternative_id
-                            logger.debug(f"Using better alternative active ID {matched_track_id} for center detection.")
-                
-                # Assign track ID
-                assigned_ids.add(matched_track_id)
-                assigned_detections.add(det_idx)
-                logger.debug(f"track ID {matched_track_id} was not an already assigned ID and is not a final assignment yet")
-                
-                # For existing tracks, mark as update (False)
-                # For new tracks from the database, mark as new (True)
-                is_new_track = matched_track_id not in active_track_ids
-                final_assignments[det_idx] = (matched_track_id, is_new_track)
-                logger.debug(f"Assigned ID {matched_track_id} to overlapping detection {det_idx} (new track: {is_new_track}) and is now final")
-            else:
-                # No match found - check if new ID is allowed
-                if det_idx in center_detections and not startup_grace_period:
-                    # Center detection must use existing ID - find best available
-                    alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
-                    
-                    if alt_id is not None:
-                        logger.debug(f"Center detection {det_idx} gets forced match with ID {alt_id}")
-                        final_assignments[det_idx] = (alt_id, False)
-                    else:
-                        try:
-                            all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
-                            alt_id = min(all_ids) if all_ids else self._next_id
-                        except Exception as e:
-                            logger.error(f"Error fetching all track IDs from Milvus: {e}")
-                            alt_id = self._next_id
-
-                        # Fallback to oldest ID if no good match
-                        logger.debug(f"Center detection {det_idx} gets fallback ID {alt_id}")
-                        final_assignments[det_idx] = (alt_id, False)
-                    
+                if matched_track_id is not None:
+                    # Handle ID competition if needed
+                    assigned_ids.add(matched_track_id)
                     assigned_detections.add(det_idx)
-                    assigned_ids.add(alt_id)
-                    logger.debug(f"Adding {alt_id} to assigned IDs dict and is a final assignment")
+                    is_new_track = matched_track_id not in active_track_ids
+                    final_assignments[det_idx] = (matched_track_id, is_new_track)
+                    logger.debug(f"Assigned ID {matched_track_id} to overlapping detection {det_idx}")
                 else:
-                    # Can assign new ID
-                    new_id = self._next_id
-                    assigned_ids.add(new_id)
-                    assigned_detections.add(det_idx)
-                    final_assignments[det_idx] = (new_id, True)
-                    logger.debug(f"Assigned new ID {new_id} to overlapping detection {det_idx} and is a final assignment")
-                    self._next_id += 1
-        
+                    if det_idx in center_detections and not startup_grace_period:
+                        # Center detection must use existing ID
+                        alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
+                        milvus_ops_count += 1
+                        if alt_id is not None:
+                            logger.debug(f"Center detection {det_idx} gets forced match with ID {alt_id}")
+                            final_assignments[det_idx] = (alt_id, False)
+                        else:
+                            # Fallback to oldest ID
+                            try:
+                                all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                                milvus_ops_count += 1
+                                alt_id = min(all_ids) if all_ids else self._next_id
+                            except Exception as e:
+                                logger.error(f"Error fetching all track IDs from Milvus: {e}")
+                                alt_id = self._next_id
+                            
+                            logger.debug(f"Center detection {det_idx} gets fallback ID {alt_id}")
+                            final_assignments[det_idx] = (alt_id, False)
+                        
+                        assigned_detections.add(det_idx)
+                        assigned_ids.add(alt_id)
+                    else:
+                        new_id = self._next_id
+                        assigned_ids.add(new_id)
+                        assigned_detections.add(det_idx)
+                        final_assignments[det_idx] = (new_id, True)
+                        logger.debug(f"Assigned new ID {new_id} to overlapping detection {det_idx}")
+                        self._next_id += 1
+            
         # Add a conditional flush if batch is above a certain size
         if len(self._feature_batch['track_ids']) >= self._batch_size // 2:
             await self._flush_feature_batch()
@@ -605,7 +652,7 @@ class AsyncTracker:
                 final_assignments[det_idx] = (new_id, True)  # New ID
                 assigned_ids.add(new_id)
                 assigned_detections.add(det_idx)
-                logger.info(f"Entering detection {det_idx} gets new track_id {new_id}")
+                logger.debug(f"Entering detection {det_idx} gets new track_id {new_id}")
                 self._next_id += 1
                 continue
             
@@ -644,6 +691,7 @@ class AsyncTracker:
                         # Fallback to oldest ID
                         try:
                             all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            milvus_ops_count += 1
                             alt_id = min(all_ids) if all_ids else self._next_id
                         except Exception as e:
                             logger.error(f"Error fetching all track IDs from Milvus: {e}")
@@ -664,7 +712,7 @@ class AsyncTracker:
                         logger.debug(f"  (Note: Allowing new ID below threshold because in startup grace period)")
                     self._next_id += 1
         
-        # Step 5: Collect all track modifications for batch application
+        # Step 6: Apply all modifications to the track list
         tracks_to_update = {}  # {track_id: (detection, is_new_track)}
         tracks_to_mark_missed = set()  # Set of track_ids to mark as missed
         
@@ -692,22 +740,27 @@ class AsyncTracker:
                 # Create new track
                 tracks_to_update[track_id] = (detection, True)
         
-        # Step 6: Apply all modifications to the track list
-        # First, update existing tracks and mark tracks as missed
         for track in self.tracks:
             if track.track_id in tracks_to_update:
                 detection, is_new = tracks_to_update[track.track_id]
                 if not is_new:
                     # Update this existing track
                     track.update(self.kf, detection)
+                    # Immediately update metric for this track
+                    if track.is_confirmed() and detection.feature is not None:
+                        self.metric.partial_fit(
+                            np.array([detection.feature]),
+                            np.array([track.track_id]),
+                            [track.track_id]
+                        )
                     await self._insert_feature_into_milvus(track, detection)
-                    logger.info(f"Updated existing track {track.track_id}")
+                    logger.debug(f"Updated existing track {track.track_id}")
                     # Remove from tracks_to_update so we don't create a duplicate
                     del tracks_to_update[track.track_id]
             elif track.track_id in tracks_to_mark_missed:
                 # Mark this track as missed
                 track.mark_missed()
-                logger.info(f"Marked track {track.track_id} as missed")
+                logger.debug(f"Marked track {track.track_id} as missed")
         
         # Now create any new tracks
         for track_id, (detection, _) in tracks_to_update.items():
@@ -726,14 +779,15 @@ class AsyncTracker:
                         track_id = track_id,
                         store_id=self.store_id
                     )
+                    milvus_ops_count += 1
                     if db_features:
                         new_track.features = db_features
-                        logger.info(f"Created track with ID {track_id} (reidentified from Milvus with {len(new_track.features)} features)")
+                        logger.debug(f"Created track with ID {track_id} (reidentified from Milvus with {len(new_track.features)} features)")
                     else:
-                        logger.info(f"Created new track with ID {track_id} (no features found in Milvus)")
+                        logger.debug(f"Created new track with ID {track_id} (no features found in Milvus)")
                 except Exception as e:
-                    logger.error(f"Failed to fetch features from Milvus for track_id {track_id}: {e}")
-                    logger.info(f"Created new track with ID {track_id} (fallback)")
+                    logger.error(f"Failed to fetch features from Milvus for track_id {track_id} in store {self.store_id}: {e}")
+                    logger.debug(f"Created new track with ID {track_id} (fallback)")
             
                 # Add the new track
                 self.tracks.append(new_track)
@@ -742,13 +796,11 @@ class AsyncTracker:
                 best_track = max(existing_tracks, key=lambda t: t.hits)
                 try:
 
-                # best_track.update(self.kf, detection)
-                # logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
-                # if track_id in self.global_database and self.global_database[track_id]["features"]:
                     db_features = await self.milvus_client.get_features_by_track_id(
                         track_id = track_id,
                         store_id=self.store_id,
                     )
+                    milvus_ops_count += 1
                     if db_features:
                         if not best_track.features:
                             best_track.features = db_features
@@ -758,20 +810,21 @@ class AsyncTracker:
                                 if not any(np.array_equal(db_feature, f) for f in best_track.features):
                                     best_track.features.append(db_feature)
                                     added += 1
-                            logger.info(f"[Milvus] Merged {added} new features for track {track_id}. Total now: {len(best_track.features)}")
+                            logger.debug(f"[Milvus] Merged {added} new features for track {track_id}. Total now: {len(best_track.features)}")
                     else:
-                        logger.info(f"[Milvus] No features found to restore for track {track_id}")
+                        logger.debug(f"[Milvus] No features found to restore for track {track_id}")
                 except Exception as e:
                     logger.error(f"[Milvus] Failed to fetch/merge features for track {track_id}: {e}")
                 best_track.update(self.kf, detection)
                 await self._insert_feature_into_milvus(best_track, detection)
-                logger.info(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
+                logger.debug(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
         
         # Step 7: Remove deleted tracks
         self.tracks = [t for t in self.tracks if not t.is_deleted()]
         self._deduplicate_tracks()
         
         # Step 8: Update distance metric
+        """
         active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
         features, targets = [], []
         for track in self.tracks:
@@ -779,19 +832,23 @@ class AsyncTracker:
                 continue
             features += track.features
             targets += [track.track_id for _ in track.features]
-            track.features = []
         
-        if features:
+        if features and targets:
             self.metric.partial_fit(np.asarray(features), np.asarray(targets), active_targets)
+
+            for track in self.tracks:
+                if track.is_confirmed():
+                    track.features = []
+                    """
         
         # Check if it's time to flush the batch by time
         current_time = time.time()
         if current_time - self._last_batch_time > self._batch_interval:
             await self._flush_feature_batch()
-
+        logger.info(f"Frame processed with {milvus_ops_count} Milvus operations")
     async def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
-        Find the best match regardless of threshold from Milvus, used for center detections.
+        Find the best match regardless of threshold from Milvus, used for center detections. Uses shared cache when available
 
         Args:
             feature: Feature vector to match
@@ -802,23 +859,30 @@ class AsyncTracker:
             track_id: Best matching track ID, or None if no unassigned IDs exist
         """
         try:
+            if self.use_shared_cache:
+                results = await self.store_cache.search_in_cache(
+                    feature=feature,
+                    exclude_ids=assigned_ids,
+                    threshold=None,  # No threshold - we want best match
+                    top_k=max_candidates * 2
+                )
+                
+                if results:
+                    logger.info(f"FOUND BEST MATCH FROM CACHE SUCCESSFULLY")
+                    return results[0][0]  # Return best track_id
+
             # Get candidate track IDs and their features from Milvus
-            track_features_dict = await self.milvus_client.get_all_track_features(self.store_id)
-
-            all_matches = []
-
-            for track_id, db_features in track_features_dict.items():
-                if track_id in assigned_ids or not db_features:
-                    continue
-
-                best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
-                all_matches.append((track_id, best_distance))
-
-            if not all_matches:
-                return None
-
-            all_matches.sort(key=lambda x: x[1])
-            return all_matches[0][0]
+            results = await self.milvus_client.search_embedding(
+                query_embedding=feature,
+                top_k=max_candidates * 5,
+                store_filter=self.store_id
+            )
+            # Filter and return best
+            for track_id, distance in results:
+                if track_id not in assigned_ids:
+                    return track_id
+            
+            return None
 
         except Exception as e:
             logger.error(f"[Tracker] Error in _find_best_match_regardless_of_threshold: {e}")
@@ -861,18 +925,19 @@ class AsyncTracker:
             if track.track_id == track_id and track.is_confirmed():
                 if track.features:
                     distance = calculate_cosine_distance(feature, track.features[-1])
-                    logger.info(f"[Tracker] distance to active track ID {track_id}: {distance}")
+                    logger.debug(f"[Tracker] distance to active track ID {track_id}: {distance}")
                     return distance
 
         # Fallback to Milvus if not found in active tracks
         try:
             db_features = await self.milvus_client.get_features_by_track_id(track_id, self.store_id)
+            milvus_ops_count += 1
             if db_features:
                 best_distance = min(calculate_cosine_distance(feature, f) for f in db_features)
-                logger.info(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
+                logger.debug(f"[Tracker] distance to track ID {track_id} from Milvus: {best_distance}")
                 return best_distance
             else:
-                logger.info(f"[Tracker] no features found in Milvus for track ID {track_id}")
+                logger.debug(f"[Tracker] no features found in Milvus for track ID {track_id}")
         except Exception as e:
             logger.error(f"[Tracker] error querying Milvus for track ID {track_id}: {e}")
 
@@ -945,8 +1010,10 @@ class AsyncTracker:
         def gated_metric(tracks, dets, track_indices, detection_indices):
             features = np.array([dets[i].feature for i in detection_indices])
             targets = np.array([tracks[i].track_id for i in track_indices])
+            targets = [int(t) for t in targets]
+
             cost_matrix = self.metric.distance(features, targets)
-            logger.info(f"Cost matrix is {cost_matrix}")
+            logger.debug(f"Cost matrix is {cost_matrix}")
             cost_matrix = linear_assignment.gate_cost_matrix(
                 self.kf, cost_matrix, tracks, dets, track_indices, detection_indices)
             return cost_matrix
@@ -957,9 +1024,9 @@ class AsyncTracker:
         unconfirmed_tracks = [
             i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
 
-        logger.info(f"confirmed_tracks are {confirmed_tracks}")
+        logger.debug(f"confirmed_tracks are {confirmed_tracks}")
         # Associate confirmed tracks using appearance features.
-        # logger.info("MAT")
+        # logger.debug("MAT")
         matches_a, unmatched_tracks_a, unmatched_detections = \
             linear_assignment.matching_cascade(
                 gated_metric, self.metric.matching_threshold, self.max_age,
@@ -1003,10 +1070,10 @@ class AsyncTracker:
 
         if is_inside_store_center(detection_bbox, center_bbox):
             threshold = increased_threshold
-            logger.info(f"Detection bbox {detection_bbox} is in the center; using increased threshold {threshold}.")
+            logger.debug(f"Detection bbox {detection_bbox} is in the center; using increased threshold {threshold}.")
         else:
             threshold = default_threshold
-            logger.info(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
+            logger.debug(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
 
         # Iterate through all track_ids in the global database without skipping any
             # Perform search on Milvus
@@ -1018,15 +1085,15 @@ class AsyncTracker:
         best_track_id = None
         best_distance = float('inf')
         for track_id, distance in results:
-            logger.info(f"Candidate match from Milvus: track_id={track_id}, distance={distance}")
+            logger.debug(f"Candidate match from Milvus: track_id={track_id}, distance={distance}")
             if distance < threshold and distance < best_distance:
                 best_track_id = track_id
                 best_distance = distance
         if best_track_id is not None:
-            logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+            logger.debug(f"Best match: track_id={best_track_id}, distance={best_distance}")
             return best_track_id
         else:    
-            logger.info("No match found in Milvus database below threshold.")
+            logger.debug("No match found in Milvus database below threshold.")
             return None
 
     def _match_with_global_database(self, detection_feature, detection_bbox, center_bbox = (0, 108, 1152, 800)):
@@ -1046,10 +1113,10 @@ class AsyncTracker:
         increased_threshold = 0.6
         if is_inside_store_center(detection_bbox, center_bbox):
             threshold = increased_threshold
-            logger.info(f"Detection bbox {detection_bbox} is in the center; using increased threshold {threshold}.")
+            logger.debug(f"Detection bbox {detection_bbox} is in the center; using increased threshold {threshold}.")
         else:
             threshold = default_threshold
-            logger.info(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
+            logger.debug(f"Detection bbox {detection_bbox} is not in the center; using default threshold {threshold}.")
 
         # store_center_x1, store_center_y1, store_center_x2, store_center_y2 = (0, 270, 1152, 800)
 
@@ -1071,7 +1138,7 @@ class AsyncTracker:
         for track_id, distance in results:
             # Skip if the track_id is currently active
             if track_id in visible_confirmed_track_ids:
-                logger.info(f"Skipping track_id {track_id} because it is confirmed and currently visible in scene")
+                logger.debug(f"Skipping track_id {track_id} because it is confirmed and currently visible in scene")
                 continue
 
             # Initialize a list to store distances less than 0.1 for this track_id
@@ -1081,8 +1148,8 @@ class AsyncTracker:
                 best_track_id = track_id
                 best_distance = distance
         if best_track_id is not None:
-            logger.info(f"Best match: track_id={best_track_id}, distance={best_distance}")
+            logger.debug(f"Best match: track_id={best_track_id}, distance={best_distance}")
             return best_track_id
         else:
-            logger.info("No suitable match found in Milvus. Assigning new track_id.")
+            logger.debug("No suitable match found in Milvus. Assigning new track_id.")
             return None

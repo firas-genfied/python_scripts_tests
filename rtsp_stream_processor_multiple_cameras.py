@@ -37,6 +37,7 @@ from TransReID.config import cfg
 from TransReID.model import make_model
 from TransReID.datasets.transforms import build_transforms
 from TransReID.processor import extract_features
+from typing import List, Dict, Tuple, Union, Optional  # Add List to existing import
 
 # Create Detection objects for DeepSORT
 from yolov4_deepsort.deep_sort.detection import Detection
@@ -50,6 +51,7 @@ from task_manager import TaskManager
 
 from milvus_router_client import AsyncMilvusRouterClient
 
+from store_cache_manager import StoreCacheManager
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -73,7 +75,14 @@ class TrackState:
 class GPUBatchProcessor:
     """Handles batch processing of images using GPU for shared operations"""
     def __init__(self, max_batch_size=8, device=None, model_config=None):
+        
         self.max_batch_size = max_batch_size
+        self.dynamic_batch_size = max_batch_size 
+        self.min_batch_size = max_batch_size // 2
+        self.oom_strikes = 0
+        self.memory_high_water_mark = 0
+        self.last_oom_batch_size = None
+
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         self.model_config = model_config or {}
@@ -89,6 +98,9 @@ class GPUBatchProcessor:
         self.model_config = model_config or {}
         # Initialize the segmentation model (Detectron2)
         self.seg_predictor = setup_predictor()
+        self.seg_model = self.seg_predictor.model
+        self.seg_model.eval()
+        self.aug = self.seg_predictor.aug
         logger.info("Segmentation model initialized")
         
         self.model = make_model(cfg, num_class=1041, camera_num=0, view_num=0).to(self.device)
@@ -166,134 +178,6 @@ class GPUBatchProcessor:
                 return True
         return False
 
-    def process_single_frame(self, image, metadata):
-        """
-        Optimized processing of a single image frame.
-        
-        Args:
-            image: The image frame (numpy array).
-            metadata: Associated metadata dictionary.
-            
-        Returns:
-            A tuple (metadata, valid_detections, detection_features), where:
-            - valid_detections is a list of detection tuples (bbox, score, class, mask)
-            - detection_features is a list of corresponding feature vectors.
-        """
-        start_time = time.time()
-        try:
-            # Use the dedicated CUDA stream for asynchronous operations.
-            with torch.cuda.stream(self.stream):
-                # Run segmentation on the single image.
-                outputs = self.seg_predictor(image)
-                instances = outputs["instances"]
-                # Select detections classified as person (assuming class 0 is person).
-                person_indices = (instances.pred_classes == 0).nonzero().flatten()
-                if len(person_indices) == 0:
-                    # Update statistics and synchronize the stream.
-                    self.stats["total_processing_time"] += time.time() - start_time
-                    self.stats["total_batches_processed"] += 1
-                    self.stats["total_frames_processed"] += 1
-                    self._update_memory_stats()
-                    self.stream.synchronize()
-                    return (metadata, [], [])
-                
-                # Get boxes, scores, and masks for the detected persons.
-                person_boxes = instances.pred_boxes.tensor[person_indices].cpu().numpy()
-                person_scores = instances.scores[person_indices].cpu().numpy()
-                person_masks = instances.pred_masks[person_indices].cpu().numpy()
-                
-                # Optionally filter duplicate detections.
-                # frame_copy = image.copy()  # Only needed if visualizing or debugging duplicates.
-                filtered_boxes, filtered_scores, filtered_masks = filter_duplicate_detections(
-                    person_boxes, person_scores, person_masks, image, iou_threshold=0.9
-                )
-                
-                # Define a “green box” (or entrance region) for overlap filtering.
-                height, width = image.shape[:2]
-                line_y = int(height * 0.10)  # e.g., 10% from the top.
-                green_box = [0, line_y, width, height]
-                
-                valid_detections = []
-                detection_crops = []
-                # Iterate over filtered detections.
-                # Convert the entire frame once to RGB
-                # if 'converted_frame' not in locals():
-                converted_frame = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                for j, bbox in enumerate(filtered_boxes):
-                    if self.is_blacklisted(bbox):
-                        continue
-                    score = filtered_scores[j]
-                    mask = filtered_masks[j]
-                    overlap_area, bbox_area = self.calculate_overlap(bbox, green_box)
-                    if overlap_area / bbox_area > 0.7:
-                        # Convert bbox to [x, y, width, height] format for DeepSORT.
-                        tlwh_bbox = [bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]]
-                        detection = (tlwh_bbox, score, "person", mask)
-                        valid_detections.append(detection)
-                        
-                        # Prepare crop for feature extraction.
-                        x, y, w, h = map(int, tlwh_bbox)
-                        crop_masked = crop_without_resize(converted_frame, [x, y, x + w, y + h], mask)
-                        if crop_masked.size == 0 or w <= 0 or h <= 0:
-                            continue
-                        # Convert crop to PIL and apply transformation.
-                        crop_pil = Image.fromarray(crop_masked)
-                        # crop_pil = Image.fromarray(cv2.cvtColor(crop_masked, cv2.COLOR_BGR2RGB))
-                        transformed_crop = self.transform(crop_pil).unsqueeze(0)
-                        detection_crops.append(transformed_crop)
-                
-                # If no valid detections remain, return empty results.
-                if not valid_detections:
-                    self.stats["total_processing_time"] += time.time() - start_time
-                    self.stats["total_batches_processed"] += 1
-                    self.stats["total_frames_processed"] += 1
-                    self._update_memory_stats()
-                    self.stream.synchronize()
-                    return (metadata, [], [])
-                
-                # Process detection crops in mini-batches (if needed).
-                detection_features = [None] * len(valid_detections)
-                if detection_crops:
-                    for start_idx in range(0, len(detection_crops), self.max_batch_size):
-                        end_idx = min(start_idx + self.max_batch_size, len(detection_crops))
-                        mini_batch = detection_crops[start_idx:end_idx]
-                        batch_tensor = torch.cat(mini_batch, dim=0).to(self.device)
-                        
-                        if self.use_half_precision and self.device.type == "cuda":
-                            batch_tensor = batch_tensor.half()
-                        
-                        with torch.no_grad():
-                            features = self.extract_features(self.model, batch_tensor).cpu().float().numpy()
-                        
-                        # Assign extracted features to their corresponding detection.
-                        for idx, feat_idx in enumerate(range(start_idx, end_idx)):
-                            detection_features[feat_idx] = features[idx].reshape(-1)
-                
-                # For any detection missing features, insert a zero vector.
-                for i in range(len(detection_features)):
-                    if detection_features[i] is None:
-                        detection_features[i] = np.zeros((768,))
-                
-                # Update processing stats.
-                self.stats["total_processing_time"] += time.time() - start_time
-                self.stats["total_batches_processed"] += 1
-                self.stats["total_frames_processed"] += 1
-                self.stats["total_people_detected"] += len(valid_detections)
-                self._update_memory_stats()
-                self.stream.synchronize()
-                
-                return (metadata, valid_detections, detection_features)
-        
-        except torch.cuda.OutOfMemoryError:
-            logger.error(f"CUDA out of memory error on {self.device}")
-            torch.cuda.empty_cache()
-            return (metadata, [], [])
-        
-        except Exception as e:
-            logger.error(f"Error processing single frame on {self.device}: {e}", exc_info=True)
-            return (metadata, [], [])
-
-    
     def process_batch(self, image_batch):
         """
         Process a batch of images to extract detections and features
@@ -304,7 +188,75 @@ class GPUBatchProcessor:
         Returns:
             List of (metadata, detections, features) tuples
         """
-        start_time = time.time()
+        
+        self.start_time = time.time()
+
+        # Check available memory before processing
+        if torch.cuda.is_available():
+            free_memory = torch.cuda.mem_get_info(self.device.index)[0] / 1024**3  # GB
+            if free_memory < 4.0:  # Less than 4GB free
+                logger.info(f"Low GPU memory: {free_memory:.1f}GB free")
+                return self._process_batch_chunked(image_batch, chunk_size=4)
+            if self.last_oom_batch_size and len(image_batch) >= self.last_oom_batch_size:
+                return self._process_batch_chunked(image_batch, self.last_oom_batch_size - 2)
+
+            try:
+                return self._process_batch_impl(image_batch)
+            except torch.cuda.OutOfMemoryError:
+                logger.error(f"OOM with batch size {len(image_batch)}, splitting batch")
+                torch.cuda.empty_cache()
+                self.oom_strikes += 1
+
+                if self.oom_strikes > 2:
+                    self.dynamic_batch_size = max(self.min_batch_size, self.dynamic_batch_size // 2)
+                    logger.info(f"Reducing dynamic batch size to {self.dynamic_batch_size}")
+                    self.oom_strikes = 0
+                
+                return self._process_batch_chunked(image_batch, chunk_size=self.min_batch_size)
+    
+    def _process_batch_chunked(self, image_batch, chunk_size=4):
+        """Process batch in smaller chunks to avoid OOM"""
+        all_results = []
+        current_chunk_size = chunk_size
+
+        for i in range(0, len(image_batch), chunk_size):
+            retry_count = 0
+            max_retries = 2
+            chunk = image_batch[i:i + chunk_size]
+            for attempt in range(2): 
+                try:
+                    chunk_results = self._process_batch_impl(chunk)
+                    all_results.extend(chunk_results)
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    logger.error(f"OOM even with chunk size {chunk_size}")
+                    torch.cuda.empty_cache()
+                    if attempt == 0:
+                        if len(chunk) > 1:
+                            chunk = chunk[:len(chunk)//2]
+                            logger.info(f"Reducing chunk size to {len(chunk)} for retry")
+                        else:
+                            # Single image still failing, return empty result
+                            logger.error("Single image OOM, skipping")
+                            all_results.append((chunk[0][1], [], []))  # metadata, empty detections, empty features
+                            break
+                    else:
+                        logger.error(f"Skipping chunk after 2 OOM attempts")
+                        for img, meta in chunk:
+                            all_results.append((meta, [], []))
+                        break
+
+                except Exception as e:
+                    logger.error(f"Non-OOM error in chunk processing: {e}")
+                    # Return empty results for this chunk
+                    for img, meta in chunk:
+                        all_results.append((meta, [], []))
+                    break
+            if i + chunk_size < len(image_batch):
+                await asyncio.sleep(0.1)
+        return all_results
+
+    def _process_batch_impl(self, image_batch):
         # logger.info(f"Processing batch of {len(image_batch)} images on GPU")
         batch_results = []
         timestamps = []
@@ -313,13 +265,23 @@ class GPUBatchProcessor:
         try:
             # Step 1: Run segmentation on each image
             with torch.cuda.stream(self.stream):
-                for i, (image, metadata) in enumerate(image_batch):
-                    # Run segmentation model (on GPU)
-                    outputs = self.seg_predictor(image)
+                batch_inputs = []
+                original_sizes = []
+                for image, metadata in image_batch:
+                    original_sizes.append((image.shape[0], image.shape[1]))
+                    height, width = image.shape[:2]
+                    transformed_image = self.aug.get_transform(image).apply_image(image)
+                    transformed_image = torch.as_tensor(transformed_image.astype("float32").transpose(2, 0, 1))
+                    batch_inputs.append({
+                        "image": transformed_image.to(self.device),
+                        "height": height,
+                        "width": width,
+                    })
+                with torch.no_grad():
+                    batch_outputs = self.seg_model(batch_inputs)
+                for i, (outputs, (image, metadata)) in enumerate(zip(batch_outputs, image_batch)):
                     instances = outputs["instances"]
                     person_indices = (instances.pred_classes == 0).nonzero().flatten()
-                    
-                    # Skip if no people detected
                     if len(person_indices) == 0:
                         batch_results.append((metadata, [], []))
                         continue
@@ -358,61 +320,67 @@ class GPUBatchProcessor:
                             tlwh_bbox = [bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]]
                             detection = (tlwh_bbox, score, "person", mask)
                             valid_detections.append(detection)
-                            
-                            # Prepare crop for feature extraction
-                            x, y, w, h = map(int, tlwh_bbox)
-                            crop_masked = crop_without_resize(image, [x, y, x+w, y+h], mask)
-                            
-                            # Skip empty crops
-                            if crop_masked.size == 0 or w <= 0 or h <= 0:
-                                continue
-                            
-                            # Convert to PIL for TransReID
-                            crop_pil = Image.fromarray(cv2.cvtColor(crop_masked, cv2.COLOR_BGR2RGB))
-                            detection_crops.append(self.transform(crop_pil).unsqueeze(0))
-                            detection_indices.append(len(valid_detections) - 1)
-                    
-                    # Skip if no valid detections
-                    if not valid_detections:
-                        batch_results.append((metadata, [], []))
+                        
+                    batch_results.append((metadata, valid_detections, [None] * len(valid_detections)))
+                    total_people += len(valid_detections)
+                
+                all_crops = []
+                crop_info = []
+                for batch_idx, (metadata, detections, _) in enumerate(batch_results):
+                    if not detections:
                         continue
                     
-                    # Step 2: Batch extract features for this image's detections
-                    detection_features = [None] * len(valid_detections)
-                    
-                    if detection_crops:
-                        # Process crops in mini-batches to avoid GPU memory issues
-                        for start_idx in range(0, len(detection_crops), self.max_batch_size):
-                            end_idx = min(start_idx + self.max_batch_size, len(detection_crops))
-                            mini_batch = detection_crops[start_idx:end_idx]
-                            mini_indices = detection_indices[start_idx:end_idx]
-                            
-                            # Concatenate crops for batch processing
-                            batch_tensor = torch.cat(mini_batch, dim=0).to(self.device)
+                    image = image_batch[batch_idx][0]
+                    converted_frame = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    for det_idx, detection in enumerate(detections):
+                        tlwh_bbox, score, class_name, mask = detection
+                        x, y, w, h = map(int, tlwh_bbox)
+                        crop_masked = crop_without_resize(converted_frame, [x, y, x+w, y+h], mask)
+                        if crop_masked.size == 0 or w <= 0 or h <= 0:
+                            continue
+                        crop_pil = Image.fromarray(crop_masked)
+                        transformed_crop = self.transform(crop_pil).unsqueeze(0)
+                        all_crops.append(transformed_crop)
+                        crop_info.append((batch_idx, det_idx))
+                
+                if all_crops:
+                    chunk_size = min(self.max_batch_size * 2, len(all_crops), 32)
+                    for chunk_start in range(0, len(all_crops), chunk_size):
+                        torch.cuda.empty_cache()
 
-                            # Convert to half precision if enabled
-                            if self.use_half_precision and self.device.type == "cuda":
-                                batch_tensor = batch_tensor.half()
-                            
-                            # Extract features using TransReID
-                            with torch.no_grad():
-                                features = self.extract_features(self.model, batch_tensor).cpu().float().numpy()
-                            
-                            # Assign features to detections
-                            for idx, feat_idx in enumerate(mini_indices):
-                                detection_features[feat_idx] = features[idx].reshape(-1)
-                    
-                    # Fill in empty features with zeros
-                    for i in range(len(detection_features)):
-                        if detection_features[i] is None:
-                            detection_features[i] = np.zeros((768,))  # TransReID feature dim
-                    
-                    # Add results for this image
-                    batch_results.append((metadata, valid_detections, detection_features))
-                    total_people += len(valid_detections)
+                        chunk_end = min(chunk_start + chunk_size, len(all_crops))
+                        chunk_crops = all_crops[chunk_start:chunk_end]
+                        chunk_info = crop_info[chunk_start:chunk_end]
 
-                    # Update stats
-                processing_time = time.time() - start_time
+                        use_size = chunk_size
+                        if torch.cuda.is_available():
+                            free_mem = torch.cuda.mem_get_info(self.device.index)[0] / 1024**3
+                            if free_mem < 2.0: 
+                                logger.warning(f"Low memory before feature extraction: {free_mem:.1f}GB")
+                                use_size = max(8, chunk_size // 2)
+                        
+                        for sub_start in range(0, len(chunk_crops), use_size):
+                            sub_end    = min(sub_start + use_size, len(chunk_crops))
+                            sub_crops  = chunk_crops[sub_start:sub_end]
+                            sub_info   = chunk_info[sub_start:sub_end]
+
+                        batch_tensor = torch.cat(chunk_crops, dim=0).to(self.device)
+                        if self.use_half_precision and self.device.type == "cuda":
+                            batch_tensor = batch_tensor.half()
+                        with torch.no_grad():
+                            features = self.extract_features(self.model, batch_tensor).cpu().float().numpy()
+                        # Assign features back to detections
+                        for feat_idx, (batch_idx, det_idx) in enumerate(chunk_info):
+                            if batch_results[batch_idx][2][det_idx] is None:
+                                batch_results[batch_idx][2][det_idx] = features[feat_idx].reshape(-1)
+                
+                # Fill any remaining None features with zeros
+                for batch_idx, (metadata, detections, features) in enumerate(batch_results):
+                    for feat_idx in range(len(features)):
+                        if features[feat_idx] is None:
+                            features[feat_idx] = np.zeros((768,))
+
+                processing_time = time.time() - self.start_time
                 self.stats["total_processing_time"] += processing_time
                 self.stats["total_batches_processed"] += 1
                 self.stats["total_frames_processed"] += len(image_batch)
@@ -460,7 +428,6 @@ class GPUBatchProcessor:
         except Exception as e:
             logger.error(f"Error logging performance stats: {e}")
     
-
     def calculate_overlap(self, bbox, green_box):
         """
         Calculate the overlap area between a detection bounding box and the green box.
@@ -487,18 +454,37 @@ class GPUBatchProcessor:
 
         return overlap_area, bbox_area
     
-
+    def calculate_overlap_vectorized(self, bboxes, green_box):
+        """Vectorized overlap calculation for multiple bboxes"""
+        bboxes = np.array(bboxes)
+        
+        # Calculate intersections vectorized
+        x1_inter = np.maximum(bboxes[:, 0], green_box[0])
+        y1_inter = np.maximum(bboxes[:, 1], green_box[1])
+        x2_inter = np.minimum(bboxes[:, 2], green_box[2])
+        y2_inter = np.minimum(bboxes[:, 3], green_box[3])
+        
+        inter_widths = np.maximum(0, x2_inter - x1_inter)
+        inter_heights = np.maximum(0, y2_inter - y1_inter)
+        overlap_areas = inter_widths * inter_heights
+        
+        bbox_areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        overlap_ratios = overlap_areas / bbox_areas
+        
+        return overlap_ratios > 0.7
+        
 
 class CameraProcessor:
     """Handles per-camera tracking and processing"""
-    def __init__(self, camera_id, store_id, milvus_client):
+    def __init__(self, camera_id, store_id, milvus_client, store_cache=None):
         logger.info("Inside CameraProcessor Constructor")
         logger.info(f"Received milvus client for store {milvus_client.store_id}")
         self.camera_id = camera_id
         self.store_id = store_id
         # Initialize tracker and status tracking
         self.milvus_client = milvus_client
-        self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = self.milvus_client)
+        self.store_cache = store_cache 
+        self.processor = Segmentation_DeepSort(info_flag=True, camera_id = self.camera_id, store_id = self.store_id,  milvus_client = self.milvus_client, store_cache=self.store_cache)
         self.tracker = self.processor.tracker
         self.person_status = {}
         self.recent_entries = {"entries": [], "classified": {}}
@@ -685,19 +671,25 @@ class KafkaProcessor:
         set_memory_limit(fraction=0.9)
         self.num_processors = num_processors
         self.active_processing_tasks = set()
-
         if gpu_processors is None:
-            self.gpu_processors = [
-            GPUBatchProcessor(
-                max_batch_size=batch_size, 
-                device=torch.device("cuda:0"),  # All use the same device
-                model_config={"context_id": i}  # Give each a unique context ID
-            )
-            for i in range(self.num_processors)
-        ]
+            if torch.cuda.device_count() > 1:
+                self.gpu_processors = [
+                    GPUBatchProcessor(
+                        max_batch_size=batch_size,
+                        device=torch.device(f"cuda:{i}"),  # Different GPUs!
+                        model_config={"context_id": i}
+                    )
+                    for i in range(min(num_processors, torch.cuda.device_count()))
+                ]
+            else:
+                # Single GPU = Single Processor
+                self.gpu_processors = [GPUBatchProcessor(
+                    max_batch_size=batch_size, 
+                    device=torch.device("cuda:0"),  # All use the same device
+                    model_config={"context_id": 0}  # Give each a unique context ID
+                )]
         else:
             self.gpu_processors = gpu_processors
-
 
         log_total_memory(self.gpu_processors)
         self.current_processor_index = 0
@@ -724,6 +716,7 @@ class KafkaProcessor:
 
         # Performance tracking
         self.stats = {
+            "incoming_frames":    0,
             "frames_processed": 0,
             "frames_dropped": 0,
             "processing_times": deque(maxlen=1000),
@@ -749,10 +742,62 @@ class KafkaProcessor:
             logger.info(f"GPU processor {i}: device={proc.device}")
         
         self.milvus_clients = {}
-    
-    
+        self.max_stores_per_pod = int(os.environ.get("MAX_STORES_PER_POD", "10"))
+        self.store_last_access = {}  # Track when each store was last used
+
+        self.store_cache_managers = {}
+        self.cache_stats_interval = 60  # Log cache stats every minute
+        self.last_cache_stats_time = time.time()
+
+    def get_or_create_store_cache(self, store_id: int) -> StoreCacheManager:
+        """Get or create a shared cache manager for a store."""
+        if len(self.store_cache_managers) >= self.max_stores_per_pod:
+            if self.store_last_access:
+                lru_store_id = min(self.store_last_access, key=self.store_last_access.get)
+                if lru_store_id != store_id:
+                    logger.info(f"Evicting cache for store {lru_store_id} (LRU)")
+                    del self.store_cache_managers[lru_store_id]
+                    del self.store_last_access[lru_store_id]
+        
+        self.store_last_access[store_id] = time.time()
+
+        if store_id not in self.store_cache_managers:
+            # Get the milvus client for this store
+            if store_id not in self.milvus_clients:
+                router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
+                self.milvus_clients[store_id] = AsyncMilvusRouterClient(
+                    router_url=router_url,
+                    store_id=store_id,
+                    embedding_dim=768,
+                    connection_timeout=10,
+                    batch_size=100
+                )
+            
+            # Create cache manager
+            cache_config = {
+                'time_interval': 5.0,      # Refresh every 5 seconds
+                'stale_threshold': 30.0,   # Force refresh after 30 seconds
+                'max_cache_size': max(1000, 10000 // max(1, len(self.store_cache_managers))),
+                'features_per_track': 50 if len(self.store_cache_managers) < 5 else 25,
+            }
+            
+            self.store_cache_managers[store_id] = StoreCacheManager(
+                store_id=store_id,
+                milvus_client=self.milvus_clients[store_id],
+                cache_config=cache_config
+            )
+            
+            logger.info(f"Created shared cache manager for store {store_id}")
+        
+        return self.store_cache_managers[store_id]
+      
     def _select_processor_for_batch(self):
         """Select the least busy processor for the next batch"""
+
+        # Fast path for single processor
+        if len(self.gpu_processors) == 1:
+            return self.gpu_processors[0]
+
         # If memory usage info is available, use it for balancing
         if all(hasattr(p, 'get_memory_stats') for p in self.gpu_processors):
             # Choose the processor with the lowest current memory usage
@@ -769,38 +814,78 @@ class KafkaProcessor:
         """Get or create a camera processor for the given camera"""
         key = f"{store_id}_{camera_id}"
         if key not in self.camera_processors:
-            # Use the async client from the milvus_clients dictionary
-            if store_id not in self.milvus_clients:
+            milvus_client = self.milvus_clients.get(store_id)
+            if not milvus_client:
                 logger.info("Store ID not handled by any milvus client")
                 router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
-                self.milvus_clients[store_id] = AsyncMilvusRouterClient(
+                milvus_client = AsyncMilvusRouterClient(
                     router_url=router_url,
                     store_id=store_id,
                     embedding_dim=768,  # match your model's feature dimension
                     connection_timeout=10,
                     batch_size=100
                 )
+                self.milvus_clients[store_id] = milvus_client
+
+            store_cache = self.get_or_create_store_cache(store_id)
             logger.info(f"Milvus Client found for store {self.milvus_clients[store_id].store_id}")
-            milvus_client = self.milvus_clients[store_id]
             logger.info(f"passing client for store id {milvus_client.store_id} to processor ")
-            # milvus_client = self.milvus_clients.get(store_id)
-            # if not milvus_client:
-                # logger.error(f"No Milvus client found for store {store_id}")
-                # Initialize one if missing
-                # router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
-                # milvus_client = AsyncMilvusRouterClient(
-                    # router_url=router_url,
-                    # store_id=store_id,
-                    # embedding_dim=768
-                # )
-                # self.milvus_clients[store_id] = milvus_client
-                
+    
             self.camera_processors[key] = CameraProcessor(
                 camera_id, 
                 store_id,
-                milvus_client=milvus_client
+                milvus_client=milvus_client,
+                store_cache=store_cache
             )
+            logger.info(f"Created camera processor for camera {camera_id} in store {store_id} with shared cache")
         return self.camera_processors[key]
+
+    async def _log_cache_statistics(self):
+        """Log statistics for all store caches."""
+        if not self.store_cache_managers:
+            return
+        
+        logger.info("=== Store Cache Statistics ===")
+        # Group by active/inactive
+        active_stores = []
+        inactive_stores = []
+            
+        total_memory_mb = 0
+        total_tracks = 0
+        current_time = time.time()
+        for store_id, cache_manager in self.store_cache_managers.items():
+            stats = cache_manager.get_stats()
+            last_access = self.store_last_access.get(store_id, 0)
+            idle_time = current_time - last_access
+            if idle_time < 300:  # Active if used in last 5 minutes
+                active_stores.append((store_id, stats, idle_time))
+            else:
+                inactive_stores.append((store_id, stats, idle_time))
+
+
+            # Estimate memory usage (rough calculation)
+            memory_mb = (stats['total_features'] * 768 * 4) / (1024 * 1024)
+            total_memory_mb += memory_mb
+            total_tracks += stats['cache_size']
+            
+            logger.info(f"Store {store_id}: "
+                       f"tracks={stats['cache_size']}, "
+                       f"features={stats['total_features']}, "
+                       f"age={stats['cache_age_seconds']:.1f}s, "
+                       f"hit_rate={stats['hit_rate_percent']:.1f}%, "
+                       f"memory≈{memory_mb:.1f}MB")
+        
+        logger.info(f"Total: {len(self.store_cache_managers)} stores, "
+                   f"{total_tracks} tracks, "
+                   f"≈{total_memory_mb:.1f}MB cache memory")
+        
+            # Log active stores
+        for store_id, stats, idle_time in active_stores:
+            logger.info(f"Store {store_id} [ACTIVE]: "
+                    f"idle={idle_time:.0f}s, "
+                    f"tracks={stats['cache_size']}, "
+                    f"hit_rate={stats['hit_rate_percent']:.1f}%")
+
     
     async def initialize_milvus_clients(self, store_ids):
         """Initialize AsyncMilvusRouterClient instances for all stores"""
@@ -843,169 +928,179 @@ class KafkaProcessor:
         if not task.cancelled() and task.exception() is not None:
             logger.error(f"Processing task failed with error: {task.exception()}")
     
+    async def _process_camera_batch(self, camera_id, frames_data_list):
+        """Process all frames for a specific camera"""
+        camera_results = []
+        
+        # Get store_id from first frame (assuming all frames for a camera are from same store)
+        store_id = frames_data_list[0]['store_id']
+        processor = self.get_camera_processor(camera_id, store_id)
+        
+        for frame_data in frames_data_list:
+            try:
+                # Extract all needed data
+                original_frame = frame_data['original_frame']
+                metadata = frame_data['metadata']
+                detections = frame_data['detections']
+                features = frame_data['features']
+                
+                # Process each frame for this camera
+                result = await processor.process_frame(
+                    original_frame,
+                    metadata['frame_id'],
+                    detections,
+                    features,
+                    metadata['timestamp']
+                )
+                camera_results.append({
+                    'result': result,
+                    'metadata': metadata
+                })
+            except Exception as e:
+                logger.error(f"Error processing frame for camera {camera_id}: {e}", exc_info=True)
+                # Continue with other frames even if one fails
+    
+        return camera_results
+        
     async def process_batch(self):
         """Process all frames in the current batch"""
         try:
             # Get batch from the robust buffer using fair distribution
+            batch_start_time = time.time()
+            timing_stats = {
+                "buffer_read": 0,
+                "gpu_processing": 0,
+                "camera_processing": 0,
+                "result_preparation": 0,
+                "sending_data": 0,
+                "total": 0
+            }
+            buffer_start = time.time()
             loop = asyncio.get_running_loop()
             current_batch = await self.frame_buffer.get_next_batch(
                 max_batch_size=self.gpu_processors[0].max_batch_size,
                 strategy='fair'  # Ensures all cameras get processing time
             )
-            
+            timing_stats["buffer_read"] = time.time() - buffer_start
+            logger.info(f"[TIMING] Buffer read: {timing_stats['buffer_read']:.3f}s, frames: {len(current_batch) if current_batch else 0}")
             if not current_batch:
                 logger.info("No frames in buffer to process")
                 self.processing_busy = False
                 return
-           # if not self.frame_buffer:
-           #     return
-           # batch = await self.frame_buffer.get_next_batch(self.gpu_processor.max_batch_size)
-           # if not batch:
-           #     return  
-           # Get current buffer and clear it
-           # current_batch = self.frame_buffer.copy()
-
-           # if not current_batch:
-           #     return
-           
+            
+            gpu_start = time.time() 
             batch_start_time = time.time()
-            # logger.info(f"Processing batch of {len(current_batch)} frames")
-                    
-            # from_ts, to_ts = get_time_window_list(current_batch)
-            # logger.info(f"Batch time window (list approach): from {from_ts} to {to_ts}")
-            # Process batch on GPU (segmentation + feature extraction)
-            # Use round-robin to select a GPU processor for processing this batch
             processor = self._select_processor_for_batch()
-            # processor = self.gpu_processors[self.current_processor_index]
-            # self.current_processor_index = (self.current_processor_index + 1) % len(self.gpu_processors)
             batch_results = await loop.run_in_executor(
                 None,  # Use default executor
                 lambda: processor.process_batch(current_batch)
             )
-            
-            # Process each result with its camera processor (CPU-intensive)
+            timing_stats["gpu_processing"] = time.time() - gpu_start
+            logger.info(f"[TIMING] GPU processing: {timing_stats['gpu_processing']:.3f}s for {len(current_batch)} frames")
+            # Group by camera WITH original frames
+            camera_start = time.time()
+            camera_groups = defaultdict(list)
             tasks = []
-            for metadata, detections, features in batch_results:
+            for i, (metadata, detections, features) in enumerate(batch_results):
                 if not detections:  # Skip empty results
                     continue
                 store_id = metadata['store_id']
                 camera_id = metadata['camera_id']
                 frame_id = metadata['frame_id']
                 timestamp = metadata['timestamp']
-                
-                # Find the original frame
-                original_frame = None
-                for frame, meta in current_batch:
-                    if meta['camera_id'] == camera_id and meta['frame_id'] == frame_id:
-                        original_frame = frame
-                        break
-                
-                if original_frame is None:
-                    logger.error(f"Original frame not found for camera {camera_id}, frame {frame_id}")
-                    continue
-                
-                # Get camera processor
-                logger.info("About to get_camera_processor for %s/%s", camera_id, store_id) 
-                processor = self.get_camera_processor(camera_id, store_id)
-                logger.info(f"processor.milvus_client.store_id is {processor.milvus_client.store_id}")
-                # Create task for CPU processing
-                # task = loop.run_in_executor(
-                #     self.thread_pool,
-                #     processor.process_frame,
-                #     original_frame,
-                #     frame_id,
-                #     detections,
-                #     features,
-                #     timestamp
-                # )
-
-                # Create task for processing (now async)
-                task = processor.process_frame(
-                    original_frame,
-                    frame_id,
-                    detections,
-                    features,
-                    timestamp
-                )
-
-                tasks.append((task, metadata))
+                original_frame = current_batch[i][0]
+                camera_groups[camera_id].append({
+                    'original_frame': original_frame,
+                    'metadata': metadata,
+                    'detections': detections,
+                    'features': features,
+                    'store_id': store_id
+                })
             
+            camera_tasks = []
+            for camera_id, frames_data in camera_groups.items():
+                cam_start = time.time()
+                task = self._process_camera_batch(camera_id, frames_data)
+                camera_tasks.append(task)
+                # Find the original frame
+            all_results = await asyncio.gather(*camera_tasks)
+            timing_stats["camera_processing"] = time.time() - camera_start
+            logger.info(f"[TIMING] Camera processing: {timing_stats['camera_processing']:.3f}s for {len(camera_groups)} cameras")
             # Wait for all processing to complete
             send_tasks = []
+            prep_start = time.time()
             results_to_send = []  # Create a list to store all results
-            for task, metadata in tasks:
-                try:
-                    # result, annotated_frame = await task
-                    result = await task
 
-                    if result["no_of_people"] == 0:
-                        logger.info(f"Skipping result with no people detected: camera_id={result['camera_id']}, frame_id={metadata['frame_id']}")
-                        continue
+            for camera_results in all_results:
 
-                    # Ensure all required fields are present regardless of detection count
-                    if "image_url" not in result or not result["image_url"]:
-                        result["image_url"] = ""  # Default empty string if not already set
+                if isinstance(camera_results, Exception):
+                    logger.error(f"Camera processing failed: {camera_results}")
+                    continue
 
-                    if "camera_id" not in result or not result["camera_id"]:
-                        result["camera_id"] = ""  # Default empty string if not already set
+                for result_data in camera_results:
+                    try:
+                        result = result_data["result"]
+                        metadata = result_data["metadata"]
 
-                    if "is_organised" not in result:
-                        result["is_organised"] = True  # Default to True
+                        # Skip if no people detected
+                        if result["no_of_people"] == 0:
+                            logger.info(f"Skipping result with no people detected: camera_id={result['camera_id']}, frame_id={metadata['frame_id']}")
+                            continue
                         
-                    # Make sure date_time is properly set
-                    if "date_time" not in result or not result["date_time"]:
-                        result["date_time"] = metadata["timestamp"]
+                        # Ensure all required fields are present
+                        if "image_url" not in result or not result["image_url"]:
+                            result["image_url"] = ""
+                        
+                        if "camera_id" not in result or not result["camera_id"]:
+                            result["camera_id"] = ""
+                        
+                        if "is_organised" not in result:
+                            result["is_organised"] = True
+                        
+                        # Make sure date_time is properly set
+                        if "date_time" not in result or not result["date_time"]:
+                            result["date_time"] = metadata["timestamp"]
+                        
+                        if "persons" not in result:
+                            result["persons"] = []
+                        
+                        results_to_send.append(result)
 
-                    if "persons" not in result:
-                        result["persons"] = []
-                    
-                    # if result["persons"]:
-                    #     for person in result["persons"]:
-                    #         if "coords" not in person:
-                    #             person["coords"] = {
-                    #                 "x": str(person.pop("x_coord", 0)),
-                    #                 "y": str(person.pop("y_coord", 0))
-                    #                 }
-                    
-                            # # Ensure all required person fields exist
-                            # if "person_id" not in person:
-                            #     person["person_id"] = "unknown"
-                            # if "type" not in person:
-                            #     person["type"] = "unknown"
-                            # if "group_id" not in person:
-                            #     person["group_id"] = ""
+                        # Calculate processing latency
+                        queued_time = metadata.get('queued_time', time.time())
+                        total_latency = time.time() - queued_time
+                        
+                        # Track processing time for stats
+                        self.stats["processing_times"].append(total_latency)
+                        self.stats["frames_processed"] += 1
+                        logger.info(f"Processed frame {metadata['frame_id']} from camera {result['camera_id']} "
+                                f"with {result['no_of_people']} people (latency: {total_latency*1000:.1f}ms)")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing result: {e}", exc_info=True)
 
-                    results_to_send.append(result)
-                    # result["from_datetime"] = from_ts
-                    # result["to_datetime"] = to_ts
-                    # Calculate processing latency
-                    queued_time = metadata.get('queued_time', time.time())
-                    total_latency = time.time() - queued_time
-                    # Track processing time for stats
-                    self.stats["processing_times"].append(total_latency)
-                    self.stats["frames_processed"] += 1
-
-                    # Add latency info to result
-                    # result['processing_latency'] = total_latency
-                    logger.info(f"Processed frame {frame_id} from camera {result['camera_id']} "
-                               f"with {result['no_of_people']} people (latency: {total_latency*1000:.1f}ms)")
-                    current_time = time.time()
-                    if current_time - self.last_send_time >= self.send_interval:
-                        payload_str = json.dumps(results_to_send, indent=2)
-                        logger.info("About to send detection payload:\n%s", payload_str)
-                        send_task = asyncio.create_task(send_detection_data(results_to_send))
-                        send_tasks.append(send_task)
-                        self.last_send_time = current_time
-                    else:
-                        logger.info("Skipping send to maintain configured send rate")
-                except Exception as task_error:
-                    logger.error(f"Error processing task: {task_error}", exc_info=True)
+                #     current_time = time.time()
+                #     if current_time - self.last_send_time >= self.send_interval:
+                #         payload_str = json.dumps(results_to_send, indent=2)
+                #         logger.info("About to send detection payload:\n%s", payload_str)
+                #         send_task = asyncio.create_task(send_detection_data(results_to_send))
+                #         send_tasks.append(send_task)
+                #         self.last_send_time = current_time
+                #     else:
+                #         logger.info("Skipping send to maintain configured send rate")
+                # except Exception as task_error:
+                #     logger.error(f"Error processing task: {task_error}", exc_info=True)
 
             # After collecting all results
+            timing_stats["result_preparation"] = time.time() - prep_start
+            logger.info(f"[TIMING] Result preparation: {timing_stats['result_preparation']:.3f}s, {len(results_to_send)} results")
             if results_to_send:
+                send_start = time.time()
                 payload_str = json.dumps(results_to_send, indent=2)
                 logger.info("About to send detection payload:\n%s", payload_str)
                 success = await send_detection_data(results_to_send)
+                timing_stats["sending_data"] = time.time() - send_start
+                logger.info(f"[TIMING] Send detection data: {timing_stats['sending_data']:.3f}s, success: {success}")
                 if not success:
                     logger.warning("Failed to send batch of results after multiple attempts")
 
@@ -1018,25 +1113,31 @@ class KafkaProcessor:
                     send_task = asyncio.create_task(send_detection_data(results_to_send))
                     send_tasks.append(send_task)
                     self.last_send_time = current_time
-                    logger.info(f"Sent final batch of {len(results_to_send)} results")
-                    results_to_send = []  # Clear the list after sending
                 else:
-                    # If we need to respect the interval, schedule the send for later
-                    wait_time = self.send_interval - (current_time - self.last_send_time)
-                    logger.info(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
-                    await asyncio.sleep(wait_time)
-                    payload_str = json.dumps(results_to_send, indent=2)
-                    logger.info("About to send detection payload:\n%s", payload_str)
-                    send_task = asyncio.create_task(send_detection_data(results_to_send))
-                    send_tasks.append(send_task)
-                    self.last_send_time = time.time()
-                    results_to_send = []  # Clear the list after sending
-                    # Wait for all send tasks to complete
+                    logger.info(f"Skipping send to maintain configured send rate. Will send {len(results_to_send)} results later.")
+                    # # If we need to respect the interval, schedule the send for later
+                    # wait_time = self.send_interval - (current_time - self.last_send_time)
+                    # logger.info(f"Waiting {wait_time:.2f}s before sending final batch of {len(results_to_send)} results")
+                    # await asyncio.sleep(wait_time)
+                    # payload_str = json.dumps(results_to_send, indent=2)
+                    # logger.info("About to send detection payload:\n%s", payload_str)
+                    # send_task = asyncio.create_task(send_detection_data(results_to_send))
+                    # send_tasks.append(send_task)
+                    # self.last_send_time = time.time()
+                    # results_to_send = []  # Clear the list after sending
+                    # # Wait for all send tasks to complete
             else:
                 logger.info("No people detected in any frames, skipping API call")
             if send_tasks:
                 await asyncio.gather(*send_tasks)
 
+            timing_stats["total"] = time.time() - batch_start_time
+            logger.info(f"[TIMING] BATCH TOTAL: {timing_stats['total']:.3f}s | "
+                   f"Buffer: {timing_stats['buffer_read']:.3f}s, "
+                   f"GPU: {timing_stats['gpu_processing']:.3f}s, "
+                   f"Camera: {timing_stats['camera_processing']:.3f}s, "
+                   f"Prep: {timing_stats['result_preparation']:.3f}s, "
+                   f"Send: {timing_stats['sending_data']:.3f}s")
             # Log processing stats periodically
             current_time = time.time()
             if current_time - self.stats["last_stats_time"] > self.stats["stats_interval"]:
@@ -1062,6 +1163,9 @@ class KafkaProcessor:
                 
     def _log_processing_stats(self):
         """Log processing statistics"""
+        now = time.time()
+        if now - self.stats["last_stats_time"] < self.stats["stats_interval"]:
+            return
         if not self.stats["processing_times"]:
             return
             
@@ -1083,9 +1187,20 @@ class KafkaProcessor:
                    f"({buffer_status['utilization_percent']:.1f}%), "
                    f"GPU memory=[{', '.join(gpu_mem_stats)}]")
         
-        # Reset counters
+
+        interval = self.stats["stats_interval"]
+        proc_fps = self.stats["frames_processed"] / interval
+        in_fps   = self.stats["incoming_frames"]  / interval
+        logger.info(
+            f"FPS: in={in_fps:.1f}/s, proc={proc_fps:.1f}/s, "
+            f"avg_latency={avg_latency*1000:.1f}ms, "
+            f"buffer={buffer_status['utilization_percent']:.1f}%"
+        )
+        self.stats["processing_times"].clear()       
         self.stats["frames_processed"] = 0
-    
+        self.stats["incoming_frames"]  = 0
+        self.stats["last_stats_time"] = now
+        
     def save_annotated_frame(self, frame, camera_id, frame_number):
         """Save annotated frame for debugging (optional)"""
         output_dir = f"output/{camera_id}"
@@ -1313,6 +1428,7 @@ class KafkaProcessor:
                             self.frame_buffer.add_frame(frame, metadata),
                             loop
                         )
+                        self.stats["incoming_frames"] += 1
                     except Exception as e:
                         logger.error(f"Error processing message from topic {msg.topic}: {e}")
             except Exception as e:
@@ -1325,7 +1441,6 @@ class KafkaProcessor:
 
         # Schedule the blocking poll in the threadpool
         await loop.run_in_executor(None, poll_loop)
-
 
     async def _processing_loop(self):
         """Background task that ensures batch processing happens regularly"""
@@ -1342,11 +1457,26 @@ class KafkaProcessor:
                     if (buffer_status['total_frames'] > 0 and 
                         time.time() - self.last_process_time >= self.batch_interval):
                         self.processing_busy = True
-                        await self.process_batch()
+                        try:
+                            await self.process_batch()
+                        except Exception as e:
+                            logger.error(f"Error in process_batch: {e}")
+                        finally:
+                            self.processing_busy = False
                         self.last_process_time = time.time()
+                
 
                 # Check if we should do a periodic cleanup of features
                 current_time = time.time()
+                if current_time - self.last_cache_stats_time >= self.cache_stats_interval:
+                    await self._log_cache_statistics()
+                    self.last_cache_stats_time = current_time
+                
+                # Clean up inactive store caches every 5 minutes
+                if current_time - last_cleanup_time >= 300:
+                    await self._cleanup_inactive_stores()
+                    last_cleanup_time = current_time
+
                 if current_time - last_cleanup_time >= cleanup_interval:
                     # Flush features for all camera processors
                     for key, camera_processor in self.camera_processors.items():
@@ -1360,8 +1490,50 @@ class KafkaProcessor:
                 
             except Exception as e:
                 logger.error(f"Error in processing loop: {e}", exc_info=True)
+                self.processing_busy = False
                 await asyncio.sleep(1)  # Sleep before retrying
-    
+
+    async def _handle_consumer_error(self):
+        """Handle Kafka consumer errors and attempt restart"""
+        logger.error("Kafka consumer encountered an error, attempting to restart...")
+        
+        # Close existing consumer if it exists
+        if hasattr(self, 'kafka_consumer') and self.kafka_consumer:
+            try:
+                self.kafka_consumer.close()
+            except Exception as e:
+                logger.error(f"Error closing Kafka consumer: {e}")
+        
+        # Wait before restarting
+        await asyncio.sleep(5)
+        
+        # Restart consumer loop
+        self.task_manager.create_task(
+            self._kafka_consumer_loop(),
+            category="kafka_consumer_restart"
+        )
+
+
+    async def _cleanup_inactive_stores(self):
+        """Remove caches for stores that haven't been used recently"""
+        current_time = time.time()
+        inactive_threshold = 600  # 10 minutes
+
+        stores_to_remove = []
+        for store_id, last_access in self.store_last_access.items():
+            if current_time - last_access > inactive_threshold:
+                stores_to_remove.append(store_id)
+
+        for store_id in stores_to_remove:
+            logger.info(f"Removing inactive store cache: {store_id}")
+            del self.store_cache_managers[store_id]
+            del self.store_last_access[store_id]
+
+            # Also clean up milvus client if not needed
+            if store_id in self.milvus_clients:
+                await self.milvus_clients[store_id].close()
+                del self.milvus_clients[store_id]
+
     async def _health_monitor(self):
         """Monitor overall system health and log status"""
         logger.info("Starting health monitor")
@@ -1476,8 +1648,10 @@ async def main():
         memory_management = system_config.get("memory_management", {})
         thread_pool_cfg = system_config.get("thread_pool", {})
         thread_pool_size = thread_pool_cfg.get("max_workers", 8)
-        send_fps = args.send_fps
-        
+        processing_config = base_config.get("processing", {})
+        result_database_config = base_config.get("result_database", {})
+
+        send_fps = result_database_config.get("send_fps",args.send_fps)
 
 
         # Determine GPU settings
@@ -1486,6 +1660,9 @@ async def main():
             num_processors = gpu_config.get("num_processors", 2)
             # Override batch_size per GPU if provided, else use the command-line argument
             batch_size = gpu_config.get("batch_size_per_gpu", args.batch_size)
+            batch_interval = processing_config.get("batch_interval", args.batch_interval)
+            fps = processing_config.get("processing_fps", args.fps)
+            logger.info(f"batch_size is {batch_size}, batch_interval is {batch_interval}")
         else:
             num_processors = 2  # or any default value if GPUs are not enabled
             batch_size = args.batch_size
@@ -1493,8 +1670,8 @@ async def main():
         processor = KafkaProcessor(
             num_processors=num_processors,
             batch_size=batch_size,
-            batch_interval=args.batch_interval,
-            processing_fps=args.fps,
+            batch_interval=batch_interval,
+            processing_fps=fps,
             frame_buffer_config=buffer_config,
             thread_pool_size=thread_pool_size,
             send_fps = send_fps
