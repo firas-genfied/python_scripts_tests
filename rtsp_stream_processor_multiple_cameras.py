@@ -17,6 +17,7 @@ import aiohttp
 # Import your custom modules
 from processor_segment_with_transreid import Segmentation_DeepSort, confirm_human, compute_iou
 from processor_segment_with_transreid import setup_predictor
+import time
 
 from utils.detection_utils import (
     crop_without_resize, 
@@ -253,7 +254,7 @@ class GPUBatchProcessor:
                         all_results.append((meta, [], []))
                     break
             if i + chunk_size < len(image_batch):
-                await asyncio.sleep(0.1)
+                time.sleep(0.1)
         return all_results
 
     def _process_batch_impl(self, image_batch):
@@ -769,8 +770,8 @@ class KafkaProcessor:
                     router_url=router_url,
                     store_id=store_id,
                     embedding_dim=768,
-                    connection_timeout=10,
-                    batch_size=100
+                    connection_timeout=15,
+                    batch_size=10
                 )
             
             # Create cache manager
@@ -822,8 +823,8 @@ class KafkaProcessor:
                     router_url=router_url,
                     store_id=store_id,
                     embedding_dim=768,  # match your model's feature dimension
-                    connection_timeout=10,
-                    batch_size=100
+                    connection_timeout=15,
+                    batch_size=10   
                 )
                 self.milvus_clients[store_id] = milvus_client
 
@@ -902,8 +903,8 @@ class KafkaProcessor:
                     router_url=router_url,
                     store_id=store_id,
                     embedding_dim=768,  # Match your model's embedding dimension
-                    connection_timeout=10,
-                    batch_size=100
+                    connection_timeout=15,
+                    batch_size=10
                 )
                 
                 # Check connection health

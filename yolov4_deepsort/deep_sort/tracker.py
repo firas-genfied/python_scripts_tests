@@ -16,7 +16,7 @@ import time
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILENAME),
@@ -763,41 +763,43 @@ class AsyncTracker:
                 logger.debug(f"Marked track {track.track_id} as missed")
         
         # Now create any new tracks
-        for track_id, (detection, _) in tracks_to_update.items():
-            existing_track_with_id = any(t.track_id == track_id for t in self.tracks)
+        for new_id, (detection, is_new) in tracks_to_update.items():
+            existing_track_with_id = any(t.track_id == new_id for t in self.tracks)
             if not existing_track_with_id:
                 mean, covariance = self.kf.initiate(detection.to_xyah())
                 class_name = detection.get_class()
             
                 new_track = Track(
-                    mean, covariance, track_id, self.n_init, self.max_age,
+                    mean, covariance, new_id, self.n_init, self.max_age,
                     detection.feature, class_name
                 )
             
                 try:
+                    logger.info("HERE")
                     db_features = await self.milvus_client.get_features_by_track_id(
-                        track_id = track_id,
+                        track_id = new_id,
                         store_id=self.store_id
                     )
+                    logger.info(f"store id is {self.store_id}")
                     milvus_ops_count += 1
                     if db_features:
                         new_track.features = db_features
-                        logger.debug(f"Created track with ID {track_id} (reidentified from Milvus with {len(new_track.features)} features)")
+                        logger.debug(f"Created track with ID {new_id} (reidentified from Milvus with {len(new_track.features)} features)")
                     else:
-                        logger.debug(f"Created new track with ID {track_id} (no features found in Milvus)")
+                        logger.debug(f"Created new track with ID {new_id} (no features found in Milvus)")
                 except Exception as e:
-                    logger.error(f"Failed to fetch features from Milvus for track_id {track_id} in store {self.store_id}: {e}")
-                    logger.debug(f"Created new track with ID {track_id} (fallback)")
+                    logger.error(f"Failed to fetch features from Milvus for track_id {new_id} in store {self.store_id}: {e}")
+                    logger.debug(f"Created new track with ID {new_id} (fallback)")
             
                 # Add the new track
                 self.tracks.append(new_track)
             else:
-                existing_tracks = [t for t in self.tracks if t.track_id == track_id]
+                existing_tracks = [t for t in self.tracks if t.track_id == new_id]
                 best_track = max(existing_tracks, key=lambda t: t.hits)
                 try:
 
                     db_features = await self.milvus_client.get_features_by_track_id(
-                        track_id = track_id,
+                        track_id = new_id,
                         store_id=self.store_id,
                     )
                     milvus_ops_count += 1
@@ -810,14 +812,14 @@ class AsyncTracker:
                                 if not any(np.array_equal(db_feature, f) for f in best_track.features):
                                     best_track.features.append(db_feature)
                                     added += 1
-                            logger.debug(f"[Milvus] Merged {added} new features for track {track_id}. Total now: {len(best_track.features)}")
+                            logger.debug(f"[Milvus] Merged {added} new features for track {new_id}. Total now: {len(best_track.features)}")
                     else:
-                        logger.debug(f"[Milvus] No features found to restore for track {track_id}")
+                        logger.debug(f"[Milvus] No features found to restore for track {new_id}")
                 except Exception as e:
-                    logger.error(f"[Milvus] Failed to fetch/merge features for track {track_id}: {e}")
+                    logger.error(f"[Milvus] Failed to fetch/merge features for track {new_id}: {e}")
                 best_track.update(self.kf, detection)
                 await self._insert_feature_into_milvus(best_track, detection)
-                logger.debug(f"Updated existing track ID {track_id} with n_hits={best_track.hits} instead of creating duplicate")
+                logger.debug(f"Updated existing track ID {new_id} with n_hits={best_track.hits} instead of creating duplicate")
         
         # Step 7: Remove deleted tracks
         self.tracks = [t for t in self.tracks if not t.is_deleted()]

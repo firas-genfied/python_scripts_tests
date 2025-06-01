@@ -14,7 +14,7 @@ logger = logging.getLogger("async-milvus-router-client")
 class AsyncMilvusRouterClient:
     """Asynchronous client for interacting with the Milvus Router API from tracker code"""
     
-    def __init__(self, router_url, store_id, connection_timeout=5, 
+    def __init__(self, router_url, store_id, connection_timeout=15, 
                  embedding_dim=768, batch_size=100, max_retries=2):
         """
         Initialize client that connects to the Milvus Router instead of directly to Milvus
@@ -35,11 +35,11 @@ class AsyncMilvusRouterClient:
         self.max_retries = max_retries
 
         # ADD: Global request limiter
-        self._max_concurrent = int(os.environ.get("MILVUS_MAX_CONCURRENT", "8"))
+        self._max_concurrent = int(os.environ.get("MILVUS_MAX_CONCURRENT", "25"))
         self._min_interval = float(os.environ.get("MILVUS_MIN_INTERVAL", "0.01"))
         self._request_semaphore = asyncio.Semaphore(self._max_concurrent)
         self._last_request_time = 0
-        self._min_request_interval = 0.01  # 10ms between requests
+        self._min_request_interval = 0.001  # 10ms between requests
         
         # Create the HTTP client during initialization
         self._http_client = None
@@ -62,12 +62,18 @@ class AsyncMilvusRouterClient:
     async def _get_client(self):
         """Get or create the HTTP client for async operations"""
         if self._http_client is None:
+            timeout_config = httpx.Timeout(
+                connect=10.0,   # Connection timeout
+                read=30.0,      # Read timeout (important for large queries)
+                write=15.0,     # Write timeout
+                pool=20.0       # Pool timeout
+            )
             self._http_client = httpx.AsyncClient(
-                timeout=self.connection_timeout,
+                timeout=timeout_config,
                 limits=httpx.Limits(
                     max_keepalive_connections=20,  # Keep connections alive
                     max_connections=50,
-                    keepalive_expiry=30.0
+                    keepalive_expiry=45.0
                 ),
                 headers={"Content-Type": "application/json"}
             )
@@ -111,8 +117,8 @@ class AsyncMilvusRouterClient:
             # Process track_id if it's a tuple
             if isinstance(track_id, tuple) and len(track_id) > 0:
                 track_id = track_id[0]
-            else:
-                track_id = track_id
+            # else:
+            #     track_id = track_id
                 
             # If track_id is None, return False
             if track_id is None:
@@ -205,44 +211,61 @@ class AsyncMilvusRouterClient:
                 else:
                     processed_embeddings.append(emb)
 
-            batch_size = batch_size or self.batch_size
+            effective_batch_size = min(batch_size or self.batch_size, 30)  # FIXED: 30 items per batch for efficiency
             total_records = len(track_ids)
             inserted_count = 0
         
-            try:
-                client = await self._get_client()
+            client = await self._get_client()
 
-                # Process in batches
-                for i in range(0, total_records, batch_size):
-                    end_idx = min(i + batch_size, total_records)
+            # Process in batches
+            for i in range(0, total_records, effective_batch_size):
+                end_idx = min(i + effective_batch_size, total_records)
 
-                    # Prepare batch data
-                    batch_data = {
-                        "track_ids": track_ids[i:end_idx],
-                        "embeddings": processed_embeddings[i:end_idx],
-                        "store_ids": store_ids[i:end_idx],
-                        "camera_ids": camera_ids[i:end_idx],
-                        "timestamps": timestamps[i:end_idx]
-                    }
+                # Prepare batch data
+                batch_data = {
+                    "track_ids": track_ids[i:end_idx],
+                    "embeddings": processed_embeddings[i:end_idx],
+                    "store_ids": store_ids[i:end_idx],
+                    "camera_ids": camera_ids[i:end_idx],
+                    "timestamps": timestamps[i:end_idx]
+                }
+                batch_success = False
+                for attempt in range(2):
+                    try:
 
-                    # Send batch to router
-                    response = await client.post(
-                        f"{self.router_url}/batch_insert",
-                        json=batch_data
-                    )
-                
-                    if response.status_code == 200:
-                        batch_result = response.json()
-                        inserted_count += batch_result.get("total_inserted", 0)
-                    else:
-                        logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                        # Send batch to router
+                        response = await client.post(
+                            f"{self.router_url}/batch_insert",
+                            json=batch_data,
+                            timeout = 10.0
+                        )
             
-                logger.info(f"Successfully inserted {inserted_count} embeddings in batches")
-                return inserted_count
+                        if response.status_code == 200:
+                            batch_result = response.json()
+                            inserted_count += batch_result.get("total_inserted", 0)
+                            batch_success = True
+                            break
+                        elif response.status_code >= 500 and attempt == 0:
+                            logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                            await asyncio.sleep(0.1)
+                            continue
+                        else:
+                            logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                            break
+
+                    except Exception as e:
+                        if attempt == 0:
+                            await asyncio.sleep(0.1)
+                            continue
+                        else:
+                            logger.warning(f"Batch insert failed: {e}")
+                            break
+            if not batch_success:
+                logger.debug(f"Failed to insert batch {i//effective_batch_size + 1}")
             
-            except Exception as e:
-                logger.error(f"Error in batch insert: {e}")
-                return inserted_count
+            if end_idx < total_records:
+                await asyncio.sleep(0.1)
+            return inserted_count
 
         return await self._rate_limited_request(_batch_insert_operation)
     
@@ -332,21 +355,26 @@ class AsyncMilvusRouterClient:
             List of feature embeddings (numpy arrays)
         """
         async def _get_features_operation():
+            logger.info("INSIDE MILVUS ROUTER CLIENT CODE")
             effective_store_id = store_id if store_id is not None else self.store_id
+            real_track_id = track_id
 
-            if isinstance(track_id, tuple) and len(track_id) > 0:
-                track_id = track_id[0]
+            if isinstance(real_track_id, tuple) and len(real_track_id) > 0:
+                real_track_id = real_track_id[0]
             
             # If track_id is None, return empty list
-            if track_id is None:
+            if real_track_id is None:
                 logger.info(f"Cannot retrieve features for None track_id")
                 return []
                 
             try:
                 client = await self._get_client()
                 response = await client.get(
-                    f"{self.router_url}/track/features/{track_id}/{effective_store_id}"
+                    f"{self.router_url}/track/features/{track_id}/{effective_store_id}",
+                    timeout=15.0 
                 )
+
+                logger.info(f"Get Features Response status: {response.status_code}")
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -354,11 +382,17 @@ class AsyncMilvusRouterClient:
                     features = [np.array(f, dtype=np.float32) for f in result.get("features", [])]
                     return features
                 else:
+                    logger.error(f"Get features failed for track_id={track_id}: status={response.status_code}, response={response.text}")
                     logger.error(f"Get features failed with status {response.status_code}: {response.text}")
                     return []
-                    
+            except httpx.TimeoutException as e:
+                logger.error(f"Timeout retrieving features for track_id={track_id}: {str(e)}")
+                return []
+            except httpx.RequestError as e:
+                logger.error(f"Request error retrieving features for track_id={track_id}: {str(e)}")
+                return []
             except Exception as e:
-                logger.error(f"Error retrieving features for track_id={track_id}: {e}")
+                logger.error(f"Error retrieving features for track_id={real_track_id}: {e}")
                 return []
         return await self._rate_limited_request(_get_features_operation)
     
@@ -523,7 +557,7 @@ class AsyncMilvusRouterClient:
         
         async def _batch_search_operation():
             effective_store_id = store_id if store_id is not None else self.store_id
-            
+            logger.info(f"effective store id is {effective_store_id}")
             if not embeddings_list:
                 return []
             

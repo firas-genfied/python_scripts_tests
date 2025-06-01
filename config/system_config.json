@@ -4,7 +4,7 @@
          "enabled": true,
          "devices": [0],
          "memory_limit_mb_per_gpu": 4096,
-         "batch_size_per_gpu": 32,
+         "batch_size_per_gpu": 25,
          "load_balancing": "memory_based",
          "num_processors": 1
        },

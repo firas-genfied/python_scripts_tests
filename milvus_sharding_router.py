@@ -12,6 +12,7 @@ This router sits between client applications and Milvus shards, providing:
 import os
 import time
 import asyncio
+import logging
 import json
 import random
 from typing import Dict, List, Tuple, Any, Optional, Union
@@ -23,12 +24,13 @@ import httpx
 import redis
 from pymilvus import Collection, connections, utility
 import uvicorn
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler("milvus_router.log"),
         logging.StreamHandler()
@@ -86,16 +88,86 @@ class TopologyResponse(BaseModel):
     shards: Dict[str, ShardConfig]
     store_mappings: Dict[str, str]
 
+class RequestTimingMonitor:
+    def __init__(self):
+        self.request_times = deque(maxlen=1000)  # Keep last 1000 requests
+        self.timing_by_operation = defaultdict(lambda: deque(maxlen=100))
+        self.connection_wait_times = deque(maxlen=500)
+        self.db_response_times = deque(maxlen=500)
+        
+    async def time_operation(self, operation_name: str, operation_func, *args, **kwargs):
+        """Time an operation and track where delays occur"""
+        total_start = time.time()
+        
+        # Time connection acquisition
+        conn_start = time.time()
+        connection_alias, shard_id = await self._get_connection_for_store(*args, **kwargs)
+        conn_time = time.time() - conn_start
+        self.connection_wait_times.append(conn_time)
+        
+        # Time database operation
+        db_start = time.time()
+        try:
+            result = await operation_func(connection_alias, shard_id, *args, **kwargs)
+            db_time = time.time() - db_start
+            self.db_response_times.append(db_time)
+            
+            total_time = time.time() - total_start
+            self.request_times.append(total_time)
+            self.timing_by_operation[operation_name].append(total_time)
+            
+            # Log slow operations immediately
+            if total_time > 5.0:  # Anything over 5 seconds
+                logger.warning(f"SLOW {operation_name}: total={total_time:.2f}s, "
+                             f"conn_wait={conn_time:.2f}s, db_time={db_time:.2f}s")
+            
+            return result
+            
+        except Exception as e:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            logger.error(f"FAILED {operation_name}: total={total_time:.2f}s, "
+                        f"conn_wait={conn_time:.2f}s, db_time={db_time:.2f}s, error={e}")
+            raise
+    
+    def get_timing_stats(self):
+        """Get comprehensive timing statistics"""
+        if not self.request_times:
+            return {}
+            
+        recent_times = list(self.request_times)[-50:]  # Last 50 requests
+        all_times = list(self.request_times)
+        
+        conn_times = list(self.connection_wait_times)[-50:]
+        db_times = list(self.db_response_times)[-50:]
+        
+        return {
+            "recent_avg_total": sum(recent_times) / len(recent_times) if recent_times else 0,
+            "recent_p95_total": sorted(recent_times)[int(len(recent_times) * 0.95)] if recent_times else 0,
+            "overall_avg_total": sum(all_times) / len(all_times),
+            
+            "recent_avg_conn_wait": sum(conn_times) / len(conn_times) if conn_times else 0,
+            "recent_p95_conn_wait": sorted(conn_times)[int(len(conn_times) * 0.95)] if conn_times else 0,
+            
+            "recent_avg_db_time": sum(db_times) / len(db_times) if db_times else 0,
+            "recent_p95_db_time": sorted(db_times)[int(len(db_times) * 0.95)] if db_times else 0,
+            
+            "total_requests": len(all_times),
+            "slow_requests": len([t for t in recent_times if t > 5.0])
+        }
+
 
 class ConnectionPool:
     """Manages and pools connections to Milvus shards"""
     
-    def __init__(self, max_connections_per_shard=5, connection_timeout=10):
+    def __init__(self, max_connections_per_shard=25, connection_timeout=30):
         self.connections = {}  # {shard_id: {connection_alias: last_used_time}}
         self.shard_info = {}  # {shard_id: ShardConfig}
         self.max_connections_per_shard = max_connections_per_shard
         self.connection_timeout = connection_timeout
         self.lock = asyncio.Lock()
+        self.active_connections = {}
+        self.connection_health = {}
         
     async def get_connection_alias(self, shard_id: str) -> str:
         """Get a connection alias for the specified shard"""
@@ -170,12 +242,10 @@ class ConnectionPool:
                     if current_time - self.connections[shard_id][connection_alias] > max_idle_time:
                         try:
                             connections.disconnect(connection_alias)
-                            if connection_alias in connections.list_connections():
-                                logger.warning(f"Connection {connection_alias} still exists after disconnect")
+                            del self.connections[shard_id][connection_alias]
+                            logger.info(f"Closed stale connection to shard {shard_id}: {connection_alias}")
                         except Exception as e:
-                            logger.error(f"Force cleanup connection {connection_alias}: {e}")
-                         finally:
-                            self.connections[shard_id].pop(connection_alias, None)
+                            logger.error(f"Error closing connection {connection_alias}: {e}")
 
 class ShardingManager:
     """Manages store-to-shard mapping and shard topology"""
@@ -542,6 +612,11 @@ class ShardedMilvusRouter:
         self.connection_pool = ConnectionPool()
         self.collection_manager = MilvusCollectionManager(collection_name, embedding_dim)
         self.health_monitor = RouterHealthMonitor(self.sharding_manager, self.connection_pool)
+
+        #DEBUG
+        self.timing_monitor = RequestTimingMonitor()
+        self.active_requests_by_shard = defaultdict(int)
+        self.queue_lengths = defaultdict(int)
         
     async def start(self):
         """Start the router services"""
@@ -611,13 +686,14 @@ class ShardedMilvusRouter:
                 [request.camera_id], 
                 [request.timestamp]
             ]
-            
+            partition_name = f"stores_{request.store_id}_to_{request.store_id}"
             # Execute insert operation
             result = await self.collection_manager.execute_operation(
                 connection_alias=connection_alias,
                 shard_id=shard_id,
                 operation="insert",
-                data=data
+                data=data,
+                partition_name = partition_name
             )
             
             await self.collection_manager.execute_operation(
@@ -663,7 +739,7 @@ class ShardedMilvusRouter:
                     timestamps = [request.timestamps[i] for i in indices]
 
                     partition_name = f"stores_{store_id}_to_{store_id}"
-                    data = [None,track_ids, embeddings, store_ids, camera_ids, timestamps]
+                    data = [track_ids, embeddings, store_ids, camera_ids, timestamps]
                     
                     # Execute insert operation
                     store_result = await self.collection_manager.execute_operation(
@@ -696,6 +772,7 @@ class ShardedMilvusRouter:
                         shard_id=shard_id,
                         operation="flush"
                     )
+                    logger.info(f"Flushed shard {shard_id}")
                 except Exception as flush_error:
                     logger.error(f"Error flushing shard {shard_id}: {flush_error}")
             return {
@@ -1111,7 +1188,6 @@ class ShardedMilvusRouter:
                     track_id_int = int(track_id)
                 except Exception as e:
                     logger.error(f"Cannot convert track ID '{track_id}' to integer: {e}")
-                    continue
                 embeddings = []
                 for f in features_data:
                     logger.debug(f"Track {track_id_int}, feature entry type: {type(f)}, value: {f}")
@@ -1269,12 +1345,20 @@ async def test_connection(store_id: int):
     """Test connection to the Milvus shard for a specific store"""
     try:
         # Get connection details
+        logger.info(f"[{store_id}] start health check")
+        t0 = time.time()
         connection_alias, shard_id = await router._get_connection_for_store(store_id)
+        t1 = time.time()
+        logger.info(f"[{store_id}] got alias in {t1 - t0:.3f}s")
         shard_config = router.connection_pool.shard_info[shard_id]
         
         # Try to list collections as a test
+        t2 = time.time()
         collection_list = utility.list_collections(using=connection_alias)
-        
+        t3 = time.time()
+        logger.info(f"[{store_id}] list_collections took {t3 - t2:.3f}s")
+        total = t3 - t0
+        logger.info(f"[{store_id}] total endpoint latency: {total:.3f}s")
         return {
             "success": True,
             "store_id": store_id,
