@@ -75,7 +75,7 @@ class TrackState:
 
 class GPUBatchProcessor:
     """Handles batch processing of images using GPU for shared operations"""
-    def __init__(self, max_batch_size=8, device=None, model_config=None):
+    def __init__(self, max_batch_size=16, device=None, model_config=None):
         
         self.max_batch_size = max_batch_size
         self.dynamic_batch_size = max_batch_size 

@@ -3,8 +3,8 @@
        "gpu_config": {
          "enabled": true,
          "devices": [0],
-         "memory_limit_mb_per_gpu": 4096,
-         "batch_size_per_gpu": 25,
+         "memory_limit_mb_per_gpu": 2048,
+         "batch_size_per_gpu": 12,
          "load_balancing": "memory_based",
          "num_processors": 1
        },
@@ -17,7 +17,7 @@
        }
     },
     "processing": {
-       "batch_interval": 0.3, 
+       "batch_interval": 0.2, 
        "processing_fps": 5,
        "mode": "batch" 
     },

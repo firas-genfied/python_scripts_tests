@@ -37,7 +37,7 @@ class AsyncTrackManager:
     def __init__(self, milvus_client):
         self.milvus_client = milvus_client
         self.operation_queue = asyncio.Queue()
-        self.batch_size = 50  # Max operations per batch
+        self.batch_size = 32  # Max operations per batch
         self.batch_timeout = 0.1  # Max seconds to wait for a full batch
         self.processing_task = None
         self.is_running = False
@@ -449,7 +449,7 @@ class MilvusReIDClient:
         search_params = {
             "metric_type": "COSINE", 
             "params": {
-                "ef": 64  # Higher for better recall at the cost of speed
+                "ef": 32  # Higher for better recall at the cost of speed
             }
         }
 

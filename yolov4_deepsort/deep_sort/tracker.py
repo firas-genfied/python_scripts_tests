@@ -62,7 +62,7 @@ class AsyncTracker:
             'timestamps': []
         } #Created for batch fetaure insertion. Instead of inserting the features everytime a track gets confirmed/created, we store them temporarily and insert them in batches.
         try:
-            self._batch_size = int(os.environ.get("MILVUS_BATCH_SIZE", "50"))
+            self._batch_size = int(os.environ.get("MILVUS_BATCH_SIZE", "32"))
             self._batch_interval = float(os.environ.get("MILVUS_BATCH_INTERVAL", "1.0"))
              # Validate values
             if self._batch_size < 1:
@@ -270,7 +270,17 @@ class AsyncTracker:
         to choose the best match for detections in the center/bottom of the frame,
         EXCEPT during the first 250 frames where new IDs are allowed anywhere.
         """
+        frame_start = time.time()
+        operation_times = []
         milvus_ops_count = 0
+
+        def log_operation(operation_name, start_time):
+            elapsed = time.time() - start_time
+            operation_times.append((operation_name, elapsed))
+            logger.warning(f"[TIMING] {operation_name}: {elapsed:.3f}s")
+            return time.time()
+        
+        logger.warning(f"=== FRAME START: {len(detections)} detections ===")
         # Step 1: Identify potentially overlapping detections
         self._deduplicate_tracks()
         overlap_threshold = 0.25  # IoU threshold
@@ -448,12 +458,14 @@ class AsyncTracker:
             if self.use_shared_cache:
                 logger.info(f"SEARCHING IN CACHE FIRST")
                 # Search in shared cache first
+                op_start = time.time()
                 cache_results = await self.store_cache.batch_search_in_cache(
                     features=search_features,
                     exclude_ids=set(),  # Don't exclude any IDs initially
                     threshold=self.matching_threshold,
                     top_k=20
                 )
+                log_operation("search_embeddings_batch", op_start)
                 
                 # If we need more results, fall back to Milvus
                 batch_results = []
@@ -462,12 +474,13 @@ class AsyncTracker:
                         logger.info("len(cache_result) < 1")
                         milvus_ops_count += 1
                         # Search Milvus for additional results
+                        op_start = time.time()
                         milvus_result = await self.milvus_client.search_embedding(
                             query_embedding=feature,
                             top_k=10,
                             store_filter=self.store_id
                         )
-                        
+                        log_operation("search_embeddings", op_start)
                         # Merge results
                         seen_ids = {r[0] for r in cache_result}
                         for track_id, distance in milvus_result:
@@ -480,14 +493,13 @@ class AsyncTracker:
                     logger.info(f"Using the cache data")
                     batch_results.append(cache_result)
             else:
-            
-
+                op_start = time.time()
                 batch_results = await self.milvus_client.search_embeddings_batch(
                     embeddings_list = search_features,
                     top_k = 20,
                     store_id = self.store_id
                 )
-
+                log_operation("search_embeddings_batch", op_start)
                 # Process batch results
                 for i, (det_idx, results) in enumerate(zip(search_indices, batch_results)):
                     potential_matches[det_idx] = []
@@ -575,8 +587,10 @@ class AsyncTracker:
                     logger.debug(f"Assigned ID {matched_track_id} to overlapping detection {det_idx}")
                 else:
                     if det_idx in center_detections and not startup_grace_period:
+                        op_start = time.time()
                         # Center detection must use existing ID
                         alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
+                        log_operation("find_best_match_fallback", op_start)
                         milvus_ops_count += 1
                         if alt_id is not None:
                             logger.debug(f"Center detection {det_idx} gets forced match with ID {alt_id}")
@@ -584,7 +598,9 @@ class AsyncTracker:
                         else:
                             # Fallback to oldest ID
                             try:
+                                op_start = time.time()
                                 all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                                log_operation("get_all_track_ids", op_start)
                                 milvus_ops_count += 1
                                 alt_id = min(all_ids) if all_ids else self._next_id
                             except Exception as e:
@@ -690,7 +706,9 @@ class AsyncTracker:
                     else:
                         # Fallback to oldest ID
                         try:
+                            op_start = time.time()
                             all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
+                            log_operation("get_all_track_ids", op_start)
                             milvus_ops_count += 1
                             alt_id = min(all_ids) if all_ids else self._next_id
                         except Exception as e:
@@ -776,10 +794,12 @@ class AsyncTracker:
             
                 try:
                     logger.info("HERE")
+                    op_start = time.time()
                     db_features = await self.milvus_client.get_features_by_track_id(
                         track_id = new_id,
                         store_id=self.store_id
                     )
+                    log_operation(f"get_features_track_{new_id}", op_start)
                     logger.info(f"store id is {self.store_id}")
                     milvus_ops_count += 1
                     if db_features:
@@ -797,11 +817,12 @@ class AsyncTracker:
                 existing_tracks = [t for t in self.tracks if t.track_id == new_id]
                 best_track = max(existing_tracks, key=lambda t: t.hits)
                 try:
-
+                    op_start = time.time()
                     db_features = await self.milvus_client.get_features_by_track_id(
                         track_id = new_id,
                         store_id=self.store_id,
                     )
+                    log_operation(f"get_features_track_{new_id}", op_start)
                     milvus_ops_count += 1
                     if db_features:
                         if not best_track.features:
@@ -848,6 +869,16 @@ class AsyncTracker:
         if current_time - self._last_batch_time > self._batch_interval:
             await self._flush_feature_batch()
         logger.info(f"Frame processed with {milvus_ops_count} Milvus operations")
+        total_frame_time = time.time() - frame_start
+        total_milvus_time = sum(elapsed for _, elapsed in operation_times)
+        non_milvus_time = total_frame_time - total_milvus_time
+        
+        logger.warning(f"=== FRAME SUMMARY ===")
+        logger.warning(f"Total frame time: {total_frame_time:.3f}s")
+        logger.warning(f"Total Milvus time: {total_milvus_time:.3f}s ({len(operation_times)} ops)")
+        logger.warning(f"Non-Milvus time: {non_milvus_time:.3f}s")
+        logger.warning(f"Milvus operations: {[f'{name}:{time:.3f}s' for name, time in operation_times]}")
+        logger.warning(f"========================")
     async def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
         Find the best match regardless of threshold from Milvus, used for center detections. Uses shared cache when available
@@ -874,11 +905,13 @@ class AsyncTracker:
                     return results[0][0]  # Return best track_id
 
             # Get candidate track IDs and their features from Milvus
+            op_start = time.time()
             results = await self.milvus_client.search_embedding(
                 query_embedding=feature,
                 top_k=max_candidates * 5,
                 store_filter=self.store_id
             )
+            log_operation(f"search_embedding", op_start)
             # Filter and return best
             for track_id, distance in results:
                 if track_id not in assigned_ids:
