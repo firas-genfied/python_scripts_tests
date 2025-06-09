@@ -341,6 +341,9 @@ class AsyncTracker:
                 targets_to_add.extend([track.track_id] * len(track.features))
 
         if features_to_add and targets_to_add:
+            # logger.info(f"Active tracks: {[t.track_id for t in self.tracks if not t.is_deleted()]}")
+            # logger.info(f"Active targets passed: {active_targets}")
+            # logger.info(f"Samples keys: {list(self.metric.samples.keys())}")
             self.metric.partial_fit(np.asarray(features_to_add), np.asarray(targets_to_add), active_targets)
             # Now we can safely clear the features since they're in the metric
             for track in self.tracks:
@@ -394,6 +397,9 @@ class AsyncTracker:
                     track.update(self.kf, detection)
                     # Immediately update metric for this track
                     if track.is_confirmed() and detection.feature is not None:
+                        # logger.info(f"Active tracks: {[t.track_id for t in self.tracks if not t.is_deleted()]}")
+                        # logger.info(f"Active targets passed: {active_targets}")
+                        # logger.info(f"Samples keys: {list(self.metric.samples.keys())}")
                         self.metric.partial_fit(
                             np.array([detection.feature]),
                             np.array([track.track_id]),
@@ -766,6 +772,9 @@ class AsyncTracker:
                     track.update(self.kf, detection)
                     # Immediately update metric for this track
                     if track.is_confirmed() and detection.feature is not None:
+                        # logger.info(f"Active tracks: {[t.track_id for t in self.tracks if not t.is_deleted()]}")
+                        # logger.info(f"Active targets passed: {active_targets}")
+                        # logger.info(f"Samples keys: {list(self.metric.samples.keys())}")
                         self.metric.partial_fit(
                             np.array([detection.feature]),
                             np.array([track.track_id]),
