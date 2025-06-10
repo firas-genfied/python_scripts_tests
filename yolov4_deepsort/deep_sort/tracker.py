@@ -260,7 +260,7 @@ class AsyncTracker:
     
     def log_operation(self,operation_name, start_time):
         elapsed = time.time() - start_time
-        operation_times.append((operation_name, elapsed))
+        self.operation_times.append((operation_name, elapsed))
         logger.warning(f"[TIMING] {operation_name}: {elapsed:.3f}s")
         return time.time()
 
@@ -277,7 +277,7 @@ class AsyncTracker:
         EXCEPT during the first 250 frames where new IDs are allowed anywhere.
         """
         frame_start = time.time()
-        operation_times = []
+        self.operation_times = []
         milvus_ops_count = 0
         
         logger.warning(f"=== FRAME START: {len(detections)} detections ===")
@@ -879,14 +879,14 @@ class AsyncTracker:
             await self._flush_feature_batch()
         logger.info(f"Frame processed with {milvus_ops_count} Milvus operations")
         total_frame_time = time.time() - frame_start
-        total_milvus_time = sum(elapsed for _, elapsed in operation_times)
+        total_milvus_time = sum(elapsed for _, elapsed in self.operation_times)
         non_milvus_time = total_frame_time - total_milvus_time
         
         logger.warning(f"=== FRAME SUMMARY ===")
         logger.warning(f"Total frame time: {total_frame_time:.3f}s")
-        logger.warning(f"Total Milvus time: {total_milvus_time:.3f}s ({len(operation_times)} ops)")
+        logger.warning(f"Total Milvus time: {total_milvus_time:.3f}s ({len(self.operation_times)} ops)")
         logger.warning(f"Non-Milvus time: {non_milvus_time:.3f}s")
-        logger.warning(f"Milvus operations: {[f'{name}:{time:.3f}s' for name, time in operation_times]}")
+        logger.warning(f"Milvus operations: {[f'{name}:{time:.3f}s' for name, time in self.operation_times]}")
         logger.warning(f"========================")
     async def _find_best_match_regardless_of_threshold(self, feature, assigned_ids, max_candidates=10):
         """
