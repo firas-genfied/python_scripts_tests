@@ -257,6 +257,12 @@ class AsyncTracker:
         
         # Update the tracks list
         self.tracks = tracks_to_keep
+    
+    def log_operation(self,operation_name, start_time):
+        elapsed = time.time() - start_time
+        operation_times.append((operation_name, elapsed))
+        logger.warning(f"[TIMING] {operation_name}: {elapsed:.3f}s")
+        return time.time()
 
     async def update(self, detections):
         """
@@ -273,12 +279,6 @@ class AsyncTracker:
         frame_start = time.time()
         operation_times = []
         milvus_ops_count = 0
-
-        def log_operation(operation_name, start_time):
-            elapsed = time.time() - start_time
-            operation_times.append((operation_name, elapsed))
-            logger.warning(f"[TIMING] {operation_name}: {elapsed:.3f}s")
-            return time.time()
         
         logger.warning(f"=== FRAME START: {len(detections)} detections ===")
         # Step 1: Identify potentially overlapping detections
@@ -471,7 +471,7 @@ class AsyncTracker:
                     threshold=self.matching_threshold,
                     top_k=20
                 )
-                log_operation("search_embeddings_batch", op_start)
+                self.log_operation("search_embeddings_batch", op_start)
                 
                 # If we need more results, fall back to Milvus
                 batch_results = []
@@ -486,7 +486,7 @@ class AsyncTracker:
                             top_k=10,
                             store_filter=self.store_id
                         )
-                        log_operation("search_embeddings", op_start)
+                        self.log_operation("search_embeddings", op_start)
                         # Merge results
                         seen_ids = {r[0] for r in cache_result}
                         for track_id, distance in milvus_result:
@@ -505,7 +505,7 @@ class AsyncTracker:
                     top_k = 20,
                     store_id = self.store_id
                 )
-                log_operation("search_embeddings_batch", op_start)
+                self.log_operation("search_embeddings_batch", op_start)
                 # Process batch results
                 for i, (det_idx, results) in enumerate(zip(search_indices, batch_results)):
                     potential_matches[det_idx] = []
@@ -596,7 +596,7 @@ class AsyncTracker:
                         op_start = time.time()
                         # Center detection must use existing ID
                         alt_id = await self._find_best_match_regardless_of_threshold(detection.feature, assigned_ids)
-                        log_operation("find_best_match_fallback", op_start)
+                        self.log_operation("find_best_match_fallback", op_start)
                         milvus_ops_count += 1
                         if alt_id is not None:
                             logger.debug(f"Center detection {det_idx} gets forced match with ID {alt_id}")
@@ -606,7 +606,7 @@ class AsyncTracker:
                             try:
                                 op_start = time.time()
                                 all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
-                                log_operation("get_all_track_ids", op_start)
+                                self.log_operation("get_all_track_ids", op_start)
                                 milvus_ops_count += 1
                                 alt_id = min(all_ids) if all_ids else self._next_id
                             except Exception as e:
@@ -714,7 +714,7 @@ class AsyncTracker:
                         try:
                             op_start = time.time()
                             all_ids = await self.milvus_client.get_all_track_ids(store_id=self.store_id)
-                            log_operation("get_all_track_ids", op_start)
+                            self.log_operation("get_all_track_ids", op_start)
                             milvus_ops_count += 1
                             alt_id = min(all_ids) if all_ids else self._next_id
                         except Exception as e:
@@ -808,7 +808,7 @@ class AsyncTracker:
                         track_id = new_id,
                         store_id=self.store_id
                     )
-                    log_operation(f"get_features_track_{new_id}", op_start)
+                    self.log_operation(f"get_features_track_{new_id}", op_start)
                     logger.info(f"store id is {self.store_id}")
                     milvus_ops_count += 1
                     if db_features:
@@ -831,7 +831,7 @@ class AsyncTracker:
                         track_id = new_id,
                         store_id=self.store_id,
                     )
-                    log_operation(f"get_features_track_{new_id}", op_start)
+                    self.log_operation(f"get_features_track_{new_id}", op_start)
                     milvus_ops_count += 1
                     if db_features:
                         if not best_track.features:
@@ -920,7 +920,7 @@ class AsyncTracker:
                 top_k=max_candidates * 5,
                 store_filter=self.store_id
             )
-            log_operation(f"search_embedding", op_start)
+            self.log_operation(f"search_embedding", op_start)
             # Filter and return best
             for track_id, distance in results:
                 if track_id not in assigned_ids:
