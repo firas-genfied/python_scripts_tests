@@ -56,7 +56,7 @@ async def initialize_auth():
         refresh_interval=AUTH_REFRESH_INTERVAL
     )
     await auth_manager.start()
-    logger.debug("Authentication initialized")
+    logger.error("Authentication initialized")
 
 def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     """
@@ -150,7 +150,7 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
                         response_json = await response.json()
                         logger.debug(f"Response JSON: {json.dumps(response_json, indent=2)}")
                     except Exception:
-                        logger.debug("Response was not a valid JSON")
+                        logger.error("Response was not a valid JSON")
                     
                     if response.status == 200:
                         logger.debug(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")

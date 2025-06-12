@@ -215,46 +215,152 @@ class GPUBatchProcessor:
                 
                 return self._process_batch_chunked(image_batch, chunk_size=self.min_batch_size)
     
-    def _process_batch_chunked(self, image_batch, chunk_size=4):
-        """Process batch in smaller chunks to avoid OOM"""
+    # def _process_batch_chunked(self, image_batch, chunk_size=4):
+    #     """Process batch in smaller chunks to avoid OOM"""
+    #     all_results = []
+    #     current_chunk_size = chunk_size
+
+    #     for i in range(0, len(image_batch), chunk_size):
+    #         retry_count = 0
+    #         max_retries = 2
+    #         chunk = image_batch[i:i + chunk_size]
+    #         # Extract metadata for logging context
+    #         chunk_camera_ids = [meta["camera_id"] for _, meta in chunk]
+    #         chunk_store_ids = [meta["store_id"] for _, meta in chunk]
+    #         unique_cameras = list(set(chunk_camera_ids))
+    #         unique_stores = list(set(chunk_store_ids))
+    #         for attempt in range(2): 
+    #             try:
+    #                 chunk_results = self._process_batch_impl(chunk)
+    #                 all_results.extend(chunk_results)
+    #                 break
+    #             except torch.cuda.OutOfMemoryError:
+    #                 logger.error(
+    #                     f"CUDA out of memory error on {self.device} - "
+    #                     f"Cameras: {unique_cameras}, Stores: {unique_stores}, "
+    #                     f"Chunk size: {len(chunk)}, Attempt: {attempt + 1}"
+    #                 )
+    #                 torch.cuda.empty_cache()
+    #                 if attempt == 0:
+    #                     if len(chunk) > 1:
+    #                         chunk = chunk[:len(chunk)//2]
+    #                         chunk_camera_ids = [meta["camera_id"] for _, meta in chunk]
+    #                         chunk_store_ids = [meta["store_id"] for _, meta in chunk]
+    #                         unique_cameras = list(set(chunk_camera_ids))
+    #                         unique_stores = list(set(chunk_store_ids))
+    #                         logger.info(
+    #                             f"Reducing chunk size to {len(chunk)} for retry - "
+    #                             f"Cameras: {unique_cameras}, Stores: {unique_stores}"
+    #                         )
+    #                     else:
+    #                         # Single image still failing, return empty result
+    #                         logger.error(
+    #                             f"Single image OOM, skipping - "
+    #                             f"Camera: {unique_cameras[0]}, Store: {unique_stores[0]}"
+    #                         )
+    #                         logger.error("Single image OOM, skipping")
+    #                         all_results.append((chunk[0][1], [], []))  # metadata, empty detections, empty features
+    #                         break
+    #                 else:
+    #                      logger.error(
+    #                         f"Skipping chunk after 2 OOM attempts - "
+    #                         f"Cameras: {unique_cameras}, Stores: {unique_stores}, "
+    #                         f"Final chunk size: {len(chunk)}"
+    #                     )
+    #                     for img, meta in chunk:
+    #                         all_results.append((meta, [], []))
+    #                     break
+
+    #             except Exception as e:
+    #                 logger.error(
+    #                     f"Non-OOM error in chunk processing - "
+    #                     f"Cameras: {unique_cameras}, Stores: {unique_stores}, "
+    #                     f"Chunk size: {len(chunk)}, Error: {e}"
+    #                 )
+    #                 # Return empty results for this chunk
+    #                 for img, meta in chunk:
+    #                     all_results.append((meta, [], []))
+    #                 break
+    #         if i + chunk_size < len(image_batch):
+    #             time.sleep(0.1)
+    #     return all_results
+
+    def _process_batch_chunked(self, image_batch, chunk_size=4, max_retries=2, retry_delay=0.1):
+        """
+        Process a batch in smaller chunks to avoid OOM.
+        On OOM, halves the chunk and retries up to `max_retries`.
+        """
         all_results = []
+        idx = 0
         current_chunk_size = chunk_size
 
-        for i in range(0, len(image_batch), chunk_size):
-            retry_count = 0
-            max_retries = 2
-            chunk = image_batch[i:i + chunk_size]
-            for attempt in range(2): 
-                try:
-                    chunk_results = self._process_batch_impl(chunk)
-                    all_results.extend(chunk_results)
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    logger.error(f"OOM even with chunk size {chunk_size}")
-                    torch.cuda.empty_cache()
-                    if attempt == 0:
-                        if len(chunk) > 1:
-                            chunk = chunk[:len(chunk)//2]
-                            logger.info(f"Reducing chunk size to {len(chunk)} for retry")
-                        else:
-                            # Single image still failing, return empty result
-                            logger.error("Single image OOM, skipping")
-                            all_results.append((chunk[0][1], [], []))  # metadata, empty detections, empty features
-                            break
-                    else:
-                        logger.error(f"Skipping chunk after 2 OOM attempts")
-                        for img, meta in chunk:
-                            all_results.append((meta, [], []))
-                        break
+        while idx < len(image_batch):
+            # grab up to current_chunk_size items
+            chunk = image_batch[idx : idx + current_chunk_size]
+            # metadata for logs
+            camera_ids = [meta["camera_id"] for _, meta in chunk]
+            store_ids = [meta["store_id"] for _, meta in chunk]
+            unique_cameras = list(set(camera_ids))
+            unique_stores = list(set(store_ids))
 
-                except Exception as e:
-                    logger.error(f"Non-OOM error in chunk processing: {e}")
-                    # Return empty results for this chunk
-                    for img, meta in chunk:
-                        all_results.append((meta, [], []))
+            # attempt processing
+            for attempt in range(max_retries):
+                try:
+                    results = self._process_batch_impl(chunk)
+                    all_results.extend(results)
+                    # success: advance index and reset chunk size for next slice
+                    idx += len(chunk)
+                    current_chunk_size = chunk_size
                     break
-            if i + chunk_size < len(image_batch):
-                time.sleep(0.1)
+
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    logger.error(
+                        f"OOM on {self.device} | Cameras={unique_cameras} "
+                        f"| Stores={unique_stores} | ChunkSize={len(chunk)} "
+                        f"| Attempt={attempt+1}/{max_retries}"
+                    )
+                    # if we can retry by shrinking
+                    if attempt < max_retries - 1 and len(chunk) > 1:
+                        # halve it (but at least 1)
+                        current_chunk_size = max(1, len(chunk) // 3)
+                        chunk = image_batch[idx : idx + current_chunk_size]
+                        camera_ids = [meta["camera_id"] for _, meta in chunk]
+                        store_ids = [meta["store_id"] for _, meta in chunk]
+                        unique_cameras = list(set(camera_ids))
+                        unique_stores = list(set(store_ids))
+                        logger.info(
+                            f"Reducing chunk to {len(chunk)} for retry | "
+                            f"Cameras={unique_cameras} | Stores={unique_stores}"
+                        )
+                        continue
+                    # final retry failed or single-image chunk
+                    logger.error(
+                        f"Skipping chunk after {max_retries} OOMs | "
+                        f"FinalChunkSize={len(chunk)}"
+                    )
+                    for _, meta in chunk:
+                        all_results.append((meta, [], []))
+                    idx += len(chunk)
+                    current_chunk_size = chunk_size
+                    break
+
+            else:
+                # non-OOM exception or max_retries exhausted without break
+                # but to catch non-OOM errors, wrap the call in a broad except instead
+                logger.error(
+                    f"Non-OOM exception or retries exhausted | "
+                    f"Cameras={unique_cameras} | Stores={unique_stores}"
+                )
+                for _, meta in chunk:
+                    all_results.append((meta, [], []))
+                idx += len(chunk)
+                current_chunk_size = chunk_size
+
+            # small pause between chunks
+            if idx < len(image_batch):
+                time.sleep(retry_delay)
+
         return all_results
 
     def _process_batch_impl(self, image_batch):
@@ -262,6 +368,12 @@ class GPUBatchProcessor:
         batch_results = []
         timestamps = []
         total_people = 0
+
+        # Extract metadata for logging context
+        batch_metadata = [metadata for _, metadata in image_batch]
+        camera_ids = [meta["camera_id"] for meta in batch_metadata]
+        store_ids = [meta["store_id"] for meta in batch_metadata]
+
         
         try:
             # Step 1: Run segmentation on each image
@@ -402,14 +514,28 @@ class GPUBatchProcessor:
         
         except torch.cuda.OutOfMemoryError:
             # Handle OOM error
-            logger.error(f"CUDA out of memory error on {self.device}")
+            unique_cameras = list(set(camera_ids))
+            unique_stores = list(set(store_ids))
+            logger.error(
+                f"CUDA out of memory error on {self.device} - "
+                f"Cameras: {unique_cameras}, Stores: {unique_stores}, "
+                f"Batch size: {len(image_batch)}, Total people detected: {total_people}"
+            )
             torch.cuda.empty_cache()
             
             # Return empty results
             return [(metadata, [], []) for metadata, _ in image_batch]
             
         except Exception as e:
-            logger.error(f"Error processing batch on {self.device}: {e}", exc_info=True)
+            # Enhanced general error logging with camera and store IDs
+            unique_cameras = list(set(camera_ids))
+            unique_stores = list(set(store_ids))
+            logger.error(
+                f"Error processing batch on {self.device} - "
+                f"Cameras: {unique_cameras}, Stores: {unique_stores}, "
+                f"Batch size: {len(image_batch)}, Error: {e}", 
+                exc_info=True
+            )
             return [(metadata, [], []) for metadata, _ in image_batch]
 
     def _log_performance_stats(self):
@@ -477,7 +603,7 @@ class GPUBatchProcessor:
 
 class CameraProcessor:
     """Handles per-camera tracking and processing"""
-    def __init__(self, camera_id, store_id, milvus_client, store_cache=None):
+    def __init__(self, camera_id, store_id, milvus_client, store_cache=True):
         logger.info("Inside CameraProcessor Constructor")
         logger.info(f"Received milvus client for store {milvus_client.store_id}")
         self.camera_id = camera_id
@@ -667,7 +793,7 @@ class CameraProcessor:
 class KafkaProcessor:
     """Manages processing for multiple Kafka topics/partitions"""
     def __init__(self, num_processors = 2, batch_size=8, batch_interval=0.5, processing_fps=5,
-        gpu_processors=None, frame_buffer_config=None, thread_pool_size=8, send_fps = 5):
+        gpu_processors=None, frame_buffer_config=None, thread_pool_size=8, send_fps = 5, clients_per_store = 4):
         # self.gpu_processor = GPUBatchProcessor(max_batch_size=batch_size)
         set_memory_limit(fraction=0.9)
         self.num_processors = num_processors
@@ -750,6 +876,11 @@ class KafkaProcessor:
         self.cache_stats_interval = 60  # Log cache stats every minute
         self.last_cache_stats_time = time.time()
 
+        self.clients_per_store = clients_per_store
+        self.client_pools = {}  # {store_id: [AsyncMilvusRouterClient, ...]}
+        self.client_selection_counters = {}  # {store_id: int} for round-robin
+        
+
     def get_or_create_store_cache(self, store_id: int) -> StoreCacheManager:
         """Get or create a shared cache manager for a store."""
         if len(self.store_cache_managers) >= self.max_stores_per_pod:
@@ -815,9 +946,9 @@ class KafkaProcessor:
         """Get or create a camera processor for the given camera"""
         key = f"{store_id}_{camera_id}"
         if key not in self.camera_processors:
-            milvus_client = self.milvus_clients.get(store_id)
+            milvus_client = self.get_client_for_camera(store_id, camera_id)
             if not milvus_client:
-                logger.info("Store ID not handled by any milvus client")
+                logger.error("Store ID not handled by any milvus client")
                 router_url = os.environ.get("MILVUS_ROUTER_URL", "http://localhost:8000")
                 milvus_client = AsyncMilvusRouterClient(
                     router_url=router_url,
@@ -826,6 +957,9 @@ class KafkaProcessor:
                     connection_timeout=15,
                     batch_size=10   
                 )
+                if store_id not in self.client_pools:
+                    self.client_pools[store_id] = [milvus_client]
+                    self.client_selection_counters[store_id] = 0
                 self.milvus_clients[store_id] = milvus_client
 
             store_cache = self.get_or_create_store_cache(store_id)
@@ -840,6 +974,28 @@ class KafkaProcessor:
             )
             logger.info(f"Created camera processor for camera {camera_id} in store {store_id} with shared cache")
         return self.camera_processors[key]
+
+    async def get_client_pool_stats(self):
+        """Get statistics about client pool utilization"""
+        stats = {}
+        for store_id, clients in self.client_pools.items():
+            store_stats = {
+                'total_clients': len(clients),
+                'client_details': []
+            }
+            
+            for i, client in enumerate(clients):
+                client_stats = {
+                    'client_index': i,
+                    'store_id': client.store_id,
+                    'pending_requests': getattr(client, 'pending_requests', 0),
+                    'connection_healthy': True  # You could add actual health check here
+                }
+                store_stats['client_details'].append(client_stats)
+            
+            stats[store_id] = store_stats
+        
+        return stats
 
     async def _log_cache_statistics(self):
         """Log statistics for all store caches."""
@@ -898,27 +1054,89 @@ class KafkaProcessor:
         # Initialize a client for each store
         for store_id in store_ids:
             try:
+                store_clients = []
+                for client_idx in range(self.clients_per_store):
                 # Create new AsyncMilvusRouterClient
-                client = AsyncMilvusRouterClient(
-                    router_url=router_url,
-                    store_id=store_id,
-                    embedding_dim=768,  # Match your model's embedding dimension
-                    connection_timeout=15,
-                    batch_size=10
-                )
+                    client = AsyncMilvusRouterClient(
+                        router_url=router_url,
+                        store_id=store_id,
+                        embedding_dim=768,  # Match your model's embedding dimension
+                        connection_timeout=15,
+                        batch_size=10
+                    )
+                    if client_idx == 0:
+                        is_healthy = await client.check_connection_health()
+                        if not is_healthy:
+                            logger.error(f"Failed to connect to Milvus router for store {store_id}")
+                            continue
+                    store_clients.append(client)
+                    logger.info(f"Created client {client_idx + 1}/{self.clients_per_store} for store {store_id}")
                 
-                # Check connection health
-                is_healthy = await client.check_connection_health()
-                if is_healthy:
-                    logger.info(f"Successfully connected to Milvus router for store {store_id}")
-                    self.milvus_clients[store_id] = client
+                if store_clients:
+                    self.client_pools[store_id] = store_clients
+                    self.client_selection_counters[store_id] = 0
+                    logger.info(f"Successfully initialized {len(store_clients)} clients for store {store_id}")
+                    self.milvus_clients[store_id] = store_clients[0]
                 else:
-                    logger.error(f"Failed to connect to Milvus router for store {store_id}")
-                    
+                    logger.error(f"No healthy clients created for store {store_id}")
             except Exception as e:
-                logger.error(f"Error initializing Milvus client for store {store_id}: {e}")
+                logger.error(f"Error initializing Milvus clients for store {store_id}: {e}")
+            total_clients = sum(len(clients) for clients in self.client_pools.values())
+            logger.info(f"Initialized {total_clients} total Milvus clients across {len(self.client_pools)} stores")
+
+    def get_client_for_camera(self, store_id, camera_id):
+        """Get a client for a specific camera using camera-based distribution"""
+        if store_id not in self.client_pools:
+            logger.error(f"No client pool found for store {store_id}")
+            return self.milvus_clients.get(store_id)  # Fallback to old behavior
         
-        logger.info(f"Initialized {len(self.milvus_clients)} Milvus clients {self.milvus_clients}")
+        clients = self.client_pools[store_id]
+        if not clients:
+            logger.error(f"Empty client pool for store {store_id}")
+            return self.milvus_clients.get(store_id)
+        
+        # Use camera_id for consistent distribution
+        client_index = camera_id % len(clients)
+        selected_client = clients[client_index]
+        
+        logger.debug(f"Camera {camera_id} → Client {client_index + 1}/{len(clients)} for store {store_id}")
+        return selected_client
+
+    def get_client_round_robin(self, store_id):
+        """Get a client using round-robin distribution"""
+        if store_id not in self.client_pools:
+            return self.milvus_clients.get(store_id)
+        
+        clients = self.client_pools[store_id]
+        if not clients:
+            return self.milvus_clients.get(store_id)
+        
+        # Round-robin selection
+        counter = self.client_selection_counters[store_id]
+        client_index = counter % len(clients)
+        self.client_selection_counters[store_id] = counter + 1
+        
+        selected_client = clients[client_index]
+        logger.debug(f"Round-robin → Client {client_index + 1}/{len(clients)} for store {store_id}")
+        return selected_client
+
+    def get_client_least_loaded(self, store_id):
+        """Get the client with the least pending requests (if available)"""
+        if store_id not in self.client_pools:
+            return self.milvus_clients.get(store_id)
+        
+        clients = self.client_pools[store_id]
+        if not clients:
+            return self.milvus_clients.get(store_id)
+        
+        # If clients don't have load tracking, fall back to round-robin
+        if not hasattr(clients[0], 'pending_requests'):
+            return self.get_client_round_robin(store_id)
+        
+        # Select client with minimum pending requests
+        selected_client = min(clients, key=lambda c: getattr(c, 'pending_requests', 0))
+        logger.debug(f"Least loaded client selected for store {store_id}")
+        return selected_client
     
     def _task_done_callback(self, task):
         """Callback function when a processing task completes."""
@@ -1019,14 +1237,58 @@ class KafkaProcessor:
                 })
             
             camera_tasks = []
+            camera_metadata = {}
             for camera_id, frames_data in camera_groups.items():
+                store_id = frames_data[0]['store_id']
+                camera_metadata[camera_id] = {
+                    'store_id': store_id,
+                    'frame_count': len(frames_data),
+                    'frame_ids': [fd['metadata']['frame_id'] for fd in frames_data]
+                }
                 cam_start = time.time()
                 task = self._process_camera_batch(camera_id, frames_data)
                 camera_tasks.append(task)
                 # Find the original frame
-            all_results = await asyncio.gather(*camera_tasks)
+            try:
+                all_results = await asyncio.gather(*camera_tasks, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Critical error in camera processing gather: {e}")
+                all_results = [Exception(f"Gather failed: {e}") for _ in camera_tasks]
+            # all_results = await asyncio.gather(*camera_tasks)
             timing_stats["camera_processing"] = time.time() - camera_start
             logger.info(f"[TIMING] Camera processing: {timing_stats['camera_processing']:.3f}s for {len(camera_groups)} cameras")
+            
+            # Wait for all processing to complete
+            failed_cameras = []
+            successful_cameras = 0
+
+            for i, camera_result in enumerate(all_results):
+                if isinstance(camera_result, Exception):
+                    # Get camera_id from the camera_groups order
+                    camera_id = list(camera_groups.keys())[i]
+                    store_id = camera_metadata[camera_id]['store_id']
+                    frame_count = camera_metadata[camera_id]['frame_count']
+                    frame_ids = camera_metadata[camera_id]['frame_ids']
+                    
+                    failed_cameras.append(camera_id)
+                    logger.error(
+                        f"Camera processing failed - "
+                        f"Camera: {camera_id}, Store: {store_id}, "
+                        f"Frame count: {frame_count}, Frame IDs: {frame_ids[:3]}{'...' if len(frame_ids) > 3 else ''}, "
+                        f"Error: {camera_result}"
+                    )
+                else:
+                    successful_cameras += 1
+
+            logger.info(f"[TIMING] Camera processing: {timing_stats['camera_processing']:.3f}s for {len(camera_groups)} cameras - Success: {successful_cameras}, Failed: {len(failed_cameras)}")
+
+            if failed_cameras:
+                failed_info = []
+                for cam_id in failed_cameras:
+                    store_id = camera_metadata[cam_id]['store_id']
+                    failed_info.append(f"Cam{cam_id}(Store{store_id})")
+                logger.error(f"Failed cameras: {', '.join(failed_info)}")
+
             # Wait for all processing to complete
             send_tasks = []
             prep_start = time.time()
@@ -1078,7 +1340,23 @@ class KafkaProcessor:
                                 f"with {result['no_of_people']} people (latency: {total_latency*1000:.1f}ms)")
                         
                     except Exception as e:
-                        logger.error(f"Error processing result: {e}", exc_info=True)
+                        # Enhanced result processing error logging
+                        camera_id = "unknown"
+                        frame_id = "unknown"
+                        store_id = "unknown"
+
+                        try:
+                            camera_id = result_data.get("result", {}).get("camera_id", "unknown")
+                            frame_id = result_data.get("metadata", {}).get("frame_id", "unknown")
+                            store_id = result_data.get("metadata", {}).get("store_id", "unknown")
+                        except:
+                            pass
+
+                        logger.error(
+                            f"Error processing result - "
+                            f"Camera: {camera_id}, Store: {store_id}, Frame: {frame_id}, "
+                            f"Error: {e}", exc_info=True
+                        )
 
                 #     current_time = time.time()
                 #     if current_time - self.last_send_time >= self.send_interval:
@@ -1615,6 +1893,15 @@ class KafkaProcessor:
             except Exception as e:
                 logger.error(f"Error in final batch processing: {e}")
 
+        # Close all clients in all pools
+        for store_id, clients in self.client_pools.items():
+            for i, client in enumerate(clients):
+                try:
+                    await client.close()
+                    logger.info(f"Closed Milvus client {i + 1}/{len(clients)} for store {store_id}")
+                except Exception as e:
+                    logger.error(f"Error closing Milvus client {i} for store {store_id}: {e}")
+
         for store_id, client in self.milvus_clients.items():
             try:
                 await client.close()
@@ -1633,6 +1920,7 @@ async def main():
     parser.add_argument('--batch-interval', type=float, default=0.5, help='Maximum time to wait before processing a batch (seconds)')
     parser.add_argument('--fps', type=float, default=5, help='Frames per second to process from each camera')
     parser.add_argument('--send_fps', type=float, default=1, help='How frequently to hit the send_detection function')
+    parser.add_argument('--clients-per-store', type=int, default=4, help='Number of Milvus client instances per store')  # NEW
     
     args = parser.parse_args()
     
@@ -1642,6 +1930,7 @@ async def main():
     try:
         with open(args.config, 'r') as f:
             base_config = json.load(f)
+
 
         system_config = base_config.get("system", {})
         buffer_config = base_config.get("buffer_settings", {})
@@ -1668,6 +1957,9 @@ async def main():
             num_processors = 2  # or any default value if GPUs are not enabled
             batch_size = args.batch_size
         
+        milvus_config = base_config.get("milvus", {})
+        clients_per_store = milvus_config.get("clients_per_store", args.clients_per_store)
+
         processor = KafkaProcessor(
             num_processors=num_processors,
             batch_size=batch_size,
@@ -1675,7 +1967,8 @@ async def main():
             processing_fps=fps,
             frame_buffer_config=buffer_config,
             thread_pool_size=thread_pool_size,
-            send_fps = send_fps
+            send_fps = send_fps,
+            clients_per_store=clients_per_store
         )
 
 

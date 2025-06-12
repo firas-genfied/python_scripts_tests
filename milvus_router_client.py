@@ -52,19 +52,19 @@ class AsyncMilvusRouterClient:
             self._search_semaphore = asyncio.Semaphore(8)      # Dedicated for searches
             self._batch_semaphore = asyncio.Semaphore(5)       # Dedicated for batch ops
             self._feature_semaphore = asyncio.Semaphore(6)     # Dedicated for feature retrieval
-            logger.debug(f"Semaphore enabled with max concurrent requests: {self._max_concurrent}")
+            logger.info(f"Semaphore enabled with max concurrent requests: {self._max_concurrent}")
         else:
             self._request_semaphore = None
             self._search_semaphore = None     # Dedicated for searches
             self._batch_semaphore = None       # Dedicated for batch ops
             self._feature_semaphore = None     # Dedicated for feature retrieval
-            logger.debug("Semaphore disabled - unlimited concurrent requests")
+            logger.info("Semaphore disabled - unlimited concurrent requests")
 
         if self.enable_rate_limiting:
             self._min_interval = float(os.environ.get("MILVUS_MIN_INTERVAL", "0.01"))
             self._last_request_time = 0
             self._min_request_interval = self._min_interval
-            logger.debug(f"Rate limiting enabled with min interval: {self._min_interval}s")
+            logger.info(f"Rate limiting enabled with min interval: {self._min_interval}s")
         else:
             self._min_interval = 0
             self._last_request_time = 0
@@ -74,8 +74,8 @@ class AsyncMilvusRouterClient:
         # Create the HTTP client during initialization
         self._http_client = None
         
-        logger.debug(f"Initialized AsyncMilvusRouterClient for store_id={self.store_id}, router={router_url}")
-        logger.debug(f"Rate limiting: {'enabled' if self.enable_rate_limiting else 'disabled'}, "
+        logger.info(f"Initialized AsyncMilvusRouterClient for store_id={self.store_id}, router={router_url}")
+        logger.info(f"Rate limiting: {'enabled' if self.enable_rate_limiting else 'disabled'}, "
                    f"Semaphore: {'enabled' if self.enable_semaphore else 'disabled'}")
 
     async def _rate_limited_request(self, operation):
@@ -181,7 +181,7 @@ class AsyncMilvusRouterClient:
                 track_id = track_id[0]
 
             if track_id is None:
-                logger.error("Cannot insert embedding with None track_id")
+                logger.error(f"Cannot insert embedding for store {store_id} with None track_id")
                 return False
             
             # Ensure embedding is in the correct format
@@ -191,7 +191,7 @@ class AsyncMilvusRouterClient:
                 embedding_list = embedding
                 
             if len(embedding) != self.embedding_dim:
-                logger.error(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
+                logger.error(f"Embedding dimension mismatch for store {store_id}: expected {self.embedding_dim}, got {len(embedding)}")
                 return False
             
             # Prepare request data
@@ -216,13 +216,13 @@ class AsyncMilvusRouterClient:
                     logger.debug(f"[Milvus] Inserted feature for track_id {track_id}")
                     return True
                 else:
-                    logger.error(f"Insert failed with status {response.status_code}: {response.text}")
+                    logger.error(f"Insert failed for store {store_id} with status {response.status_code}: {response.text}")
                     return False
                     
                 
             except Exception as e:
                 # Log other exceptions in detail
-                logger.error(f"Error inserting feature_vector for track_id {track_id}: {str(e)}", exc_info=True)
+                logger.error(f"Error inserting feature_vector for track_id {track_id} for store {store_id}: {str(e)}", exc_info=True)
                 # For other exceptions, don't retry
                 return False
         if self.enable_rate_limiting or self.enable_semaphore:
@@ -264,7 +264,7 @@ class AsyncMilvusRouterClient:
             
             # Validate input lists have same length
             if not (len(track_ids) == len(embeddings) == len(store_ids) == len(camera_ids) == len(timestamps)):
-                logger.error("All input lists must have the same length for batch insert")
+                logger.error(f"All input lists must have the same length for batch insert for the following stores {store_ids}")
                 return 0
             
             # Convert numpy arrays to lists
@@ -310,11 +310,11 @@ class AsyncMilvusRouterClient:
                             batch_success = True
                             break
                         elif response.status_code >= 500 and attempt == 0:
-                            logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                            logger.error(f"Batch insert failed for the following stores {store_ids}: with status {response.status_code}: {response.text}")
                             #asyncio.sleep(0.1)
                             continue
                         else:
-                            logger.error(f"Batch insert failed with status {response.status_code}: {response.text}")
+                            logger.error(f"Batch insert failed for the following stores {store_ids}: with status {response.status_code}: {response.text}")
                             break
 
                     except Exception as e:
@@ -322,10 +322,10 @@ class AsyncMilvusRouterClient:
                             #asyncio.sleep(0.1)
                             continue
                         else:
-                            logger.warning(f"Batch insert failed: {e}")
+                            logger.warning(f"Batch insert failed for the following stores {store_ids}: {e}")
                             break
                 if not batch_success:
-                    logger.debug(f"Failed to insert batch {i//effective_batch_size + 1}")
+                    logger.debug(f"Failed to insert batch {i//effective_batch_size + 1} for the following stores {store_ids}")
             
                 # if end_idx < total_records:
                     #asyncio.sleep(0.1)
@@ -397,27 +397,27 @@ class AsyncMilvusRouterClient:
                         logger.debug(f"Search client error {response.status_code} - not retrying")
                         return []
                     else:
-                        logger.error(f"Search attempt {attempt+1}/{effective_max_retries} failed with status {response.status_code}: {response.text}")
+                        logger.error(f"Search attempt {attempt+1}/{effective_max_retries} failed for store {store_id} with status {response.status_code}: {response.text}")
                         if attempt < effective_max_retries - 1:
                             #asyncio.sleep(0.1)
-                            logger.info("will sleep here 0.1")
+                            logger.debug("will sleep here 0.1")
                             continue
 
                 except asyncio.TimeoutError:
                     if attempt < effective_max_retries - 1:
                         #asyncio.sleep(0.05)
-                        logger.info("will sleep here 0.05")
+                        logger.debug("will sleep here 0.05")
                         continue
 
                 except Exception as e:
-                    logger.error(f"Search attempt {attempt+1}/{effective_max_retries} failed: {e}")
+                    logger.error(f"Search attempt {attempt+1}/{effective_max_retries} failed for store {store_id}: {e}")
                     # Retry with exponential backoff (use asyncio.sleep instead of time.sleep)
                     if attempt < effective_max_retries - 1:
                         #asyncio.sleep(0.05)
-                        logger.info("will sleep here 0.05")
+                        logger.debug("will sleep here 0.05")
                         continue
                     
-            logger.error("All search attempts failed")
+            logger.error(f"All search attempts failed for store {store_id}")
             return []
 
         # Use rate limited or direct request based on configuration
@@ -461,17 +461,17 @@ class AsyncMilvusRouterClient:
                     features = [np.array(f, dtype=np.float32) for f in result.get("features", [])]
                     return features
                 else:
-                    logger.error(f"Get features failed for track_id={track_id}: status={response.status_code}, response={response.text}")
-                    logger.error(f"Get features failed with status {response.status_code}: {response.text}")
+                    logger.error(f"Get features failed for store {effective_store_id} for track_id={track_id}: status={response.status_code}, response={response.text}")
+                    logger.error(f"Get features failed for store {effective_store_id} with status {response.status_code}: {response.text}")
                     return []
             except httpx.TimeoutException as e:
-                logger.error(f"Timeout retrieving features for track_id={track_id}: {str(e)}")
+                logger.error(f"Timeout retrieving features for track_id={track_id} for store {effective_store_id}: {str(e)}")
                 return []
             except httpx.RequestError as e:
-                logger.error(f"Request error retrieving features for track_id={track_id}: {str(e)}")
+                logger.error(f"Request error retrieving features for track_id={track_id} for store {effective_store_id}: {str(e)}")
                 return []
             except Exception as e:
-                logger.error(f"Error retrieving features for track_id={real_track_id}: {e}")
+                logger.error(f"Error retrieving features for track_id={real_track_id} for store {effective_store_id}: {e}")
                 return []
         # Use rate limited or direct request based on configuration
         if self.enable_rate_limiting or self.enable_semaphore:
@@ -506,11 +506,11 @@ class AsyncMilvusRouterClient:
                     
                     return feature_map
                 else:
-                    logger.error(f"Get all features failed with status {response.status_code}: {response.text}")
+                    logger.error(f"Get all features failed for store {effective_store_id} with status {response.status_code}: {response.text}")
                     return {}
                     
             except Exception as e:
-                logger.error(f"Failed to query embeddings: {e}")
+                logger.error(f"Failed to query embeddings for store {effective_store_id}: {e}")
                 return {}
         # Use rate limited or direct request based on configuration
         if self.enable_rate_limiting or self.enable_semaphore:
@@ -586,7 +586,7 @@ class AsyncMilvusRouterClient:
                     result = response.json()
                     return result.get("deleted", False)
                 else:
-                    logger.error(f"Delete failed with status {response.status_code}: {response.text}")
+                    logger.error(f"Delete failed for store {effective_store_id} with status {response.status_code}: {response.text}")
                     return False
                     
             except Exception as e:
@@ -670,7 +670,7 @@ class AsyncMilvusRouterClient:
                     # Small delay between chunks
                     if i + chunk_size < len(embeddings_list):
                         #asyncio.sleep(0.02)  # 20ms between chunks
-                        logger.info("will sleep here 0.02")
+                        logger.debug("will sleep here 0.02")
                 return all_results
 
             processed_embeddings = []
@@ -724,11 +724,11 @@ class AsyncMilvusRouterClient:
                             break
                             
                 # Fallback to smart individual/micro-batch processing
-                logger.info(f"Batch search failed, using fallback for {len(embeddings_list)} items")
+                logger.debug(f"Batch search failed, using fallback for {len(embeddings_list)} items for store {effective_store_id}")
                 return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
                     
             except Exception as e:
-                logger.info(f"Batch search error: {e}, using fallback")
+                logger.debug(f"Batch search error for store {effective_store_id}: {e}, using fallback")
                 return await self._fallback_individual_searches(embeddings_list, top_k, effective_store_id)
         
         # Use rate limited or direct request based on configuration
