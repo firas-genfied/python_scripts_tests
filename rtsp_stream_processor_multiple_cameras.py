@@ -323,7 +323,7 @@ class GPUBatchProcessor:
                     # if we can retry by shrinking
                     if attempt < max_retries - 1 and len(chunk) > 1:
                         # halve it (but at least 1)
-                        current_chunk_size = max(1, len(chunk) // 3)
+                        current_chunk_size = max(1, len(chunk) // 2)
                         chunk = image_batch[idx : idx + current_chunk_size]
                         camera_ids = [meta["camera_id"] for _, meta in chunk]
                         store_ids = [meta["store_id"] for _, meta in chunk]
@@ -477,15 +477,17 @@ class GPUBatchProcessor:
                             sub_crops  = chunk_crops[sub_start:sub_end]
                             sub_info   = chunk_info[sub_start:sub_end]
 
-                        batch_tensor = torch.cat(chunk_crops, dim=0).to(self.device)
-                        if self.use_half_precision and self.device.type == "cuda":
-                            batch_tensor = batch_tensor.half()
-                        with torch.no_grad():
-                            features = self.extract_features(self.model, batch_tensor).cpu().float().numpy()
-                        # Assign features back to detections
-                        for feat_idx, (batch_idx, det_idx) in enumerate(chunk_info):
-                            if batch_results[batch_idx][2][det_idx] is None:
-                                batch_results[batch_idx][2][det_idx] = features[feat_idx].reshape(-1)
+                            # batch_tensor = torch.cat(chunk_crops, dim=0).to(self.device)
+                            batch_tensor = torch.cat(sub_crops, dim=0).to(self.device)
+                            if self.use_half_precision and self.device.type == "cuda":
+                                batch_tensor = batch_tensor.half()
+                            with torch.no_grad():
+                                sub_features = self.extract_features(self.model, batch_tensor).cpu().float().numpy()
+                            # Assign features back to detections
+                            # for feat_idx, (batch_idx, det_idx) in enumerate(chunk_info):
+                            for feat_idx, (batch_idx, det_idx) in enumerate(sub_info):
+                                if batch_results[batch_idx][2][det_idx] is None:
+                                    batch_results[batch_idx][2][det_idx] = sub_features[feat_idx].reshape(-1)
                 
                 # Fill any remaining None features with zeros
                 for batch_idx, (metadata, detections, features) in enumerate(batch_results):
@@ -1185,7 +1187,6 @@ class KafkaProcessor:
         """Process all frames in the current batch"""
         try:
             # Get batch from the robust buffer using fair distribution
-            batch_start_time = time.time()
             timing_stats = {
                 "buffer_read": 0,
                 "gpu_processing": 0,
