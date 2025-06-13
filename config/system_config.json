@@ -17,7 +17,7 @@
        }
     },
     "milvus": {
-      "clients_per_store": 4,
+      "clients_per_store": 16,
       "router_url": "http://172.210.56.49:8000"
     },
     "processing": {

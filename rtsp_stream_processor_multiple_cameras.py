@@ -54,7 +54,7 @@ from milvus_router_client import AsyncMilvusRouterClient
 
 from store_cache_manager import StoreCacheManager
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.DEBUG, 
                    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,7 @@ class GPUBatchProcessor:
         # Check available memory before processing
         if torch.cuda.is_available():
             free_memory = torch.cuda.mem_get_info(self.device.index)[0] / 1024**3  # GB
-            if free_memory < 4.0:  # Less than 4GB free
+            if free_memory < 2.0:  # Less than 4GB free
                 logger.info(f"Low GPU memory: {free_memory:.1f}GB free")
                 return self._process_batch_chunked(image_batch, chunk_size=4)
             if self.last_oom_batch_size and len(image_batch) >= self.last_oom_batch_size:
@@ -380,15 +380,20 @@ class GPUBatchProcessor:
             with torch.cuda.stream(self.stream):
                 batch_inputs = []
                 original_sizes = []
+                transforms = []
                 for image, metadata in image_batch:
                     original_sizes.append((image.shape[0], image.shape[1]))
-                    height, width = image.shape[:2]
-                    transformed_image = self.aug.get_transform(image).apply_image(image)
+                    original_height, original_width = image.shape[:2]
+                    transform = self.aug.get_transform(image)
+                    transformed_image = transform.apply_image(image)
+                    transforms.append(transform)
+                    logger.info(f"Original image size: {image.shape}, "
+                           f"Transformed size: {transformed_image.shape}")
                     transformed_image = torch.as_tensor(transformed_image.astype("float32").transpose(2, 0, 1))
                     batch_inputs.append({
                         "image": transformed_image.to(self.device),
-                        "height": height,
-                        "width": width,
+                        "height": original_height,
+                        "width": original_width,
                     })
                 with torch.no_grad():
                     batch_outputs = self.seg_model(batch_inputs)
@@ -403,15 +408,39 @@ class GPUBatchProcessor:
                     person_boxes = instances.pred_boxes.tensor[person_indices].cpu().numpy()
                     person_scores = instances.scores[person_indices].cpu().numpy()
                     person_masks = instances.pred_masks[person_indices].cpu().numpy()
+
+                    transform = transforms[i]
                     
                     # Filter duplicate detections
                     # frame_copy = image.copy()  # For visualization of suppressed boxes
+                    transformed_height, transformed_width = batch_inputs[i]["image"].shape[1], batch_inputs[i]["image"].shape[2]
+                    scale_x = original_width / transformed_width
+                    scale_y = original_height / transformed_height
+
+                    logger.info(f"Image {i}: Original={original_width}x{original_height}, "
+                        f"Transformed={transformed_width}x{transformed_height}, "
+                        f"Scale factors: x={scale_x:.3f}, y={scale_y:.3f}")
+
+                    # Scale bounding boxes back to original coordinates
+                    scaled_boxes = []
+                    for bbox in person_boxes:
+                        x1, y1, x2, y2 = bbox
+                        # Scale coordinates back
+                        orig_x1 = x1 * scale_x
+                        orig_y1 = y1 * scale_y
+                        orig_x2 = x2 * scale_x
+                        orig_y2 = y2 * scale_y
+                        scaled_boxes.append([orig_x1, orig_y1, orig_x2, orig_y2])
+
+                    person_boxes = np.array(scaled_boxes)
+                    
                     filtered_boxes, filtered_scores, filtered_masks = filter_duplicate_detections(
                         person_boxes, person_scores, person_masks, image, iou_threshold=0.9
                     )
                     
                     # Get frame dimensions for green box
                     height, width = image.shape[:2]
+
                     shrink_percentage_top = 0.10
                     line_y = int(height * shrink_percentage_top)
                     green_box = [0, line_y, width, height]
@@ -675,6 +704,8 @@ class CameraProcessor:
             # Check for false positives in tentative tracks
             if track.state == TrackState.Tentative:
                 bbox = track.to_tlbr()
+                logger.info(f"BBOX IS {bbox}")
+                logger.info(f"frams size is {frame.shape}")
                 if not confirm_human(frame, bbox):
                     self.false_positive_blacklist.append(bbox)
                     track.mark_missed()
@@ -957,7 +988,7 @@ class KafkaProcessor:
                     store_id=store_id,
                     embedding_dim=768,  # match your model's feature dimension
                     connection_timeout=15,
-                    batch_size=10   
+                    batch_size=50   
                 )
                 if store_id not in self.client_pools:
                     self.client_pools[store_id] = [milvus_client]
@@ -1064,7 +1095,7 @@ class KafkaProcessor:
                         store_id=store_id,
                         embedding_dim=768,  # Match your model's embedding dimension
                         connection_timeout=15,
-                        batch_size=10
+                        batch_size=50
                     )
                     if client_idx == 0:
                         is_healthy = await client.check_connection_health()

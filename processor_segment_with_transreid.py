@@ -70,38 +70,175 @@ pose_detector = mp_pose.Pose(static_image_mode=True,
                              model_complexity=0,   # Lower complexity for real-time use
                              enable_segmentation=False)
 MIN_FRAMES_FOR_CONFIRMATION = 3
-def confirm_human(image, bbox, min_keypoints=3, min_confidence=0.5):
+def confirm_human(image, bbox, min_keypoints=3, min_confidence=0.5, min_overlap_ratio=0.7, min_area=400):
     """
     Checks if the region defined by bbox contains sufficient human keypoints.
+    Handles out-of-bounds coordinates and validates detections properly.
     
     Args:
         image (np.ndarray): The full image (BGR format).
         bbox (list/tuple): Bounding box [x1, y1, x2, y2].
         min_keypoints (int): Minimum number of keypoints required to confirm a human.
         min_confidence (float): Minimum confidence/visibility required for each keypoint.
+        min_overlap_ratio (float): Minimum overlap ratio with image bounds (0.7 = 70%).
+        min_area (int): Minimum area in pixels for valid detection.
     
     Returns:
         bool: True if the region is confirmed as human, False otherwise.
     """
-    # Crop the region corresponding to the bounding box.
-    x1, y1, x2, y2 = map(int, bbox)
-    crop = image[y1:y2, x1:x2]
-    
-    # Convert BGR image to RGB as required by MediaPipe.
-    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    
-    # Process the cropped image to obtain pose landmarks.
-    results = pose_detector.process(crop_rgb)
-    
-    # Check if landmarks were detected.
-    if results.pose_landmarks is None:
+    try:
+        # Input validation
+        if image is None or image.size == 0:
+            logger.debug("confirm_human: Image is empty or None")
+            return False
+        
+        if bbox is None or len(bbox) != 4:
+            logger.debug("confirm_human: Invalid bbox format")
+            return False
+        
+        # Get image dimensions
+        image_height, image_width = image.shape[:2]
+        x1, y1, x2, y2 = bbox
+        
+        # Validate bbox coordinates
+        if x2 <= x1 or y2 <= y1:
+            logger.debug(f"confirm_human: Invalid bbox dimensions: {bbox}")
+            return False
+        
+        # Check if detection is completely outside image
+        if (x2 <= 0 or y2 <= 0 or x1 >= image_width or y1 >= image_height):
+            logger.debug(f"confirm_human: Bbox completely outside image: {bbox}")
+            return False
+        
+        # Calculate intersection with image bounds
+        intersect_x1 = max(0, x1)
+        intersect_y1 = max(0, y1)
+        intersect_x2 = min(image_width, x2)
+        intersect_y2 = min(image_height, y2)
+        
+        # Calculate areas
+        detection_area = (x2 - x1) * (y2 - y1)
+        intersection_area = (intersect_x2 - intersect_x1) * (intersect_y2 - intersect_y1)
+        
+        # Reject if insufficient overlap with image
+        overlap_ratio = intersection_area / detection_area if detection_area > 0 else 0
+        if overlap_ratio < min_overlap_ratio:
+            logger.debug(f"confirm_human: Low overlap ratio {overlap_ratio:.2f} for bbox {bbox}")
+            return False
+        
+        # Check if remaining area is large enough
+        if intersection_area < min_area:
+            logger.debug(f"confirm_human: Insufficient area {intersection_area} for bbox {bbox}")
+            return False
+        
+        # Use safe intersection bounds for cropping
+        crop_x1, crop_y1 = int(intersect_x1), int(intersect_y1)
+        crop_x2, crop_y2 = int(intersect_x2), int(intersect_y2)
+        
+        # Ensure we have valid crop dimensions
+        crop_width = crop_x2 - crop_x1
+        crop_height = crop_y2 - crop_y1
+        
+        if crop_width <= 0 or crop_height <= 0:
+            logger.debug(f"confirm_human: Invalid crop dimensions: {crop_width}x{crop_height}")
+            return False
+        
+        # Crop the region using safe coordinates
+        crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
+        
+        # Final safety check - this should never be empty now
+        if crop is None or crop.size == 0:
+            logger.warning(f"confirm_human: Unexpected empty crop with safe coordinates")
+            return False
+        
+        # Check minimum crop size for meaningful pose detection
+        if crop.shape[0] < 32 or crop.shape[1] < 32:
+            logger.debug(f"confirm_human: Crop too small for pose detection: {crop.shape}")
+            return False
+        
+        # Convert BGR image to RGB as required by MediaPipe
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        
+        # Process the cropped image to obtain pose landmarks
+        results = pose_detector.process(crop_rgb)
+        
+        # Check if landmarks were detected
+        if results.pose_landmarks is None:
+            logger.debug(f"confirm_human: No pose landmarks detected in crop")
+            return False
+        
+        # Count landmarks (keypoints) with visibility above threshold
+        visible_keypoints = sum(1 for lm in results.pose_landmarks.landmark 
+                              if lm.visibility >= min_confidence)
+        
+        # Log detection details for debugging
+        logger.debug(f"confirm_human: Found {visible_keypoints}/{len(results.pose_landmarks.landmark)} "
+                    f"visible keypoints (min: {min_keypoints}) in bbox {bbox}")
+        
+        # Return True if enough keypoints are detected
+        human_confirmed = visible_keypoints >= min_keypoints
+        
+        if human_confirmed:
+            logger.debug(f"confirm_human: CONFIRMED human with {visible_keypoints} keypoints")
+        else:
+            logger.debug(f"confirm_human: REJECTED - insufficient keypoints ({visible_keypoints} < {min_keypoints})")
+        
+        return human_confirmed
+        
+    except cv2.error as e:
+        logger.error(f"confirm_human: OpenCV error - {e}")
+        return False
+    except Exception as e:
+        logger.error(f"confirm_human: Unexpected error - {e}", exc_info=True)
         return False
 
-    # Count landmarks (keypoints) with visibility above threshold.
-    count = sum(1 for lm in results.pose_landmarks.landmark if lm.visibility >= min_confidence)
-    
-    # Return True if enough keypoints are detected.
-    return count >= min_keypoints
+
+# Alternative optimized version if you want to minimize processing time
+def confirm_human_fast(image, bbox, min_keypoints=3, min_confidence=0.5):
+    """
+    Faster version with early exits and minimal validation
+    Use this if you're confident your coordinate transformation is working
+    """
+    try:
+        # Quick input validation
+        if image is None or bbox is None or len(bbox) != 4:
+            return False
+        
+        # Quick bounds check
+        image_height, image_width = image.shape[:2]
+        x1, y1, x2, y2 = map(int, bbox)
+        
+        # Early exit for obviously invalid boxes
+        if (x1 >= image_width or y1 >= image_height or 
+            x2 <= 0 or y2 <= 0 or x2 <= x1 or y2 <= y1):
+            return False
+        
+        # Clamp to image bounds (minimal approach)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(image_width, x2)
+        y2 = min(image_height, y2)
+        
+        # Quick size check
+        if (x2 - x1) < 20 or (y2 - y1) < 20:
+            return False
+        
+        # Crop and process
+        crop = image[y1:y2, x1:x2]
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        results = pose_detector.process(crop_rgb)
+        
+        if results.pose_landmarks is None:
+            return False
+        
+        # Count visible keypoints
+        visible_keypoints = sum(1 for lm in results.pose_landmarks.landmark 
+                              if lm.visibility >= min_confidence)
+        
+        return visible_keypoints >= min_keypoints
+        
+    except Exception:
+        return False  # Fail silently for speed
 
 def setup_predictor():
     """

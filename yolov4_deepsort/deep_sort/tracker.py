@@ -13,6 +13,7 @@ from collections import defaultdict
 from milvus_read_client import MilvusReIDClient
 from .tracker_utils import calculate_cosine_distance, compute_iou, overlap_ratio_single_box, is_entering_store_percent
 import time
+import asyncio
 # Configure logger at the top of your module (or in a separate config module)
 LOG_FILENAME = "tracker.log"
 logging.basicConfig(
@@ -33,7 +34,7 @@ class AsyncTracker:
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, camera_id, store_id, milvus_client, store_cache=None, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
+    def __init__(self, metric, camera_id, store_id, milvus_client, store_cache=True, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
         self.metric = metric
         self.max_age = max_age
         self.n_init = n_init
@@ -263,6 +264,46 @@ class AsyncTracker:
         self.operation_times.append((operation_name, elapsed))
         logger.warning(f"[TIMING] {operation_name}: {elapsed:.3f}s")
         return time.time()
+
+    async def _batch_fetch_track_features(self, track_ids_to_fetch):
+        """
+        Fetch features for multiple tracks in parallel
+        
+        Args:
+            track_ids_to_fetch: List of track IDs to fetch features for
+            
+        Returns:
+            Dict[int, List[features]]: Mapping of track_id to features
+        """
+        if not track_ids_to_fetch:
+            return {}
+        
+        # Create parallel tasks
+        tasks = []
+        for track_id in track_ids_to_fetch:
+            task = self.milvus_client.get_features_by_track_id(
+                track_id=track_id,
+                store_id=self.store_id
+            )
+            tasks.append(task)
+        
+        # Execute all tasks in parallel
+        start_time = time.time()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Map results back to track IDs
+        feature_map = {}
+        for track_id, result in zip(track_ids_to_fetch, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to fetch features for track {track_id}: {result}")
+                feature_map[track_id] = []
+            else:
+                feature_map[track_id] = result
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Batch fetched features for {len(track_ids_to_fetch)} tracks in {elapsed:.3f}s")
+        
+        return feature_map
 
     async def update(self, detections):
         """
@@ -740,13 +781,24 @@ class AsyncTracker:
         tracks_to_update = {}  # {track_id: (detection, is_new_track)}
         tracks_to_mark_missed = set()  # Set of track_ids to mark as missed
         
-        # Process remaining unmatched tracks
+        track_ids_needing_features = set()
+        
+        # Process all final assignments to create new tracks or update existing ones
+        for det_idx, (track_id, is_new_track) in final_assignments.items():
+            if is_new_track:
+                track_ids_needing_features.add(track_id)
+        logger.info(f"Batch fetching features for {len(track_ids_needing_features)} tracks")
+        milvus_ops_count += 1
+        op_start = time.time()
+        all_track_features = await self._batch_fetch_track_features(list(track_ids_needing_features))
+        self.log_operation(f"batch_get_features_{len(track_ids_needing_features)}_tracks", op_start)
+
+                # Process remaining unmatched tracks
         for track_idx in unmatched_tracks:
             track_id = track_idx_to_track[track_idx].track_id
             if track_id not in assigned_ids:
                 tracks_to_mark_missed.add(track_id)
-        
-        # Process all final assignments to create new tracks or update existing ones
+
         for det_idx, (track_id, is_new_track) in final_assignments.items():
             detection = detections[det_idx]
             
@@ -800,25 +852,35 @@ class AsyncTracker:
                     mean, covariance, new_id, self.n_init, self.max_age,
                     detection.feature, class_name
                 )
-            
-                try:
-                    logger.info("HERE")
-                    op_start = time.time()
-                    db_features = await self.milvus_client.get_features_by_track_id(
-                        track_id = new_id,
-                        store_id=self.store_id
-                    )
-                    self.log_operation(f"get_features_track_{new_id}", op_start)
-                    logger.info(f"store id is {self.store_id}")
-                    milvus_ops_count += 1
+
+                if new_id in all_track_features:
+                    db_features = all_track_features[new_id]
                     if db_features:
                         new_track.features = db_features
                         logger.debug(f"Created track with ID {new_id} (reidentified from Milvus with {len(new_track.features)} features)")
                     else:
                         logger.debug(f"Created new track with ID {new_id} (no features found in Milvus)")
-                except Exception as e:
-                    logger.error(f"Failed to fetch features from Milvus for track_id {new_id} in store {self.store_id}: {e}")
-                    logger.debug(f"Created new track with ID {new_id} (fallback)")
+                else:
+                    logger.debug(f"Created new track with ID {new_id} (not in pre-fetched results)")
+            
+                # try:
+                #     logger.info("HERE")
+                #     op_start = time.time()
+                #     db_features = await self.milvus_client.get_features_by_track_id(
+                #         track_id = new_id,
+                #         store_id=self.store_id
+                #     )
+                #     self.log_operation(f"get_features_track_{new_id}", op_start)
+                #     logger.info(f"store id is {self.store_id}")
+                #     milvus_ops_count += 1
+                #     if db_features:
+                #         new_track.features = db_features
+                #         logger.debug(f"Created track with ID {new_id} (reidentified from Milvus with {len(new_track.features)} features)")
+                #     else:
+                #         logger.debug(f"Created new track with ID {new_id} (no features found in Milvus)")
+                # except Exception as e:
+                #     logger.error(f"Failed to fetch features from Milvus for track_id {new_id} in store {self.store_id}: {e}")
+                #     logger.debug(f"Created new track with ID {new_id} (fallback)")
             
                 # Add the new track
                 self.tracks.append(new_track)
@@ -826,23 +888,18 @@ class AsyncTracker:
                 existing_tracks = [t for t in self.tracks if t.track_id == new_id]
                 best_track = max(existing_tracks, key=lambda t: t.hits)
                 try:
-                    op_start = time.time()
-                    db_features = await self.milvus_client.get_features_by_track_id(
-                        track_id = new_id,
-                        store_id=self.store_id,
-                    )
-                    self.log_operation(f"get_features_track_{new_id}", op_start)
-                    milvus_ops_count += 1
-                    if db_features:
-                        if not best_track.features:
-                            best_track.features = db_features
-                        elif len(db_features) > len(best_track.features):
-                            added = 0
-                            for db_feature in db_features:
-                                if not any(np.array_equal(db_feature, f) for f in best_track.features):
-                                    best_track.features.append(db_feature)
-                                    added += 1
-                            logger.debug(f"[Milvus] Merged {added} new features for track {new_id}. Total now: {len(best_track.features)}")
+                    if new_id in all_track_features:
+                        db_features = all_track_features[new_id]
+                        if db_features:
+                            if not best_track.features:
+                                best_track.features = db_features
+                            elif len(db_features) > len(best_track.features):
+                                added = 0
+                                for db_feature in db_features:
+                                    if not any(np.array_equal(db_feature, f) for f in best_track.features):
+                                        best_track.features.append(db_feature)
+                                        added += 1
+                                logger.debug(f"[Milvus] Merged {added} new features for track {new_id}. Total now: {len(best_track.features)}")
                     else:
                         logger.debug(f"[Milvus] No features found to restore for track {new_id}")
                 except Exception as e:
