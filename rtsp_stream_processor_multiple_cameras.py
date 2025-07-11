@@ -409,30 +409,32 @@ class GPUBatchProcessor:
                     person_scores = instances.scores[person_indices].cpu().numpy()
                     person_masks = instances.pred_masks[person_indices].cpu().numpy()
 
+                    logger.info(f"Image {i}: Using original bboxes without scaling/transformation")
+
                     transform = transforms[i]
                     
-                    # Filter duplicate detections
-                    # frame_copy = image.copy()  # For visualization of suppressed boxes
-                    transformed_height, transformed_width = batch_inputs[i]["image"].shape[1], batch_inputs[i]["image"].shape[2]
-                    scale_x = original_width / transformed_width
-                    scale_y = original_height / transformed_height
+                    # # Filter duplicate detections
+                    # # frame_copy = image.copy()  # For visualization of suppressed boxes
+                    # transformed_height, transformed_width = batch_inputs[i]["image"].shape[1], batch_inputs[i]["image"].shape[2]
+                    # scale_x = original_width / transformed_width
+                    # scale_y = original_height / transformed_height
 
-                    logger.info(f"Image {i}: Original={original_width}x{original_height}, "
-                        f"Transformed={transformed_width}x{transformed_height}, "
-                        f"Scale factors: x={scale_x:.3f}, y={scale_y:.3f}")
+                    # logger.info(f"Image {i}: Original={original_width}x{original_height}, "
+                    #     f"Transformed={transformed_width}x{transformed_height}, "
+                    #     f"Scale factors: x={scale_x:.3f}, y={scale_y:.3f}")
 
-                    # Scale bounding boxes back to original coordinates
-                    scaled_boxes = []
-                    for bbox in person_boxes:
-                        x1, y1, x2, y2 = bbox
-                        # Scale coordinates back
-                        orig_x1 = x1 * scale_x
-                        orig_y1 = y1 * scale_y
-                        orig_x2 = x2 * scale_x
-                        orig_y2 = y2 * scale_y
-                        scaled_boxes.append([orig_x1, orig_y1, orig_x2, orig_y2])
+                    # # Scale bounding boxes back to original coordinates
+                    # scaled_boxes = []
+                    # for bbox in person_boxes:
+                    #     x1, y1, x2, y2 = bbox
+                    #     # Scale coordinates back
+                    #     orig_x1 = x1 * scale_x
+                    #     orig_y1 = y1 * scale_y
+                    #     orig_x2 = x2 * scale_x
+                    #     orig_y2 = y2 * scale_y
+                    #     scaled_boxes.append([orig_x1, orig_y1, orig_x2, orig_y2])
 
-                    person_boxes = np.array(scaled_boxes)
+                    # person_boxes = np.array(scaled_boxes)
                     
                     filtered_boxes, filtered_scores, filtered_masks = filter_duplicate_detections(
                         person_boxes, person_scores, person_masks, image, iou_threshold=0.9
