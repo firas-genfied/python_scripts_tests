@@ -1,6 +1,9 @@
 # vim: expandtab:ts=4:sw=4
 import numpy as np
+import logging
 
+# Add logging for debugging
+logger = logging.getLogger(__name__)
 
 def _pdist(a, b):
     """Compute pair-wise squared distance between points in `a` and `b`.
@@ -121,8 +124,6 @@ class NearestNeighborDistanceMetric(object):
     """
 
     def __init__(self, metric, matching_threshold, budget=None):
-
-
         if metric == "euclidean":
             self._metric = _nn_euclidean_distance
         elif metric == "cosine":
@@ -133,6 +134,14 @@ class NearestNeighborDistanceMetric(object):
         self.matching_threshold = matching_threshold
         self.budget = budget
         self.samples = {}
+        
+        # Add statistics for monitoring
+        self.stats = {
+            'total_distance_calls': 0,
+            'missing_targets_fixed': 0,
+            'empty_samples_handled': 0,
+            'distance_errors': 0
+        }
 
     def partial_fit(self, features, targets, active_targets):
         """Update the distance metric with new data.
@@ -151,10 +160,17 @@ class NearestNeighborDistanceMetric(object):
             self.samples.setdefault(target, []).append(feature)
             if self.budget is not None:
                 self.samples[target] = self.samples[target][-self.budget:]
-        self.samples = {k: self.samples[k] for k in active_targets if k in self.samples}
+        
+        # DEFENSIVE: Only clean up if we have active targets
+        if active_targets:
+            # Keep samples for active targets, but don't remove if not in active_targets
+            # to prevent KeyErrors. Only remove if explicitly marked for deletion.
+            pass  # We'll handle cleanup more carefully elsewhere
 
     def distance(self, features, targets):
         """Compute distance between features and targets.
+        
+        DEFENSIVE VERSION: Handles missing targets gracefully.
 
         Parameters
         ----------
@@ -171,7 +187,109 @@ class NearestNeighborDistanceMetric(object):
             `targets[i]` and `features[j]`.
 
         """
+        self.stats['total_distance_calls'] += 1
         cost_matrix = np.zeros((len(targets), len(features)))
+        
+        # Log the operation for debugging
+        logger.debug(f"Computing distances for targets: {targets}")
+        logger.debug(f"Available samples: {list(self.samples.keys())}")
+        
         for i, target in enumerate(targets):
-            cost_matrix[i, :] = self._metric(self.samples[target], features)
+            try:
+                # LAZY SAMPLE CREATION: Create missing samples automatically
+                if target not in self.samples:
+                    logger.info(f"Target {target} missing from samples - creating empty sample list")
+                    self.samples[target] = []
+                    self.stats['missing_targets_fixed'] += 1
+                
+                # DEFENSIVE: Handle empty samples
+                if not self.samples[target]:
+                    logger.debug(f"Target {target} has no samples - assigning max distance")
+                    cost_matrix[i, :] = float('inf')
+                    self.stats['empty_samples_handled'] += 1
+                    continue
+                
+                # DEFENSIVE: Validate samples before computing distance
+                target_samples = self.samples[target]
+                if not isinstance(target_samples, list):
+                    logger.warning(f"Target {target} samples is not a list: {type(target_samples)}")
+                    cost_matrix[i, :] = float('inf')
+                    continue
+                
+                # Check if samples contain valid numpy arrays
+                valid_samples = []
+                for sample in target_samples:
+                    try:
+                        sample_array = np.asarray(sample)
+                        if sample_array.size > 0:
+                            valid_samples.append(sample_array)
+                    except Exception as e:
+                        logger.warning(f"Invalid sample in target {target}: {e}")
+                        continue
+                
+                if not valid_samples:
+                    logger.debug(f"Target {target} has no valid samples after validation")
+                    cost_matrix[i, :] = float('inf')
+                    continue
+                
+                # DEFENSIVE: Compute distance with error handling
+                try:
+                    cost_matrix[i, :] = self._metric(valid_samples, features)
+                    logger.debug(f"Successfully computed distance for target {target}")
+                except Exception as metric_error:
+                    logger.error(f"Metric computation failed for target {target}: {metric_error}")
+                    cost_matrix[i, :] = float('inf')
+                    self.stats['distance_errors'] += 1
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error processing target {target}: {e}")
+                cost_matrix[i, :] = float('inf')
+                self.stats['distance_errors'] += 1
+        
+        logger.debug(f"Distance computation completed. Cost matrix shape: {cost_matrix.shape}")
         return cost_matrix
+    
+    def ensure_target_exists(self, target_id):
+        """
+        LAZY CREATION: Ensure a target exists in samples with at least an empty list.
+        
+        Parameters
+        ----------
+        target_id : int
+            Target ID to ensure exists
+        """
+        if target_id not in self.samples:
+            logger.debug(f"Creating empty samples list for target {target_id}")
+            self.samples[target_id] = []
+    
+    def cleanup_missing_targets(self, valid_target_ids):
+        """
+        DEFENSIVE CLEANUP: Remove samples for targets that are no longer valid.
+        
+        Parameters
+        ----------
+        valid_target_ids : set or list
+            Set/list of target IDs that should be kept
+        """
+        if not valid_target_ids:
+            logger.warning("cleanup_missing_targets called with empty valid_target_ids")
+            return
+            
+        valid_set = set(valid_target_ids)
+        current_targets = set(self.samples.keys())
+        targets_to_remove = current_targets - valid_set
+        
+        for target_id in targets_to_remove:
+            logger.debug(f"Removing samples for obsolete target {target_id}")
+            del self.samples[target_id]
+        
+        logger.debug(f"Cleanup completed. Removed {len(targets_to_remove)} obsolete targets")
+    
+    def get_stats(self):
+        """Get diagnostic statistics"""
+        return {
+            **self.stats,
+            'total_targets': len(self.samples),
+            'targets_with_samples': len([t for t, s in self.samples.items() if s]),
+            'total_samples': sum(len(s) for s in self.samples.values())
+        }

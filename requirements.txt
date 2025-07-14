@@ -56,3 +56,6 @@ confluent-kafka
 avro-python3
 msgpack
 aiokafka
+
+#prometheus dependency to allow prom to scrape metrics
+prometheus_client==0.17.1

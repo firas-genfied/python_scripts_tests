@@ -1,4 +1,4 @@
-# sender.py
+# sender.py - Fixed version for API compatibility
 import asyncio
 import logging
 import sys
@@ -12,11 +12,11 @@ from config import config
 
 # Configure Logging
 logging.basicConfig(
-    level=logging.INFO,  # Changed to DEBUG for more detailed logs
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),        # Log to stdout
-        logging.FileHandler("sender.log")         # Log to a file named sender.log
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("sender.log")
     ]
 )
 
@@ -27,7 +27,7 @@ DETECTION_ENDPOINT = config.get("detection_endpoint")
 AUTH_ENDPOINT = config.get("auth_endpoint", os.environ.get("AUTH_ENDPOINT"))
 AUTH_USERNAME = config.get("auth_username", os.environ.get("AUTH_USERNAME"))
 AUTH_PASSWORD = config.get("auth_password", os.environ.get("AUTH_PASSWORD"))
-AUTH_REFRESH_INTERVAL = int(config.get("auth_refresh_interval", os.environ.get("AUTH_REFRESH_INTERVAL")))  # 30 minutes default
+AUTH_REFRESH_INTERVAL = int(config.get("auth_refresh_interval", os.environ.get("AUTH_REFRESH_INTERVAL", "1800")))
 
 if not DETECTION_ENDPOINT:
     logger.error("Detection endpoint not found in configuration.")
@@ -39,9 +39,7 @@ if not AUTH_USERNAME or not AUTH_PASSWORD:
     logger.error("Authentication credentials not found in configuration or environment variables.")
     sys.exit(1)
 
-# Number of retries for failed requests
 MAX_RETRIES = 3
-# Delay between retries (in seconds)
 RETRY_DELAY = 1
 
 auth_manager = None
@@ -56,15 +54,16 @@ async def initialize_auth():
         refresh_interval=AUTH_REFRESH_INTERVAL
     )
     await auth_manager.start()
-    logger.error("Authentication initialized")
+    logger.info("Authentication initialized")
 
 def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     """
-    Process detection data directly without reading from a file.
+    Process detection data and ensure it matches the exact API requirements.
+    
     Args:
         detection_data (List[Dict]): List containing detection results.
     Returns:
-        List[Dict]: Formatted data ready to be sent to the endpoint as a list.
+        List[Dict]: Formatted data ready to be sent to the endpoint.
     """
     if not detection_data or not isinstance(detection_data, list):
         raise ValueError("Invalid detection data format")
@@ -72,27 +71,156 @@ def format_detection_data(detection_data: List[Dict]) -> List[Dict]:
     formatted_results = []
     
     for frame_data in detection_data:
-        # Format according to API requirements
+        # Skip frames with no people
         if frame_data.get("no_of_people", 0) == 0:
-            logger.debug(f"Skipping frame with no people detected: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
+            logger.debug(f"Skipping frame with no people: camera_id={frame_data.get('camera_id')}, frame_id={frame_data.get('frame_id')}")
             continue
+        
+        # Ensure camera_id is an integer
+        camera_id = frame_data.get("camera_id")
+        if isinstance(camera_id, str):
+            try:
+                camera_id = int(camera_id)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid camera_id format: {camera_id}, defaulting to 0")
+                camera_id = 0
+        elif not isinstance(camera_id, int):
+            camera_id = 0
+        
+        # Process persons array
+        persons = []
+        for person in frame_data.get("persons", []):
+            # Ensure coordinates are strings
+            coords = person.get("coords", {})
+            formatted_coords = {
+                "x": str(coords.get("x", "0")),
+                "y": str(coords.get("y", "0"))
+            }
+            
+            # Build person object with required fields
+            formatted_person = {
+                "person_id": str(person.get("person_id", "")),
+                "coords": formatted_coords,
+                "type": str(person.get("type", "customer"))  # Default to customer if not specified
+            }
+            
+            # Add group_id only if it exists and is not empty
+            group_id = person.get("group_id", "")
+            if group_id and str(group_id).strip():
+                formatted_person["group_id"] = str(group_id)
+            
+            persons.append(formatted_person)
+        
+        # Build the result object matching API specification exactly
         result = {
-            "camera_id": frame_data.get("camera_id", ""),
-            "image_url": frame_data.get("image_url", ""),
-            "is_organised": frame_data.get("is_organised", True),
-            "no_of_people": frame_data.get("no_of_people", 0),
-            "date_time": frame_data.get("date_time", ""),
-            "persons": frame_data.get("persons", [])
+            "camera_id": camera_id,
+            "image_url": str(frame_data.get("image_url", "")),
+            "is_organised": bool(frame_data.get("is_organised", True)),
+            "no_of_people": int(frame_data.get("no_of_people", len(persons))),
+            "date_time": str(frame_data.get("date_time", "")),
+            "persons": persons
         }
-        formatted_results.append(result)
+        
+        # Validate the result before adding
+        if validate_detection_result(result):
+            formatted_results.append(result)
+        else:
+            logger.warning(f"Skipping invalid detection result: {result}")
     
     return formatted_results
 
+def validate_detection_result(result: Dict) -> bool:
+    """
+    Validate a single detection result against API requirements.
+    
+    Args:
+        result (Dict): Detection result to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    try:
+        # Check required fields
+        required_fields = ["camera_id", "image_url", "is_organised", "no_of_people", "date_time", "persons"]
+        for field in required_fields:
+            if field not in result:
+                logger.error(f"Missing required field: {field}")
+                return False
+        
+        # Check data types
+        if not isinstance(result["camera_id"], int):
+            logger.error(f"camera_id must be integer, got: {type(result['camera_id'])}")
+            return False
+        
+        if not isinstance(result["image_url"], str):
+            logger.error(f"image_url must be string, got: {type(result['image_url'])}")
+            return False
+        
+        if not isinstance(result["is_organised"], bool):
+            logger.error(f"is_organised must be boolean, got: {type(result['is_organised'])}")
+            return False
+        
+        if not isinstance(result["no_of_people"], int):
+            logger.error(f"no_of_people must be integer, got: {type(result['no_of_people'])}")
+            return False
+        
+        if not isinstance(result["date_time"], str):
+            logger.error(f"date_time must be string, got: {type(result['date_time'])}")
+            return False
+        
+        if not isinstance(result["persons"], list):
+            logger.error(f"persons must be list, got: {type(result['persons'])}")
+            return False
+        
+        # Validate persons array
+        for i, person in enumerate(result["persons"]):
+            if not isinstance(person, dict):
+                logger.error(f"persons[{i}] must be dict, got: {type(person)}")
+                return False
+            
+            # Check required person fields
+            person_required = ["person_id", "coords", "type"]
+            for field in person_required:
+                if field not in person:
+                    logger.error(f"persons[{i}] missing required field: {field}")
+                    return False
+            
+            # Check person field types
+            if not isinstance(person["person_id"], str):
+                logger.error(f"persons[{i}].person_id must be string")
+                return False
+            
+            if not isinstance(person["coords"], dict):
+                logger.error(f"persons[{i}].coords must be dict")
+                return False
+            
+            if "x" not in person["coords"] or "y" not in person["coords"]:
+                logger.error(f"persons[{i}].coords missing x or y")
+                return False
+            
+            if not isinstance(person["coords"]["x"], str) or not isinstance(person["coords"]["y"], str):
+                logger.error(f"persons[{i}].coords.x and y must be strings")
+                return False
+            
+            if not isinstance(person["type"], str):
+                logger.error(f"persons[{i}].type must be string")
+                return False
+            
+            # group_id is optional, but if present must be string
+            if "group_id" in person and not isinstance(person["group_id"], str):
+                logger.error(f"persons[{i}].group_id must be string if present")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        return False
+
 async def send_detection_data(detection_data: List[Dict]) -> bool:
     """
-    Processes the detection data and sends it directly to the API endpoint with authentication.
-    Skips sending if no people were detected in any frames.    
-
+    Processes the detection data and sends it to the API endpoint with proper formatting.
+    
     Args:
         detection_data (List[Dict]): List containing detection results.
         
@@ -104,7 +232,6 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
         logger.debug("Auth manager not initialized, initializing now...")
         await initialize_auth()
 
-    # Check for required config variables
     if not DETECTION_ENDPOINT:
         logger.error("DETECTION_ENDPOINT is not set or empty")
         return False
@@ -112,14 +239,21 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     logger.debug(f"Will send data to endpoint: {DETECTION_ENDPOINT}")
 
     try:
-        # Process the detection data directly
+        # Process and validate the detection data
         formatted_data = format_detection_data(detection_data)
         if not formatted_data:
-            logger.debug("No frames with people detected, skipping API call")
+            logger.debug("No valid frames with people detected, skipping API call")
             return True
-        logger.debug(f"Sending {len(formatted_data)} frames with people detected")
-        first_frame = formatted_data[0]
-        logger.debug(f"Processed detection data for camera {first_frame.get('camera_id')} with {first_frame.get('no_of_people')} people, frame {first_frame.get('frame_id')}, time {first_frame.get('date_time')}")
+        
+        logger.info(f"Sending {len(formatted_data)} frames with people detected")
+        
+        # Log first frame for debugging
+        if formatted_data:
+            first_frame = formatted_data[0]
+            logger.debug(f"First frame: camera_id={first_frame.get('camera_id')} ({type(first_frame.get('camera_id'))}), "
+                        f"people={first_frame.get('no_of_people')} ({type(first_frame.get('no_of_people'))}), "
+                        f"is_organised={first_frame.get('is_organised')} ({type(first_frame.get('is_organised'))})")
+        
     except Exception as e:
         logger.error(f"Failed to process detection data: {e}", exc_info=True)
         return False
@@ -128,81 +262,88 @@ async def send_detection_data(detection_data: List[Dict]) -> bool:
     for attempt in range(MAX_RETRIES):
         try:
             auth_headers = await auth_manager.get_auth_header()
-            logger.debug(f"Using auth headers: {auth_headers}")
-            logger.debug(f"Full payload for detection data: {json.dumps(formatted_data, indent=2)}")
+            
+            # Add explicit content-type header
+            headers = {
+                **auth_headers,
+                "Content-Type": "application/json"
+            }
+            
+            # Log the payload for debugging (only on first attempt)
+            if attempt == 0:
+                logger.debug(f"Sending payload: {json.dumps(formatted_data, indent=2)}")
             
             async with aiohttp.ClientSession() as session:
-                logger.debug("Creating POST request...")
+                logger.debug(f"Attempt {attempt + 1}/{MAX_RETRIES}: Creating POST request...")
                 async with session.post(
                     DETECTION_ENDPOINT, 
                     json=formatted_data, 
-                    headers=auth_headers, 
-                    timeout=10
+                    headers=headers, 
+                    timeout=30  # Increased timeout
                 ) as response:
                     logger.debug(f"Received response with status code: {response.status}")
                     
-                    # Read and log the full response text
+                    # Read response text
                     response_text = await response.text()
-                    logger.debug(f"Response Text: {response_text}")
-                    
-                    # Try to parse response as JSON if possible
-                    try:
-                        response_json = await response.json()
-                        logger.debug(f"Response JSON: {json.dumps(response_json, indent=2)}")
-                    except Exception:
-                        logger.error("Response was not a valid JSON")
                     
                     if response.status == 200:
-                        logger.debug(f"Data sent successfully for frame {detection_data[0].get('frame_id')} time {detection_data[0].get('date_time')}")
+                        logger.info(f"Data sent successfully! Response: {response_text}")
                         return True
+                    elif response.status == 400:
+                        logger.error(f"Bad Request (400). Response: {response_text}")
+                        
+                        # For 400 errors, don't retry as it's likely a data format issue
+                        try:
+                            # Try to parse error details
+                            error_json = json.loads(response_text)
+                            logger.error(f"API Error Details: {json.dumps(error_json, indent=2)}")
+                        except:
+                            logger.error(f"Raw error response: {response_text}")
+                        
+                        return False
                     elif response.status == 401 or response.status == 403:
                         logger.error(f"Authentication error (status {response.status}). Refreshing token and retrying...")
                         await auth_manager.refresh_token()
                         continue
                     else:
-                        logger.error(f"Failed to send data. Status: {response.status}")
+                        logger.error(f"Failed to send data. Status: {response.status}, Response: {response_text}")
                         
-                        # If this was the last attempt, return False
                         if attempt == MAX_RETRIES - 1:
                             return False
                             
-                        # Otherwise wait before retrying
-                        logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+                        logger.debug(f"Retrying in {RETRY_DELAY} seconds...")
                         await asyncio.sleep(RETRY_DELAY)
+                        
         except aiohttp.ClientError as client_error:
-            logger.error(f"HTTP Client error occurred: {client_error}", exc_info=True)
+            logger.error(f"HTTP Client error: {client_error}", exc_info=True)
             if attempt == MAX_RETRIES - 1:
                 return False
-            logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+            logger.debug(f"Retrying in {RETRY_DELAY} seconds...")
             await asyncio.sleep(RETRY_DELAY)
         except Exception as e:
-            logger.error(f"An unexpected error occurred while sending data: {e}", exc_info=True)
+            logger.error(f"Unexpected error: {e}", exc_info=True)
             if attempt == MAX_RETRIES - 1:
                 return False
-            logger.debug(f"Retrying in {RETRY_DELAY} seconds (attempt {attempt+1}/{MAX_RETRIES})...")
+            logger.debug(f"Retrying in {RETRY_DELAY} seconds...")
             await asyncio.sleep(RETRY_DELAY)
     
-    # If all retries failed
     return False
 
 async def main():
-    """
-    The main entry point for the script.
-    """
+    """Test the sender with properly formatted data"""
     try:
-        # Initialize authentication
         await initialize_auth()
         
-        # Create test detection data that matches the specified schema
+        # Test with properly formatted data matching the API spec exactly
         test_detection = [{
-            "camera_id": 1,
+            "camera_id": "1",  # This will be converted to int
             "image_url": "https://example.com/detection1.jpg",
             "is_organised": True,
-            "no_of_people": 3,
-            "date_time": "2025-03-28T21:00:53.555Z",
+            "no_of_people": 2,
+            "date_time": "2025-01-15T10:30:00.000Z",
             "persons": [
                 {
-                    "person_id": "person123",
+                    "person_id": "123",
                     "coords": {
                         "x": "0.5",
                         "y": "0.7"
@@ -211,49 +352,34 @@ async def main():
                     "group_id": "group1"
                 },
                 {
-                    "person_id": "person456",
+                    "person_id": "456", 
                     "coords": {
                         "x": "0.3",
                         "y": "0.4"
                     },
-                    "type": "employee",
-                    "group_id": "group2"
-                },
-                {
-                    "person_id": "person789",
-                    "coords": {
-                        "x": "0.7",
-                        "y": "0.2"
-                    },
-                    "type": "customer",
-                    "group_id": "group1"
+                    "type": "customer"
+                    # No group_id for this person
                 }
             ]
         }]
         
-        # Send the test detection data
         success = await send_detection_data(test_detection)
         
         if success:
-            logger.debug("Test data sent successfully.")
+            logger.info("Test data sent successfully.")
         else:
-            logger.error("Failed to send test data after multiple attempts.")
+            logger.error("Failed to send test data.")
             sys.exit(1)
             
     finally:
-        # Ensure we stop the auth manager when done
         if auth_manager:
             await auth_manager.stop()
 
-
 if __name__ == "__main__":
-    """
-    When the script is run directly, execute the main coroutine.
-    """
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.debug("Script interrupted by user.")
+        logger.info("Script interrupted by user.")
     except Exception as e:
-        logger.error(f"An unhandled exception occurred: {e}", exc_info=True)
+        logger.error(f"Unhandled exception: {e}", exc_info=True)
         sys.exit(1)
