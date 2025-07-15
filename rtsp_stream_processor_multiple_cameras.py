@@ -825,6 +825,22 @@ class CameraProcessor:
         except Exception as e:
             logger.error(f"Error cleaning up tracker: {e}")
 
+def safe_json_deserializer(data):
+    """Safely deserialize JSON data from Kafka messages"""
+    if not data:
+        logger.debug("Received empty Kafka message, returning None")
+        return None
+    
+    try:
+        return json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse JSON from Kafka message: {e}")
+        logger.debug(f"Raw message data: {data[:100]}...")  # Log first 100 bytes
+        return None
+    except UnicodeDecodeError as e:
+        logger.warning(f"Failed to decode UTF-8 from Kafka message: {e}")
+        return None
+
 class KafkaProcessor:
     """Manages processing for multiple Kafka topics/partitions"""
     def __init__(self, num_processors = 2, batch_size=8, batch_interval=0.5, processing_fps=5,
@@ -1562,7 +1578,7 @@ class KafkaProcessor:
 
         # Start the Kafka consumer loop instead of Kafka readers
         self.task_manager.create_task(
-            self._kafka_consumer_loop(),
+            self._kafka_consumer_loop_with_retry(),
             category="kafka_consumer"
         )
 
@@ -1646,7 +1662,7 @@ class KafkaProcessor:
             bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVER"),
             auto_offset_reset="latest",
             enable_auto_commit=True,   # whether to commit offsets automatically
-            value_deserializer=lambda b: json.loads(b.decode("utf-8"))
+            value_deserializer= safe_json_deserializer
         )
         all_kafka_topics = self.kafka_consumer.topics()
         filtered_topics = []
@@ -1703,13 +1719,24 @@ class KafkaProcessor:
             try:
                 for msg in self.kafka_consumer:
                     # Extract store_id from topic: e.g. "store-001-frames" → "001"
+                    if msg.value is None:
+                        logger.debug(f"Skipping message with None value from topic {msg.topic}")
+                        continue
+
+                    if not isinstance(msg.value, dict):
+                        logger.warning(f"Message value is not a dictionary: {type(msg.value)}")
+                        continue
+
                     topic_parts = msg.topic.split("-")
                     if len(topic_parts) >= 2:
                         store_id = topic_parts[1]
                     else:
                         logger.warning(f"Unexpected topic format: {msg.topic}, using topic as store_id")
                         store_id = msg.topic
-                        
+                    
+                    if msg.key is None:
+                        logger.warning(f"Message key is None for topic {msg.topic}")
+                        continue
                     # Extract camera_id from message key: e.g. b"camera-101" → 101
                     camera_id_key = msg.key.decode()
                     try:
@@ -1720,6 +1747,15 @@ class KafkaProcessor:
                         
                     # Process the frame data
                     frame_data = msg.value
+
+                    if "frame" not in frame_data:
+                        logger.warning(f"Message missing 'frame' field from topic {msg.topic}")
+                        continue
+                    
+                    if not frame_data["frame"]:
+                        logger.warning(f"Empty frame data from topic {msg.topic}")
+                        continue
+
                     try:
                         frame_bytes = bytes.fromhex(frame_data["frame"])
                         timestamp = dict(msg.headers).get("timestamp", datetime.utcnow().isoformat())
@@ -1735,6 +1771,10 @@ class KafkaProcessor:
                         # Decode bytes → image
                         arr = np.frombuffer(frame_bytes, dtype=np.uint8)
                         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+                        if frame is None:
+                            logger.warning(f"Failed to decode frame from topic {msg.topic}")
+                            continue
                         
                         # Add to buffer (async)
                         asyncio.run_coroutine_threadsafe(
@@ -1742,8 +1782,12 @@ class KafkaProcessor:
                             loop
                         )
                         self.stats["incoming_frames"] += 1
+                    except ValueError as e:
+                        logger.error(f"Error decoding hex frame data from topic {msg.topic}: {e}")
+                        continue
                     except Exception as e:
                         logger.error(f"Error processing message from topic {msg.topic}: {e}")
+                        continue
             except Exception as e:
                 logger.error(f"Error in Kafka consumer loop: {e}", exc_info=True)
                 # Signal that the loop has exited so it can be restarted
@@ -1754,6 +1798,29 @@ class KafkaProcessor:
 
         # Schedule the blocking poll in the threadpool
         await loop.run_in_executor(None, poll_loop)
+    
+    async def _kafka_consumer_loop_with_retry(self):
+        """Kafka consumer loop with retry logic for better resilience"""
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Starting Kafka consumer (attempt {attempt + 1}/{max_retries})")
+                await self._kafka_consumer_loop()
+                # If we reach here, the consumer exited normally
+                break
+                
+            except Exception as e:
+                logger.error(f"Kafka consumer failed (attempt {attempt + 1}/{max_retries}): {e}")
+                
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries reached, consumer loop failed permanently")
+                    raise
 
     async def _processing_loop(self):
         """Background task that ensures batch processing happens regularly"""
@@ -1822,7 +1889,7 @@ class KafkaProcessor:
         
         # Restart consumer loop
         self.task_manager.create_task(
-            self._kafka_consumer_loop(),
+            self._kafka_consumer_loop_with_retry(),
             category="kafka_consumer_restart"
         )
 
