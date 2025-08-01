@@ -731,7 +731,7 @@ class CameraProcessor:
  
             
             # Skip if track is not confirmed or was missed
-            if not track.is_confirmed() or track.time_since_update > 1:
+            if not track.is_confirmed() or track.time_since_update > 25:
                 continue
             
             # Get bounding box and center points

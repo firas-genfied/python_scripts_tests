@@ -34,7 +34,7 @@ class AsyncTracker:
     keeping the max_age forces the features to be checked with the features in the global database as quickly as possible. 
     """
 
-    def __init__(self, metric, camera_id, store_id, milvus_client, store_cache=True, max_iou_distance=0.7, max_age=3, n_init=5, matching_threshold=0.5):
+    def __init__(self, metric, camera_id, store_id, milvus_client, store_cache=True, max_iou_distance=0.7, max_age=30, n_init=1, matching_threshold=0.5):
         self.metric = metric
         self.max_age = max_age
         self.n_init = n_init
@@ -554,7 +554,7 @@ class AsyncTracker:
                     # Check visible tracks for this detection
                     visible_matches = []
                     for track in self.tracks:
-                        if track.is_confirmed() and track.time_since_update <= 1 and track.features:
+                        if track.is_confirmed() and track.time_since_update <= 5 and track.features: #changed from 1
                             distance = calculate_cosine_distance(search_features[i], track.features[-1])
                             if distance < self.matching_threshold:
                                 visible_matches.append((track.track_id, distance, True))
@@ -1076,7 +1076,7 @@ class AsyncTracker:
         # First, check visible tracks
         visible_matches = []
         for track in self.tracks:
-            if track.is_confirmed() and track.time_since_update <= 1:
+            if track.is_confirmed() and track.time_since_update <= 5:
                 # Calculate the feature distance using our custom function
                 if track.features:  # Make sure track has features
                     distance = calculate_cosine_distance(feature, track.features[-1])
@@ -1136,10 +1136,10 @@ class AsyncTracker:
         # Associate remaining tracks together with unconfirmed tracks using IOU.
         iou_track_candidates = unconfirmed_tracks + [
             k for k in unmatched_tracks_a if
-            self.tracks[k].time_since_update == 1]
+            self.tracks[k].time_since_update <= 3]
         unmatched_tracks_a = [
             k for k in unmatched_tracks_a if
-            self.tracks[k].time_since_update != 1]
+            self.tracks[k].time_since_update > 3]
         matches_b, unmatched_tracks_b, unmatched_detections = \
             linear_assignment.min_cost_matching(
                 iou_matching.iou_cost, self.max_iou_distance, self.tracks,
@@ -1224,7 +1224,7 @@ class AsyncTracker:
         # Get list of track IDs that are both confirmed AND currently visible in the scene
         visible_confirmed_track_ids = [
             track.track_id for track in self.tracks 
-            if track.is_confirmed() and track.time_since_update == 0
+            if track.is_confirmed() and track.time_since_update <= 3
         ]
         # Get the list of currently active track IDs
         # active_track_ids = [track.track_id for track in self.tracks if track.is_confirmed()]
