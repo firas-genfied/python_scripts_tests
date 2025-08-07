@@ -28,25 +28,7 @@ RUN apt-get update \
     libxrender-dev \
     libgl1-mesa-glx \
     ffmpeg
-# Install Python 3.10, pip, and related packages along with other system dependencies
-# RUN apt-get install -y --no-install-recommends \
-#     python3.10 \
-#     python3.10-dev \
-#     python3.10-venv \
-#     python3-pip \
-#     build-essential \
-#     software-properties-common \
-#     apt-transport-https \
-#     git \
-#     curl \
-#     ca-certificates \
-#     libglib2.0-0 \
-#     libsm6 \
-#     libxext6 \
-#     libxrender-dev \
-#     libgl1-mesa-glx \
-#     ffmpeg \
-#     && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 # Ensure that "python3" points to Python 3.10
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
@@ -62,23 +44,16 @@ RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
 
 # Set working directory
 
-# Copy your code into the container
-COPY . /app
+# Copy only requirements file first (for better caching)
+COPY requirements.txt /app/
 
-# Clone your repository (with submodules)
-# RUN git clone --recursive https://github.com/anuj018/ObjectTracking.git . 
-
-RUN echo "Python version:" && python3 --version
-RUN echo "Pip version:" && pip3 --version
-
-# Install Python dependencies from your curated requirements.txt
-# RUN pip3 install --no-cache-dir -r requirements.txt
 # Install pytorch packages first
 RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu126 \
     torch==2.6.0+cu126 \
     torchvision==0.21.0+cu126 \
     torchaudio==2.6.0+cu126
-    
+
+# Install other Python dependencies
 RUN pip3 install --no-cache-dir --ignore-installed --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements.txt
 
 # Install Detectron2 from GitHub
@@ -95,7 +70,10 @@ RUN chmod +x /app/setup_models.sh && /app/setup_models.sh
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY . /app
+
+RUN echo "Python version:" && python3 --version
+RUN echo "Pip version:" && pip3 --version
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python3", "rtsp_stream_processor_multiple_cameras.py", "--config", "/app/config/camera_config.json"]

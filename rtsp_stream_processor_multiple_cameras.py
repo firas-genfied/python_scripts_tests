@@ -1800,7 +1800,7 @@ class KafkaProcessor:
         def poll_loop():
             try:
                 for msg in self.kafka_consumer:
-                    # Extract store_id from topic: e.g. "store-001-frames" → "001"
+                    # Skip invalid messages
                     if msg.value is None:
                         logger.debug(f"Skipping message with None value from topic {msg.topic}")
                         continue
@@ -1808,44 +1808,90 @@ class KafkaProcessor:
                     if not isinstance(msg.value, dict):
                         logger.warning(f"Message value is not a dictionary: {type(msg.value)}")
                         continue
-
-                    topic_parts = msg.topic.split("-")
-                    if len(topic_parts) >= 2:
-                        store_id = topic_parts[1]
-                    else:
-                        logger.warning(f"Unexpected topic format: {msg.topic}, using topic as store_id")
-                        store_id = msg.topic
                     
                     if msg.key is None:
                         logger.warning(f"Message key is None for topic {msg.topic}")
                         continue
-                    # Extract camera_id from message key: e.g. b"camera-101" → 101
-                    camera_id_key = msg.key.decode()
-                    try:
-                        camera_id = int(camera_id_key.split("-")[1])
-                    except (IndexError, ValueError) as e:
-                        logger.warning(f"Failed to parse camera_id from key '{camera_id_key}': {e}")
-                        camera_id = 0  # Default value
-                        
+
                     # Process the frame data
                     frame_data = msg.value
 
-                    if "frame" not in frame_data:
-                        logger.warning(f"Message missing 'frame' field from topic {msg.topic}")
-                        continue
-                    
-                    if not frame_data["frame"]:
-                        logger.warning(f"Empty frame data from topic {msg.topic}")
+                    # Check for required frame_data field
+                    if "frame_data" not in frame_data:
+                        logger.warning(f"Message missing 'frame_data' field from topic {msg.topic}")
                         continue
 
+                    if not frame_data["frame_data"]:
+                        logger.warning(f"Empty frame_data from topic {msg.topic}")
+                        continue       
+
+                    # Extract store_id
+                    if "store_id" in frame_data:
+                        store_id = str(frame_data["store_id"])
+                    else:
+                        # Fallback to extracting from topic
+                        topic_parts = msg.topic.split("-")
+                        if len(topic_parts) >= 2:
+                            store_id = topic_parts[1]
+                        else:
+                            logger.warning(f"Unexpected topic format: {msg.topic}, using topic as store_id")
+                            store_id = msg.topic
+                    
+                    # Extract camera_id
+                    camera_id = 0  # Default value
+                    if "camera_id" in frame_data:
+                        camera_id_str = frame_data["camera_id"]
+                        try:
+                            if camera_id_str.startswith("camera-"):
+                                camera_id = int(camera_id_str.split("-")[1])
+                            else:
+                                camera_id = int(camera_id_str)
+                        except (IndexError, ValueError) as e:
+                            logger.warning(f"Failed to parse camera_id from value '{camera_id_str}': {e}")
+                            camera_id = 0
+
                     try:
-                        frame_bytes = bytes.fromhex(frame_data["frame"])
-                        timestamp = dict(msg.headers).get("timestamp", datetime.utcnow().isoformat())
+                        # Extract frame hex data from the nested structure
+                        frame_hex_data = None
+                        inner_frame_id = None
+                        
+                        if isinstance(frame_data["frame_data"], dict):
+                            inner_dict = frame_data["frame_data"]
+                            if "frame" in inner_dict:
+                                frame_hex_data = inner_dict["frame"]
+                                inner_frame_id = inner_dict.get("frame_id")
+                            else:
+                                logger.warning(f"frame_data dict missing 'frame' field from topic {msg.topic}")
+                                continue
+                        elif isinstance(frame_data["frame_data"], str):
+                            frame_hex_data = frame_data["frame_data"]
+                        else:
+                            logger.warning(f"frame_data has unexpected type {type(frame_data['frame_data'])} from topic {msg.topic}")
+                            continue
+
+                        # Validate frame hex data
+                        if not frame_hex_data:
+                            logger.warning(f"Empty frame hex data from topic {msg.topic}")
+                            continue
+                            
+                        if not isinstance(frame_hex_data, str):
+                            logger.warning(f"Invalid frame hex data type from topic {msg.topic}")
+                            continue
+
+                        # Convert hex to bytes and decode image
+                        frame_bytes = bytes.fromhex(frame_hex_data)
+                        
+                        # Extract metadata
+                        timestamp = frame_data.get("timestamp")
+                        if not timestamp:
+                            timestamp = dict(msg.headers).get("timestamp", datetime.utcnow().isoformat())
+                            
+                        frame_id = inner_frame_id or frame_data.get("sequence_number", None)
                         
                         metadata = {
                             "store_id": store_id,
                             "camera_id": camera_id,
-                            "frame_id": frame_data.get("frame_id", None),
+                            "frame_id": frame_id,
                             "timestamp": timestamp,
                             "queued_time": time.time()
                         }
@@ -1864,12 +1910,14 @@ class KafkaProcessor:
                             loop
                         )
                         self.stats["incoming_frames"] += 1
+                        
                     except ValueError as e:
                         logger.error(f"Error decoding hex frame data from topic {msg.topic}: {e}")
                         continue
                     except Exception as e:
                         logger.error(f"Error processing message from topic {msg.topic}: {e}")
                         continue
+                        
             except Exception as e:
                 logger.error(f"Error in Kafka consumer loop: {e}", exc_info=True)
                 # Signal that the loop has exited so it can be restarted

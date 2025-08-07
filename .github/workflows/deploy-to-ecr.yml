@@ -1,5 +1,4 @@
 name: Build and Push to Amazon ECR
-
 on:
   push:
     branches:
@@ -9,7 +8,6 @@ on:
 jobs:
   build-and-push:
     runs-on: self-hosted
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,29 +18,42 @@ jobs:
       - name: Configure AWS credentials (Paris)
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID_PARIS }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PARIS }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PARIS }}
-          aws-region:            ${{ secrets.AWS_REGION_PARIS }}
+          aws-region: ${{ secrets.AWS_REGION_PARIS }}
 
       - name: Log in to Paris ECR
         run: |
           aws ecr get-login-password \
             --region ${{ secrets.AWS_REGION_PARIS }} \
-          | docker login \
+            | docker login \
               --username AWS \
               --password-stdin ${{ secrets.ECR_REGISTRY_PARIS }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
 
-      - name: Build and push with cache
-        uses: docker/build-push-action@v4
+      - name: Build and push with advanced caching
+        uses: docker/build-push-action@v5
         with:
           context: .
-          builder: default
           push: true
-          tags: ${{ secrets.ECR_REGISTRY_PARIS }}/${{ secrets.ECR_REPOSITORY_PARIS }}:latest
-          cache-from: type=inline
-          cache-to:   type=inline
+          tags: |
+            ${{ secrets.ECR_REGISTRY_PARIS }}/${{ secrets.ECR_REPOSITORY_PARIS }}:latest
+            ${{ secrets.ECR_REGISTRY_PARIS }}/${{ secrets.ECR_REPOSITORY_PARIS }}:${{ github.sha }}
+          # Use both registry cache and local cache
+          cache-from: |
+            type=registry,ref=${{ secrets.ECR_REGISTRY_PARIS }}/${{ secrets.ECR_REPOSITORY_PARIS }}:cache
+            type=local,src=/tmp/.buildx-cache
+          cache-to: |
+            type=registry,ref=${{ secrets.ECR_REGISTRY_PARIS }}/${{ secrets.ECR_REPOSITORY_PARIS }}:cache,mode=max
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+          platforms: linux/amd64
+
+      # Move cache to avoid ever-growing cache
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
