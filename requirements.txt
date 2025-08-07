@@ -59,3 +59,6 @@ aiokafka
 
 #prometheus dependency to allow prom to scrape metrics
 prometheus_client==0.17.1
+
+#msk dependencies
+boto3

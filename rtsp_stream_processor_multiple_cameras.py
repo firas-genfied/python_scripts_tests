@@ -66,6 +66,9 @@ from kafka.admin import KafkaAdminClient
 import re
 from kafka import KafkaConsumer
 
+import boto3
+from botocore.exceptions import ClientError
+
 
 # Import needed to match original code
 class TrackState:
@@ -841,6 +844,61 @@ def safe_json_deserializer(data):
         logger.warning(f"Failed to decode UTF-8 from Kafka message: {e}")
         return None
 
+class KafkaCredentialsManager:
+    def __init__(self):
+        # Pick up the explicit Kafka-secrets region first, then AWS_REGION or AWS_DEFAULT_REGION
+        self.region = (
+            os.getenv("KAFKA_AWS_SECRETS_REGION")
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "eu-west-3"
+        )
+
+        self.secret_name = os.getenv(
+            "KAFKA_CREDENTIALS_SECRET_NAME",
+            "AmazonMSK_genfied-kafka-consumer"
+        )
+        self.credentials = None
+        
+    def get_kafka_credentials(self):
+        """Retrieve Kafka credentials from AWS Secrets Manager."""
+        if self.credentials:
+            return self.credentials
+
+        try:
+            logger.info(
+                f"Retrieving Kafka credentials from Secrets Manager "
+                f"secret={self.secret_name} region={self.region}"
+            )
+
+            client = boto3.client(
+                "secretsmanager",
+                region_name=self.region
+            )
+            response = client.get_secret_value(SecretId=self.secret_name)
+            secret_data = json.loads(response["SecretString"])
+
+            # pull out the expected keys
+            username = secret_data["username"]
+            password = secret_data["password"]
+
+            self.credentials = {"username": username, "password": password}
+            logger.info(f"Successfully retrieved credentials for user={username}")
+
+            return self.credentials
+
+        except ClientError as e:
+            logger.error(f"Failed to retrieve Kafka credentials: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in secret string: {e}")
+            raise
+        except KeyError as e:
+            logger.error(f"Missing key in secret payload: {e}")
+            raise
+
+
+
 class KafkaProcessor:
     """Manages processing for multiple Kafka topics/partitions"""
     def __init__(self, num_processors = 2, batch_size=8, batch_interval=0.5, processing_fps=5,
@@ -905,13 +963,24 @@ class KafkaProcessor:
         self.send_interval = 1.0 / send_fps
         self.last_send_time = time.time()
 
-        self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVER")
+        # self.kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVER")
+        raw = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+        self.kafka_bootstrap_servers = [s.strip() for s in raw.split(",") if s.strip()]
         logger.info(f"server is {self.kafka_bootstrap_servers}")
         self.kafka_consumer_group = os.getenv("KAFKA_CONSUMER_GROUP")
-        self.KAFKA_TOPIC_PATTERN  = re.compile(os.getenv("KAFKA_TOPIC_PATTERN"))
-        logger.info(f"Kafka bootstrap={self.kafka_bootstrap_servers},"
-                    f"group={self.kafka_consumer_group}, "
-                    f"pattern={self.KAFKA_TOPIC_PATTERN}")
+        self.KAFKA_TOPIC_PATTERN  = re.compile(os.getenv("KAFKA_TOPIC_PATTERN", "^store-([0-9]+)$"))
+        self.security_protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
+        self.sasl_mechanism = os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
+
+        creds_manager = KafkaCredentialsManager()
+        self.kafka_credentials = creds_manager.get_kafka_credentials()
+
+        logger.info(f"Kafka config: servers={self.kafka_bootstrap_servers}, "
+                   f"group={self.kafka_consumer_group}, "
+                   f"security_protocol={self.security_protocol}, "
+                   f"sasl_mechanism={self.sasl_mechanism}, "
+                   f"username={self.kafka_credentials['username']}")
+
         
         logger.info(f"Initialized KafkaProcessor with {len(self.gpu_processors)} GPU processors")
         
@@ -930,6 +999,7 @@ class KafkaProcessor:
         self.clients_per_store = clients_per_store
         self.client_pools = {}  # {store_id: [AsyncMilvusRouterClient, ...]}
         self.client_selection_counters = {}  # {store_id: int} for round-robin
+    
         
 
     def get_or_create_store_cache(self, store_id: int) -> StoreCacheManager:
@@ -1557,7 +1627,14 @@ class KafkaProcessor:
         if not store_ids:
             logger.info("No store IDs configured, attempting discovery from Kafka")
             try:
-                admin = KafkaAdminClient(bootstrap_servers=self.kafka_bootstrap_servers)
+                admin = KafkaAdminClient(
+                    bootstrap_servers=self.kafka_bootstrap_servers,
+                    security_protocol=self.security_protocol,
+                    sasl_mechanism=self.sasl_mechanism,
+                    sasl_plain_username=self.kafka_credentials["username"],
+                    sasl_plain_password=self.kafka_credentials["password"],
+                    client_id="reid-admin"
+                )
                 all_topics = admin.list_topics()
                 
                 pattern = re.compile(os.getenv("KAFKA_TOPIC_PATTERN", "^store-([0-9]+)$"))
@@ -1658,11 +1735,15 @@ class KafkaProcessor:
         logger.info(f"Allowed stores: {self.allowed_stores}")
 
         self.kafka_consumer = KafkaConsumer(
-            group_id=os.getenv("KAFKA_CONSUMER_GROUP"),
-            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVER"),
+            group_id=self.kafka_consumer_group,
+            bootstrap_servers=self.kafka_bootstrap_servers,
             auto_offset_reset="latest",
-            enable_auto_commit=True,   # whether to commit offsets automatically
-            value_deserializer= safe_json_deserializer
+            enable_auto_commit=True,
+            security_protocol=self.security_protocol,
+            sasl_mechanism=self.sasl_mechanism,
+            sasl_plain_username=self.kafka_credentials["username"],
+            sasl_plain_password=self.kafka_credentials["password"],
+            value_deserializer=safe_json_deserializer
         )
         all_kafka_topics = self.kafka_consumer.topics()
         filtered_topics = []
