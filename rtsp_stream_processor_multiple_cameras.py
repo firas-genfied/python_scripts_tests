@@ -973,8 +973,9 @@ class KafkaProcessor:
         self.sasl_mechanism = os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
 
         creds_manager = KafkaCredentialsManager()
+        logger.info(f"Retrieving credentials")
         self.kafka_credentials = creds_manager.get_kafka_credentials()
-
+        logger.info(f"Retrieved credentials")
         logger.info(f"Kafka config: servers={self.kafka_bootstrap_servers}, "
                    f"group={self.kafka_consumer_group}, "
                    f"security_protocol={self.security_protocol}, "
