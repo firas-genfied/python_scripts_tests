@@ -60,5 +60,5 @@ aiokafka
 #prometheus dependency to allow prom to scrape metrics
 prometheus_client==0.17.1
 
-#msk dependencies
+#dependencies to fetch secrets from aws secrets manager
 boto3
