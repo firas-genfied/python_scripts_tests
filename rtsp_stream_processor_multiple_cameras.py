@@ -66,6 +66,7 @@ from kafka.admin import KafkaAdminClient
 import re
 from kafka import KafkaConsumer
 
+import base64 
 import boto3
 from botocore.exceptions import ClientError
 
@@ -1851,35 +1852,64 @@ class KafkaProcessor:
                             camera_id = 0
 
                     try:
-                        # Extract frame hex data from the nested structure
-                        frame_hex_data = None
+                        # Extract frame data from the nested structure
+                        frame_encoded_data = None
                         inner_frame_id = None
                         
                         if isinstance(frame_data["frame_data"], dict):
+                            # Handle nested dictionary format: {"frame_data": {"frame": "...", "frame_id": "..."}}
                             inner_dict = frame_data["frame_data"]
                             if "frame" in inner_dict:
-                                frame_hex_data = inner_dict["frame"]
+                                frame_encoded_data = inner_dict["frame"]
                                 inner_frame_id = inner_dict.get("frame_id")
                             else:
                                 logger.warning(f"frame_data dict missing 'frame' field from topic {msg.topic}")
                                 continue
                         elif isinstance(frame_data["frame_data"], str):
-                            frame_hex_data = frame_data["frame_data"]
+                            # Handle direct string format: {"frame_data": "encoded_data"}
+                            frame_encoded_data = frame_data["frame_data"]
                         else:
                             logger.warning(f"frame_data has unexpected type {type(frame_data['frame_data'])} from topic {msg.topic}")
                             continue
 
-                        # Validate frame hex data
-                        if not frame_hex_data:
-                            logger.warning(f"Empty frame hex data from topic {msg.topic}")
+                        # Validate frame encoded data
+                        if not frame_encoded_data:
+                            logger.warning(f"Empty frame encoded data from topic {msg.topic}")
                             continue
                             
-                        if not isinstance(frame_hex_data, str):
-                            logger.warning(f"Invalid frame hex data type from topic {msg.topic}")
+                        if not isinstance(frame_encoded_data, str):
+                            logger.warning(f"Invalid frame encoded data type from topic {msg.topic}")
                             continue
 
-                        # Convert hex to bytes and decode image
-                        frame_bytes = bytes.fromhex(frame_hex_data)
+                        # FIXED: Detect encoding type and decode appropriately
+                        frame_bytes = None
+                        
+                        # Check if it's base64 (most common for image data)
+                        if frame_encoded_data.startswith('/9j/') or frame_encoded_data.startswith('iVBOR') or '/' in frame_encoded_data or '+' in frame_encoded_data:
+                            try:
+                                frame_bytes = base64.b64decode(frame_encoded_data)
+                                logger.debug(f"Decoded base64 frame data from topic {msg.topic}")
+                            except Exception as e:
+                                logger.error(f"Failed to decode base64 frame data from topic {msg.topic}: {e}")
+                                continue
+                        else:
+                            # Fallback to hex decoding for compatibility
+                            try:
+                                # Remove any whitespace and validate hex
+                                hex_data = frame_encoded_data.replace(' ', '').replace('\n', '')
+                                if all(c in '0123456789abcdefABCDEF' for c in hex_data):
+                                    frame_bytes = bytes.fromhex(hex_data)
+                                    logger.debug(f"Decoded hex frame data from topic {msg.topic}")
+                                else:
+                                    logger.error(f"Frame data is neither valid base64 nor hex from topic {msg.topic}")
+                                    continue
+                            except ValueError as e:
+                                logger.error(f"Failed to decode hex frame data from topic {msg.topic}: {e}")
+                                continue
+
+                        if frame_bytes is None:
+                            logger.error(f"Failed to decode frame data from topic {msg.topic}")
+                            continue
                         
                         # Extract metadata
                         timestamp = frame_data.get("timestamp")
@@ -1893,7 +1923,16 @@ class KafkaProcessor:
                             "camera_id": camera_id,
                             "frame_id": frame_id,
                             "timestamp": timestamp,
-                            "queued_time": time.time()
+                            "queued_time": time.time(),
+                            # Additional metadata from your message format
+                            "width": frame_data.get("width", 0),
+                            "height": frame_data.get("height", 0),
+                            "format": frame_data.get("format", "jpeg"),
+                            "fps": frame_data.get("fps", 0),
+                            "processor_id": frame_data.get("processor_id", ""),
+                            "stream_name": frame_data.get("stream_name", ""),
+                            "node_ip": frame_data.get("node_ip", ""),
+                            "original_size": frame_data.get("original_size", 0)
                         }
                         
                         # Decode bytes → image
@@ -1901,8 +1940,11 @@ class KafkaProcessor:
                         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
                         if frame is None:
-                            logger.warning(f"Failed to decode frame from topic {msg.topic}")
+                            logger.warning(f"Failed to decode image from frame bytes from topic {msg.topic}")
                             continue
+                        
+                        # Log successful processing (optional, can be removed in production)
+                        logger.debug(f"Successfully processed frame {frame_id} from camera {camera_id} in store {store_id}")
                         
                         # Add to buffer (async)
                         asyncio.run_coroutine_threadsafe(
@@ -1912,10 +1954,10 @@ class KafkaProcessor:
                         self.stats["incoming_frames"] += 1
                         
                     except ValueError as e:
-                        logger.error(f"Error decoding hex frame data from topic {msg.topic}: {e}")
+                        logger.error(f"Error decoding frame data from topic {msg.topic}: {e}")
                         continue
                     except Exception as e:
-                        logger.error(f"Error processing message from topic {msg.topic}: {e}")
+                        logger.error(f"Error processing message from topic {msg.topic}: {e}", exc_info=True)
                         continue
                         
             except Exception as e:
