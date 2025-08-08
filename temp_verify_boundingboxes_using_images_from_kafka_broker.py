@@ -72,22 +72,45 @@ class KafkaCredentialsManager:
 class KafkaImageProcessor:
     """Kafka-enabled processor for real-time image analysis"""
     
-    def __init__(self, kafka_bootstrap_servers="35.181.243.135:29092", 
-                 kafka_topic="store-109", device=None, output_dir="kafka_output"):
-        self.kafka_bootstrap_servers = kafka_bootstrap_servers
-        self.kafka_topic = kafka_topic
+    def __init__(self, kafka_bootstrap_servers=None, 
+                 kafka_topic=None, device=None, output_dir="kafka_output"):
+        
+        # CHANGE 1: Get Kafka settings from environment with fallbacks
+        self.kafka_bootstrap_servers = (
+            kafka_bootstrap_servers or 
+            os.getenv("KAFKA_BOOTSTRAP_SERVERS", "35.181.243.135:29092").split(",")
+        )
+        self.kafka_topic = kafka_topic or os.getenv("KAFKA_TOPIC", "store-109")
         self.output_dir = output_dir
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # CHANGE 2: Add Kafka authentication
+        self.security_protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
+        self.sasl_mechanism = os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
+        
+        # Get credentials
+        creds_manager = KafkaCredentialsManager()
+        self.kafka_credentials = creds_manager.get_kafka_credentials()
         
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
         
         logger.info(f"Using device: {self.device}")
+        logger.info(f"Kafka servers: {self.kafka_bootstrap_servers}")
+        logger.info(f"Kafka topic: {self.kafka_topic}")
         
         # Initialize Kafka consumer
         self.consumer = None
         self.setup_kafka_consumer()
         
+        # Initialize models (rest of your code...)
+        self.setup_models()
+        
+        # Frame counter for saving unique files
+        self.frame_counter = 0
+
+    def setup_models(self):
+        """Initialize the AI models"""
         # Initialize the segmentation model (Detectron2)
         self.seg_predictor = setup_predictor()
         self.seg_model = self.seg_predictor.model
@@ -102,36 +125,22 @@ class KafkaImageProcessor:
         self.transform = build_transforms(cfg, is_train=False)
         self.extract_features = extract_features
         logger.info("TransReID model initialized")
-        
-        # Frame counter for saving unique files
-        self.frame_counter = 0
 
     def setup_kafka_consumer(self):
-        """Setup Kafka consumer with proper configuration"""
+        """Setup Kafka consumer with proper authentication"""
         try:
-            # self.consumer = KafkaConsumer(
-            #     self.kafka_topic,
-            #     bootstrap_servers=[self.kafka_bootstrap_servers],
-            #     auto_offset_reset='latest',  # Start from latest messages
-            #     enable_auto_commit=True,
-            #     group_id='image_processor_group',
-            #     value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,  # Try JSON first
-            #     consumer_timeout_ms=1000,  # Timeout after 1 second of no messages
-            #     max_poll_records=1,  # Process one message at a time
-            #     session_timeout_ms=30000,
-            #     heartbeat_interval_ms=10000
-            # )
+            # CHANGE 3: Use proper authentication and message parsing
             self.consumer = KafkaConsumer(
                 self.kafka_topic,
-                bootstrap_servers=[self.kafka_bootstrap_servers],
-                security_protocol=security,
-                sasl_mechanism=mechanism,
-                sasl_plain_username=creds["username"],
-                sasl_plain_password=creds["password"],
+                bootstrap_servers=self.kafka_bootstrap_servers,
+                security_protocol=self.security_protocol,
+                sasl_mechanism=self.sasl_mechanism,
+                sasl_plain_username=self.kafka_credentials["username"],
+                sasl_plain_password=self.kafka_credentials["password"],
                 auto_offset_reset='latest',
                 enable_auto_commit=True,
                 group_id='image_processor_group',
-                value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
+                value_deserializer=self.safe_json_deserializer,  # Use custom deserializer
                 consumer_timeout_ms=1000,
                 max_poll_records=1,
                 session_timeout_ms=30000,
@@ -139,26 +148,26 @@ class KafkaImageProcessor:
             )
             logger.info(f"Kafka consumer initialized for topic: {self.kafka_topic}")
             logger.info(f"Bootstrap servers: {self.kafka_bootstrap_servers}")
+            logger.info(f"Using authentication: {self.security_protocol}/{self.sasl_mechanism}")
+            
         except Exception as e:
             logger.error(f"Failed to initialize Kafka consumer: {e}")
-            # Try with raw bytes deserializer as fallback
-            try:
-                self.consumer = KafkaConsumer(
-                    self.kafka_topic,
-                    bootstrap_servers=[self.kafka_bootstrap_servers],
-                    auto_offset_reset='latest',
-                    enable_auto_commit=True,
-                    group_id='image_processor_group',
-                    value_deserializer=lambda m: m,  # Keep as bytes
-                    consumer_timeout_ms=1000,
-                    max_poll_records=1,
-                    session_timeout_ms=30000,
-                    heartbeat_interval_ms=10000
-                )
-                logger.info("Kafka consumer initialized with bytes deserializer")
-            except Exception as e2:
-                logger.error(f"Failed to initialize Kafka consumer with fallback: {e2}")
-                raise
+            raise
+
+    def safe_json_deserializer(self, data):
+        """Safely deserialize JSON data from Kafka messages"""
+        if not data:
+            logger.debug("Received empty Kafka message")
+            return None
+        
+        try:
+            return json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON from Kafka message: {e}")
+            return None
+        except UnicodeDecodeError as e:
+            logger.warning(f"Failed to decode UTF-8 from Kafka message: {e}")
+            return None
 
     def decode_with_ffmpeg(self, image_data, width, height):
         """Try to decode image data using FFmpeg with various codecs"""
@@ -304,317 +313,448 @@ class KafkaImageProcessor:
         logger.warning("All FFmpeg decoding attempts failed")
         return None
 
-    def decode_image_from_kafka(self, message_value):
-        """Decode image from Kafka message"""
-        try:
-            # Handle the case where message_value is already a dict
-            if isinstance(message_value, dict):
-                message_json = message_value
-                logger.info("Message is already a dictionary")
-            else:
-                # Try to decode as JSON first
-                try:
-                    if isinstance(message_value, bytes):
-                        message_json = json.loads(message_value.decode('utf-8'))
-                    else:
-                        message_json = json.loads(message_value)
-                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
-                    # If not JSON, try direct base64 decode
-                    try:
-                        if isinstance(message_value, str):
-                            image_data = base64.b64decode(message_value)
-                        else:
-                            image_data = message_value
+    # def decode_image_from_kafka(self, message_value):
+    #     """Decode image from Kafka message"""
+    #     try:
+    #         # Handle the case where message_value is already a dict
+    #         if isinstance(message_value, dict):
+    #             message_json = message_value
+    #             logger.info("Message is already a dictionary")
+    #         else:
+    #             # Try to decode as JSON first
+    #             try:
+    #                 if isinstance(message_value, bytes):
+    #                     message_json = json.loads(message_value.decode('utf-8'))
+    #                 else:
+    #                     message_json = json.loads(message_value)
+    #             except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+    #                 # If not JSON, try direct base64 decode
+    #                 try:
+    #                     if isinstance(message_value, str):
+    #                         image_data = base64.b64decode(message_value)
+    #                     else:
+    #                         image_data = message_value
                         
-                        # Convert bytes to OpenCV image
-                        nparr = np.frombuffer(image_data, np.uint8)
-                        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        return image
-                    except Exception as inner_e:
-                        logger.error(f"Failed to decode as base64 or raw bytes: {inner_e}")
-                        return None
+    #                     # Convert bytes to OpenCV image
+    #                     nparr = np.frombuffer(image_data, np.uint8)
+    #                     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    #                     return image
+    #                 except Exception as inner_e:
+    #                     logger.error(f"Failed to decode as base64 or raw bytes: {inner_e}")
+    #                     return None
             
-            # Now we have a dictionary, extract image data and metadata
-            logger.info(f"Message keys: {list(message_json.keys())}")
+    #         # Now we have a dictionary, extract image data and metadata
+    #         logger.info(f"Message keys: {list(message_json.keys())}")
             
-            # Get resolution from message
-            resolution = message_json.get('resolution', {})
-            width = resolution.get('width', 1920)
-            height = resolution.get('height', 1080)
-            format_type = message_json.get('format', 'unknown')
+    #         # Get resolution from message
+    #         resolution = message_json.get('resolution', {})
+    #         width = resolution.get('width', 1920)
+    #         height = resolution.get('height', 1080)
+    #         format_type = message_json.get('format', 'unknown')
             
-            logger.info(f"Image format: {format_type}, resolution: {width}x{height}")
+    #         logger.info(f"Image format: {format_type}, resolution: {width}x{height}")
             
-            # Check various possible keys for image data
-            image_data = None
-            possible_keys = ['frame', 'image', 'data', 'img', 'picture', 'photo']
+    #         # Check various possible keys for image data
+    #         image_data = None
+    #         possible_keys = ['frame', 'image', 'data', 'img', 'picture', 'photo']
             
-            for key in possible_keys:
-                if key in message_json:
-                    logger.info(f"Found image data in key: {key}")
-                    raw_data = message_json[key]
+    #         for key in possible_keys:
+    #             if key in message_json:
+    #                 logger.info(f"Found image data in key: {key}")
+    #                 raw_data = message_json[key]
                     
-                    # Handle different data types
-                    if isinstance(raw_data, str):
-                        # NEW: Try hex decoding first (like the working code)
-                        try:
-                            logger.info("Attempting hex decoding...")
-                            image_data = bytes.fromhex(raw_data)
-                            logger.info(f"Successfully decoded hex from key {key}")
-                            break
-                        except ValueError as hex_e:
-                            logger.warning(f"Hex decode failed: {hex_e}")
+    #                 # Handle different data types
+    #                 if isinstance(raw_data, str):
+    #                     # NEW: Try hex decoding first (like the working code)
+    #                     try:
+    #                         logger.info("Attempting hex decoding...")
+    #                         image_data = bytes.fromhex(raw_data)
+    #                         logger.info(f"Successfully decoded hex from key {key}")
+    #                         break
+    #                     except ValueError as hex_e:
+    #                         logger.warning(f"Hex decode failed: {hex_e}")
                             
-                            # Fall back to base64 decoding approaches
-                            try:
-                                # First try direct base64 decode
-                                image_data = base64.b64decode(raw_data)
-                                logger.info(f"Successfully decoded base64 from key {key}")
-                                break
-                            except Exception as e1:
-                                logger.warning(f"Direct base64 decode failed: {e1}")
-                                try:
-                                    # Try adding padding
-                                    missing_padding = len(raw_data) % 4
-                                    if missing_padding:
-                                        raw_data += '=' * (4 - missing_padding)
-                                    image_data = base64.b64decode(raw_data)
-                                    logger.info(f"Successfully decoded base64 with padding from key {key}")
-                                    break
-                                except Exception as e2:
-                                    logger.warning(f"Base64 decode with padding failed: {e2}")
-                                    try:
-                                        # Try URL-safe base64
-                                        image_data = base64.urlsafe_b64decode(raw_data)
-                                        logger.info(f"Successfully decoded URL-safe base64 from key {key}")
-                                        break
-                                    except Exception as e3:
-                                        logger.warning(f"URL-safe base64 decode failed: {e3}")
-                                        try:
-                                            # Try to decode as latin-1 and then base64
-                                            if isinstance(raw_data, str):
-                                                raw_bytes = raw_data.encode('latin-1')
-                                                image_data = raw_bytes
-                                                logger.info(f"Encoded string as latin-1 from key {key}")
-                                                break
-                                        except Exception as e4:
-                                            logger.warning(f"Latin-1 encoding failed: {e4}")
-                                            continue
-                    elif isinstance(raw_data, (bytes, bytearray)):
-                        # Raw bytes
-                        image_data = raw_data
-                        logger.info(f"Using raw bytes from key {key}")
-                        break
-                    elif isinstance(raw_data, list):
-                        # Array of bytes
-                        try:
-                            image_data = bytes(raw_data)
-                            logger.info(f"Converted list to bytes from key {key}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to convert list to bytes from key {key}: {e}")
-                            continue
+    #                         # Fall back to base64 decoding approaches
+    #                         try:
+    #                             # First try direct base64 decode
+    #                             image_data = base64.b64decode(raw_data)
+    #                             logger.info(f"Successfully decoded base64 from key {key}")
+    #                             break
+    #                         except Exception as e1:
+    #                             logger.warning(f"Direct base64 decode failed: {e1}")
+    #                             try:
+    #                                 # Try adding padding
+    #                                 missing_padding = len(raw_data) % 4
+    #                                 if missing_padding:
+    #                                     raw_data += '=' * (4 - missing_padding)
+    #                                 image_data = base64.b64decode(raw_data)
+    #                                 logger.info(f"Successfully decoded base64 with padding from key {key}")
+    #                                 break
+    #                             except Exception as e2:
+    #                                 logger.warning(f"Base64 decode with padding failed: {e2}")
+    #                                 try:
+    #                                     # Try URL-safe base64
+    #                                     image_data = base64.urlsafe_b64decode(raw_data)
+    #                                     logger.info(f"Successfully decoded URL-safe base64 from key {key}")
+    #                                     break
+    #                                 except Exception as e3:
+    #                                     logger.warning(f"URL-safe base64 decode failed: {e3}")
+    #                                     try:
+    #                                         # Try to decode as latin-1 and then base64
+    #                                         if isinstance(raw_data, str):
+    #                                             raw_bytes = raw_data.encode('latin-1')
+    #                                             image_data = raw_bytes
+    #                                             logger.info(f"Encoded string as latin-1 from key {key}")
+    #                                             break
+    #                                     except Exception as e4:
+    #                                         logger.warning(f"Latin-1 encoding failed: {e4}")
+    #                                         continue
+    #                 elif isinstance(raw_data, (bytes, bytearray)):
+    #                     # Raw bytes
+    #                     image_data = raw_data
+    #                     logger.info(f"Using raw bytes from key {key}")
+    #                     break
+    #                 elif isinstance(raw_data, list):
+    #                     # Array of bytes
+    #                     try:
+    #                         image_data = bytes(raw_data)
+    #                         logger.info(f"Converted list to bytes from key {key}")
+    #                         break
+    #                     except Exception as e:
+    #                         logger.warning(f"Failed to convert list to bytes from key {key}: {e}")
+    #                         continue
             
-            if image_data is None:
-                logger.error(f"Could not find image data in message. Available keys: {list(message_json.keys())}")
-                return None
+    #         if image_data is None:
+    #             logger.error(f"Could not find image data in message. Available keys: {list(message_json.keys())}")
+    #             return None
             
-            # Try multiple decoding approaches
-            image = None
-            decoding_method = "unknown"
+    #         # Try multiple decoding approaches
+    #         image = None
+    #         decoding_method = "unknown"
             
-            # Method 1: Standard OpenCV decode (JPEG/PNG) - should work with hex-decoded frames
-            try:
-                nparr = np.frombuffer(image_data, np.uint8)
-                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if image is not None:
-                    decoding_method = "cv2_standard"
-                    logger.info(f"Successfully decoded using cv2.imdecode with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"cv2.imdecode failed: {e}")
+    #         # Method 1: Standard OpenCV decode (JPEG/PNG) - should work with hex-decoded frames
+    #         try:
+    #             nparr = np.frombuffer(image_data, np.uint8)
+    #             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    #             if image is not None:
+    #                 decoding_method = "cv2_standard"
+    #                 logger.info(f"Successfully decoded using cv2.imdecode with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"cv2.imdecode failed: {e}")
             
-            # Method 2: Try with PIL (handles more formats)
-            try:
-                from PIL import Image as PILImage
-                pil_image = PILImage.open(io.BytesIO(image_data))
-                # Convert PIL image to OpenCV format
-                image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-                decoding_method = "pil_standard"
-                logger.info(f"Successfully decoded using PIL with shape: {image.shape}")
-                return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"PIL decoding failed: {e}")
+    #         # Method 2: Try with PIL (handles more formats)
+    #         try:
+    #             from PIL import Image as PILImage
+    #             pil_image = PILImage.open(io.BytesIO(image_data))
+    #             # Convert PIL image to OpenCV format
+    #             image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    #             decoding_method = "pil_standard"
+    #             logger.info(f"Successfully decoded using PIL with shape: {image.shape}")
+    #             return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"PIL decoding failed: {e}")
             
-            # Method 3: Try FFmpeg-based decoding
-            try:
-                logger.info("Attempting FFmpeg decoding...")
-                image = self.decode_with_ffmpeg(image_data, width, height)
-                if image is not None:
-                    decoding_method = "ffmpeg"
-                    logger.info(f"Successfully decoded using FFmpeg with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"FFmpeg decoding failed: {e}")
+    #         # Method 3: Try FFmpeg-based decoding
+    #         try:
+    #             logger.info("Attempting FFmpeg decoding...")
+    #             image = self.decode_with_ffmpeg(image_data, width, height)
+    #             if image is not None:
+    #                 decoding_method = "ffmpeg"
+    #                 logger.info(f"Successfully decoded using FFmpeg with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"FFmpeg decoding failed: {e}")
             
-            # Method 4: Try as raw YUV420 data
-            try:
-                logger.info("Attempting YUV420 decoding...")
-                expected_size = width * height * 3 // 2  # YUV420 format
-                if len(image_data) >= expected_size:
-                    # Reshape as YUV420
-                    yuv_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
-                    yuv_image = yuv_data.reshape((height * 3 // 2, width))
+    #         # Method 4: Try as raw YUV420 data
+    #         try:
+    #             logger.info("Attempting YUV420 decoding...")
+    #             expected_size = width * height * 3 // 2  # YUV420 format
+    #             if len(image_data) >= expected_size:
+    #                 # Reshape as YUV420
+    #                 yuv_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
+    #                 yuv_image = yuv_data.reshape((height * 3 // 2, width))
                     
-                    # Convert YUV420 to BGR
-                    image = cv2.cvtColor(yuv_image, cv2.COLOR_YUV2BGR_I420)
-                    decoding_method = "yuv420"
-                    logger.info(f"Successfully decoded YUV420 with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"YUV420 decoding failed: {e}")
+    #                 # Convert YUV420 to BGR
+    #                 image = cv2.cvtColor(yuv_image, cv2.COLOR_YUV2BGR_I420)
+    #                 decoding_method = "yuv420"
+    #                 logger.info(f"Successfully decoded YUV420 with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"YUV420 decoding failed: {e}")
             
-            # Method 5: Try as raw RGB data
-            try:
-                logger.info("Attempting raw RGB decoding...")
-                expected_size = width * height * 3  # RGB format
-                if len(image_data) >= expected_size:
-                    rgb_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
-                    image = rgb_data.reshape((height, width, 3))
-                    # Convert RGB to BGR for OpenCV
-                    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                    decoding_method = "raw_rgb"
-                    logger.info(f"Successfully decoded raw RGB with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"Raw RGB decoding failed: {e}")
+    #         # Method 5: Try as raw RGB data
+    #         try:
+    #             logger.info("Attempting raw RGB decoding...")
+    #             expected_size = width * height * 3  # RGB format
+    #             if len(image_data) >= expected_size:
+    #                 rgb_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
+    #                 image = rgb_data.reshape((height, width, 3))
+    #                 # Convert RGB to BGR for OpenCV
+    #                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    #                 decoding_method = "raw_rgb"
+    #                 logger.info(f"Successfully decoded raw RGB with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"Raw RGB decoding failed: {e}")
             
-            # Method 6: Try as raw BGR data
-            try:
-                logger.info("Attempting raw BGR decoding...")
-                expected_size = width * height * 3  # BGR format
-                if len(image_data) >= expected_size:
-                    bgr_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
-                    image = bgr_data.reshape((height, width, 3))
-                    decoding_method = "raw_bgr"
-                    logger.info(f"Successfully decoded raw BGR with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"Raw BGR decoding failed: {e}")
+    #         # Method 6: Try as raw BGR data
+    #         try:
+    #             logger.info("Attempting raw BGR decoding...")
+    #             expected_size = width * height * 3  # BGR format
+    #             if len(image_data) >= expected_size:
+    #                 bgr_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
+    #                 image = bgr_data.reshape((height, width, 3))
+    #                 decoding_method = "raw_bgr"
+    #                 logger.info(f"Successfully decoded raw BGR with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"Raw BGR decoding failed: {e}")
             
-            # Method 7: Try as grayscale and convert to BGR
-            try:
-                logger.info("Attempting grayscale decoding...")
-                expected_size = width * height  # Grayscale format
-                if len(image_data) >= expected_size:
-                    gray_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
-                    gray_image = gray_data.reshape((height, width))
-                    image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
-                    decoding_method = "grayscale"
-                    logger.info(f"Successfully decoded grayscale with shape: {image.shape}")
-                    return self.save_decoded_image(image, message_json, decoding_method)
-            except Exception as e:
-                logger.warning(f"Grayscale decoding failed: {e}")
+    #         # Method 7: Try as grayscale and convert to BGR
+    #         try:
+    #             logger.info("Attempting grayscale decoding...")
+    #             expected_size = width * height  # Grayscale format
+    #             if len(image_data) >= expected_size:
+    #                 gray_data = np.frombuffer(image_data[:expected_size], dtype=np.uint8)
+    #                 gray_image = gray_data.reshape((height, width))
+    #                 image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+    #                 decoding_method = "grayscale"
+    #                 logger.info(f"Successfully decoded grayscale with shape: {image.shape}")
+    #                 return self.save_decoded_image(image, message_json, decoding_method)
+    #         except Exception as e:
+    #             logger.warning(f"Grayscale decoding failed: {e}")
             
-            # Method 8: Try interpreting the data as a compressed format and create a dummy image
-            try:
-                logger.info("Creating visualization of the raw data...")
-                # Create a visualization by treating the data as pixel values
-                data_length = len(image_data)
+    #         # Method 8: Try interpreting the data as a compressed format and create a dummy image
+    #         try:
+    #             logger.info("Creating visualization of the raw data...")
+    #             # Create a visualization by treating the data as pixel values
+    #             data_length = len(image_data)
                 
-                # Calculate dimensions for visualization (aim for roughly square)
-                viz_width = int(np.sqrt(data_length))
-                viz_height = data_length // viz_width
+    #             # Calculate dimensions for visualization (aim for roughly square)
+    #             viz_width = int(np.sqrt(data_length))
+    #             viz_height = data_length // viz_width
                 
-                if viz_width * viz_height > 0:
-                    # Take only the data we can visualize
-                    viz_data = image_data[:viz_width * viz_height]
-                    viz_image = np.frombuffer(viz_data, dtype=np.uint8).reshape((viz_height, viz_width))
+    #             if viz_width * viz_height > 0:
+    #                 # Take only the data we can visualize
+    #                 viz_data = image_data[:viz_width * viz_height]
+    #                 viz_image = np.frombuffer(viz_data, dtype=np.uint8).reshape((viz_height, viz_width))
                     
-                    # Convert to BGR and resize to a reasonable size
-                    viz_image_bgr = cv2.cvtColor(viz_image, cv2.COLOR_GRAY2BGR)
-                    viz_image_resized = cv2.resize(viz_image_bgr, (800, 600))
+    #                 # Convert to BGR and resize to a reasonable size
+    #                 viz_image_bgr = cv2.cvtColor(viz_image, cv2.COLOR_GRAY2BGR)
+    #                 viz_image_resized = cv2.resize(viz_image_bgr, (800, 600))
                     
-                    # Add text overlay showing this is raw data visualization
-                    cv2.putText(viz_image_resized, f"RAW DATA VISUALIZATION", (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.putText(viz_image_resized, f"Data size: {data_length} bytes", (10, 70), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(viz_image_resized, f"Original dims: {viz_width}x{viz_height}", (10, 110), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    #                 # Add text overlay showing this is raw data visualization
+    #                 cv2.putText(viz_image_resized, f"RAW DATA VISUALIZATION", (10, 30), 
+    #                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    #                 cv2.putText(viz_image_resized, f"Data size: {data_length} bytes", (10, 70), 
+    #                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    #                 cv2.putText(viz_image_resized, f"Original dims: {viz_width}x{viz_height}", (10, 110), 
+    #                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     
-                    decoding_method = "raw_visualization"
-                    logger.info(f"Created raw data visualization with shape: {viz_image_resized.shape}")
-                    return self.save_decoded_image(viz_image_resized, message_json, decoding_method)
+    #                 decoding_method = "raw_visualization"
+    #                 logger.info(f"Created raw data visualization with shape: {viz_image_resized.shape}")
+    #                 return self.save_decoded_image(viz_image_resized, message_json, decoding_method)
                     
-            except Exception as e:
-                logger.warning(f"Raw data visualization failed: {e}")
+    #         except Exception as e:
+    #             logger.warning(f"Raw data visualization failed: {e}")
             
-            # If all methods fail, log debug info and save raw data
-            logger.error("All decoding methods failed")
-            logger.info(f"Image data length: {len(image_data)} bytes")
-            logger.info(f"Expected sizes - YUV420: {width * height * 3 // 2}, RGB/BGR: {width * height * 3}, Gray: {width * height}")
-            logger.info(f"First 20 bytes: {image_data[:20]}")
-            logger.info(f"Last 20 bytes: {image_data[-20:]}")
+    #         # If all methods fail, log debug info and save raw data
+    #         logger.error("All decoding methods failed")
+    #         logger.info(f"Image data length: {len(image_data)} bytes")
+    #         logger.info(f"Expected sizes - YUV420: {width * height * 3 // 2}, RGB/BGR: {width * height * 3}, Gray: {width * height}")
+    #         logger.info(f"First 20 bytes: {image_data[:20]}")
+    #         logger.info(f"Last 20 bytes: {image_data[-20:]}")
             
-            # Save raw data for debugging with better file names
-            self.save_debug_data(image_data, message_json)
+    #         # Save raw data for debugging with better file names
+    #         self.save_debug_data(image_data, message_json)
             
-            return None
+    #         return None
             
-        except Exception as e:
-            logger.error(f"Error decoding image from Kafka: {e}")
-            logger.error(f"Message type: {type(message_value)}")
-            return None
+    #     except Exception as e:
+    #         logger.error(f"Error decoding image from Kafka: {e}")
+    #         logger.error(f"Message type: {type(message_value)}")
+    #         return None
 
-    def save_decoded_image(self, image, message_json, decoding_method):
-        """Save successfully decoded image in viewable format"""
+    def decode_image_from_kafka(self, message_value):
+        """CHANGE 4: Updated to handle your actual message format"""
         try:
-            self.frame_counter += 1
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            frame_seq = message_json.get('frame_seq', 0)
+            if not isinstance(message_value, dict):
+                logger.warning(f"Message value is not a dictionary: {type(message_value)}")
+                return None, {}
             
-            # Save as PNG (lossless) and JPEG (smaller file)
-            base_filename = f"frame_{self.frame_counter:06d}_seq{frame_seq}_{decoding_method}_{timestamp}"
+            frame_data = message_value
+            logger.info(f"Message keys: {list(frame_data.keys())}")
             
-            png_path = os.path.join(self.output_dir, f"{base_filename}.png")
-            jpg_path = os.path.join(self.output_dir, f"{base_filename}.jpg")
-            
-            # Save both formats
-            cv2.imwrite(png_path, image)
-            cv2.imwrite(jpg_path, image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            
-            logger.info(f"Successfully saved decoded image:")
-            logger.info(f"  PNG: {png_path}")
-            logger.info(f"  JPEG: {jpg_path}")
-            logger.info(f"  Method: {decoding_method}")
-            logger.info(f"  Shape: {image.shape}")
-            
-            # Also save metadata
-            metadata_path = os.path.join(self.output_dir, f"{base_filename}_metadata.json")
+            # CHANGE 5: Extract metadata from your actual format
             metadata = {
-                'frame_number': self.frame_counter,
-                'frame_seq': frame_seq,
-                'timestamp': timestamp,
-                'decoding_method': decoding_method,
-                'image_shape': list(image.shape),
-                'resolution': message_json.get('resolution', {}),
-                'format': message_json.get('format', 'unknown'),
-                'message_timestamp': message_json.get('timestamp', 0),
-                'files': {
-                    'png': os.path.basename(png_path),
-                    'jpg': os.path.basename(jpg_path)
-                }
+                "store_id": frame_data.get("store_id"),
+                "camera_id": frame_data.get("camera_id"),
+                "stream_name": frame_data.get("stream_name"),
+                "node_ip": frame_data.get("node_ip"),
+                "processor_id": frame_data.get("processor_id"),
+                "timestamp": frame_data.get("timestamp"),
+                "sequence_number": frame_data.get("sequence_number"),
+                "width": frame_data.get("width", 1920),
+                "height": frame_data.get("height", 1080),
+                "format": frame_data.get("format", "jpeg"),
+                "fps": frame_data.get("fps", 20.0),
+                "original_size": frame_data.get("original_size", 0)
             }
             
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
+            # CHANGE 6: Handle frame_data correctly (base64 format)
+            if "frame_data" not in frame_data:
+                logger.warning("Message missing 'frame_data' field")
+                return None, metadata
             
-            return image
+            frame_encoded_data = frame_data["frame_data"]
+            
+            # Handle both formats: direct string or nested dict
+            if isinstance(frame_encoded_data, dict):
+                if "frame" in frame_encoded_data:
+                    frame_encoded_data = frame_encoded_data["frame"]
+                    metadata["inner_frame_id"] = frame_encoded_data.get("frame_id")
+                else:
+                    logger.warning("frame_data dict missing 'frame' field")
+                    return None, metadata
+            elif not isinstance(frame_encoded_data, str):
+                logger.warning(f"frame_data has unexpected type: {type(frame_encoded_data)}")
+                return None, metadata
+            
+            if not frame_encoded_data:
+                logger.warning("Empty frame_data")
+                return None, metadata
+            
+            # CHANGE 7: Decode base64 data (your format uses base64, not hex)
+            try:
+                # Your data is base64 encoded (starts with /9j/ for JPEG)
+                if frame_encoded_data.startswith('/9j/') or '/' in frame_encoded_data or '+' in frame_encoded_data:
+                    logger.debug("Decoding base64 frame data")
+                    image_data = base64.b64decode(frame_encoded_data)
+                else:
+                    # Fallback to hex if needed
+                    logger.debug("Attempting hex decode as fallback")
+                    image_data = bytes.fromhex(frame_encoded_data)
+                
+                # Convert to OpenCV image
+                nparr = np.frombuffer(image_data, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if image is not None:
+                    logger.info(f"Successfully decoded image with shape: {image.shape}")
+                    return image, metadata
+                else:
+                    logger.warning("Failed to decode image from bytes")
+                    return None, metadata
+                    
+            except Exception as e:
+                logger.error(f"Error decoding frame data: {e}")
+                return None, metadata
             
         except Exception as e:
-            logger.error(f"Failed to save decoded image: {e}")
-            return image
+            logger.error(f"Error in decode_image_from_kafka: {e}")
+            return None, {}
+
+    # def save_decoded_image(self, image, message_json, decoding_method):
+    #     """Save successfully decoded image in viewable format"""
+    #     try:
+    #         self.frame_counter += 1
+    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    #         frame_seq = message_json.get('frame_seq', 0)
+            
+    #         # Save as PNG (lossless) and JPEG (smaller file)
+    #         base_filename = f"frame_{self.frame_counter:06d}_seq{frame_seq}_{decoding_method}_{timestamp}"
+            
+    #         png_path = os.path.join(self.output_dir, f"{base_filename}.png")
+    #         jpg_path = os.path.join(self.output_dir, f"{base_filename}.jpg")
+            
+    #         # Save both formats
+    #         cv2.imwrite(png_path, image)
+    #         cv2.imwrite(jpg_path, image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            
+    #         logger.info(f"Successfully saved decoded image:")
+    #         logger.info(f"  PNG: {png_path}")
+    #         logger.info(f"  JPEG: {jpg_path}")
+    #         logger.info(f"  Method: {decoding_method}")
+    #         logger.info(f"  Shape: {image.shape}")
+            
+    #         # Also save metadata
+    #         metadata_path = os.path.join(self.output_dir, f"{base_filename}_metadata.json")
+    #         metadata = {
+    #             'frame_number': self.frame_counter,
+    #             'frame_seq': frame_seq,
+    #             'timestamp': timestamp,
+    #             'decoding_method': decoding_method,
+    #             'image_shape': list(image.shape),
+    #             'resolution': message_json.get('resolution', {}),
+    #             'format': message_json.get('format', 'unknown'),
+    #             'message_timestamp': message_json.get('timestamp', 0),
+    #             'files': {
+    #                 'png': os.path.basename(png_path),
+    #                 'jpg': os.path.basename(jpg_path)
+    #             }
+    #         }
+            
+    #         with open(metadata_path, 'w') as f:
+    #             json.dump(metadata, f, indent=2)
+            
+    #         return image
+            
+    #     except Exception as e:
+    #         logger.error(f"Failed to save decoded image: {e}")
+    #         return image
+
+    def save_processed_frame(self, result, metadata, camera_id=None):
+        """CHANGE 8: Enhanced to save metadata from your message format"""
+        if result is None:
+            return
+            
+        self.frame_counter += 1
+        
+        # Extract info from metadata
+        store_id = metadata.get("store_id", "unknown")
+        sequence_number = metadata.get("sequence_number", 0)
+        timestamp = metadata.get("timestamp", datetime.now().isoformat())
+        camera_id = camera_id or metadata.get("camera_id", "unknown")
+        
+        # Clean timestamp for filename
+        clean_timestamp = timestamp.replace(":", "-").replace(".", "_")
+        
+        # Save visualization image with better naming
+        base_filename = f"store{store_id}_cam{camera_id}_seq{sequence_number}_{clean_timestamp}"
+        output_image_path = os.path.join(self.output_dir, f"{base_filename}.jpg")
+        cv2.imwrite(output_image_path, result['vis_image'])
+        
+        # Save detection data as JSON with full metadata
+        output_json_path = os.path.join(self.output_dir, f"{base_filename}_data.json")
+        result_data = {
+            # Original metadata from your message
+            "kafka_metadata": metadata,
+            
+            # Processing results
+            "frame_number": self.frame_counter,
+            "processing_timestamp": datetime.now().isoformat(),
+            "image_dimensions": result.get('image_dimensions', [metadata.get("width", 1920), metadata.get("height", 1080)]),
+            "store_area": result.get('store_area', [0, 0, metadata.get("width", 1920), metadata.get("height", 1080)]),
+            "total_detections": result.get('total_detections', 0),
+            "valid_detections": result.get('valid_detections', 0),
+            "detection_data": result.get('detections', []),
+            
+            # File info
+            "output_files": {
+                "image": os.path.basename(output_image_path),
+                "data": os.path.basename(output_json_path)
+            }
+        }
+        
+        with open(output_json_path, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        
+        logger.info(f"Processed frame {self.frame_counter} saved:")
+        logger.info(f"  Image: {output_image_path}")
+        logger.info(f"  Data: {output_json_path}")
+        logger.info(f"  Store: {store_id}, Camera: {camera_id}, Sequence: {sequence_number}")
+        logger.info(f"  Detections: {len(result.get('detections', []))}")
 
     def save_debug_data(self, image_data, message_json):
         """Save raw data and metadata for debugging"""
@@ -859,8 +999,65 @@ class KafkaImageProcessor:
         logger.info(f"Detection data saved to: {output_json_path}")
         logger.info(f"Found {len(result.get('detections', []))} valid person detections")
 
+    # def run(self):
+    #     """Main processing loop for Kafka messages"""
+    #     logger.info("Starting Kafka image processing...")
+    #     logger.info(f"Listening to topic: {self.kafka_topic}")
+    #     logger.info(f"Bootstrap servers: {self.kafka_bootstrap_servers}")
+    #     logger.info(f"Output directory: {self.output_dir}")
+        
+    #     try:
+    #         while True:
+    #             try:
+    #                 # Poll for messages
+    #                 message_batch = self.consumer.poll(timeout_ms=1000)
+                    
+    #                 if not message_batch:
+    #                     logger.debug("No messages received, continuing...")
+    #                     continue
+                    
+    #                 for topic_partition, messages in message_batch.items():
+    #                     for message in messages:
+    #                         logger.info(f"Received message from {topic_partition.topic}:{topic_partition.partition} offset {message.offset}")
+                            
+    #                         # Decode image from Kafka message
+    #                         camera_id = message.key.decode('utf-8')
+    #                         logger.info(f"camera id is {camera_id}")
+    #                         image = self.decode_image_from_kafka(message.value)
+                            
+    #                         if image is not None:
+    #                             # Process the image
+    #                             start_time = time.time()
+    #                             result = self.process_image(image)
+    #                             processing_time = time.time() - start_time
+                                
+    #                             # Generate timestamp
+    #                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                                
+    #                             # Save results
+    #                             self.save_processed_frame(result, timestamp, camera_id)
+                                
+    #                             logger.info(f"Frame processed in {processing_time:.2f}s")
+    #                         else:
+    #                             logger.warning("Failed to decode image from Kafka message - saved raw data for debugging")
+                    
+    #             except KafkaError as e:
+    #                 logger.error(f"Kafka error: {e}")
+    #                 time.sleep(1)
+                    
+    #             except Exception as e:
+    #                 logger.error(f"Error processing message: {e}", exc_info=True)
+    #                 time.sleep(1)
+                    
+    #     except KeyboardInterrupt:
+    #         logger.info("Processing interrupted by user")
+    #     finally:
+    #         if self.consumer:
+    #             self.consumer.close()
+    #             logger.info("Kafka consumer closed")
+
     def run(self):
-        """Main processing loop for Kafka messages"""
+        """CHANGE 9: Updated main loop to handle new message format"""
         logger.info("Starting Kafka image processing...")
         logger.info(f"Listening to topic: {self.kafka_topic}")
         logger.info(f"Bootstrap servers: {self.kafka_bootstrap_servers}")
@@ -880,10 +1077,22 @@ class KafkaImageProcessor:
                         for message in messages:
                             logger.info(f"Received message from {topic_partition.topic}:{topic_partition.partition} offset {message.offset}")
                             
-                            # Decode image from Kafka message
-                            camera_id = message.key.decode('utf-8')
-                            logger.info(f"camera id is {camera_id}")
-                            image = self.decode_image_from_kafka(message.value)
+                            # CHANGE 10: Extract camera_id from message value, not key
+                            camera_id = "unknown"
+                            if message.key:
+                                try:
+                                    camera_id = message.key.decode('utf-8')
+                                    logger.info(f"Camera ID from key: {camera_id}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to decode message key: {e}")
+                            
+                            # Decode image and metadata from Kafka message
+                            image, metadata = self.decode_image_from_kafka(message.value)
+                            
+                            # Also try to get camera_id from message content
+                            if metadata.get("camera_id"):
+                                camera_id = metadata["camera_id"]
+                                logger.info(f"Camera ID from metadata: {camera_id}")
                             
                             if image is not None:
                                 # Process the image
@@ -891,19 +1100,21 @@ class KafkaImageProcessor:
                                 result = self.process_image(image)
                                 processing_time = time.time() - start_time
                                 
-                                # Generate timestamp
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                                
-                                # Save results
-                                self.save_processed_frame(result, timestamp, camera_id)
+                                # Save results with full metadata
+                                self.save_processed_frame(result, metadata, camera_id)
                                 
                                 logger.info(f"Frame processed in {processing_time:.2f}s")
+                                logger.info(f"Store: {metadata.get('store_id')}, Camera: {camera_id}, "
+                                          f"Sequence: {metadata.get('sequence_number')}")
                             else:
-                                logger.warning("Failed to decode image from Kafka message - saved raw data for debugging")
-                    
-                except KafkaError as e:
-                    logger.error(f"Kafka error: {e}")
-                    time.sleep(1)
+                                logger.warning("Failed to decode image from Kafka message")
+                                # Still save metadata for debugging
+                                if metadata:
+                                    debug_file = os.path.join(self.output_dir, 
+                                        f"failed_decode_{metadata.get('store_id', 'unknown')}_"
+                                        f"{metadata.get('sequence_number', 0)}.json")
+                                    with open(debug_file, 'w') as f:
+                                        json.dump(metadata, f, indent=2)
                     
                 except Exception as e:
                     logger.error(f"Error processing message: {e}", exc_info=True)
@@ -1191,10 +1402,13 @@ def main():
     parser = argparse.ArgumentParser(description='Kafka Image Processor for Human Detection')
     parser.add_argument('--mode', choices=['kafka', 'folder', 'single'], default='kafka',
                        help='Processing mode: kafka (stream from Kafka), folder (process folder), or single (process single image)')
-    parser.add_argument('--kafka-servers', default='35.181.243.135:29092',
-                       help='Kafka bootstrap servers (default: 35.181.243.135:29092)')
-    parser.add_argument('--kafka-topic', default='store-109',
-                       help='Kafka topic to consume from (default: store-109)')
+    
+    # CHANGE 11: Remove hardcoded defaults, use environment variables
+    parser.add_argument('--kafka-servers', default=None,
+                       help='Kafka bootstrap servers (uses KAFKA_BOOTSTRAP_SERVERS env var if not specified)')
+    parser.add_argument('--kafka-topic', default=None,
+                       help='Kafka topic to consume from (uses KAFKA_TOPIC env var if not specified)')
+    
     parser.add_argument('--input', '-i', help='Input folder containing images (for folder mode)')
     parser.add_argument('--output', '-o', required=True, help='Output folder for processed images and data')
     parser.add_argument('--device', default=None, help='Device to use (cuda:0, cpu, etc.)')
@@ -1220,18 +1434,17 @@ def main():
     
     try:
         if args.mode == 'kafka':
-            # Kafka streaming mode
-            logger.info("Starting Kafka streaming mode...")
+            # CHANGE 12: Pass None to use environment variables
             processor = KafkaImageProcessor(
-                kafka_bootstrap_servers=args.kafka_servers,
-                kafka_topic=args.kafka_topic,
+                kafka_bootstrap_servers=args.kafka_servers,  # Will use env var if None
+                kafka_topic=args.kafka_topic,               # Will use env var if None
                 device=device,
                 output_dir=args.output
             )
             processor.run()
             
         elif args.mode == 'single':
-            # Process single image
+            # Process single image (unchanged)
             if not os.path.exists(args.single_image):
                 logger.error(f"Image file not found: {args.single_image}")
                 return
@@ -1244,7 +1457,7 @@ def main():
                 logger.info(f"Successfully processed single image with {result['valid_detections']} detections")
                 
         elif args.mode == 'folder':
-            # Process folder
+            # Process folder (unchanged)
             if not os.path.exists(args.input):
                 logger.error(f"Input folder not found: {args.input}")
                 return
