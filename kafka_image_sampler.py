@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, json, time, base64, argparse, logging
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Tuple
 from collections import defaultdict
 
 import cv2
@@ -59,7 +60,7 @@ def draw_top_right_label(img, text, pad=10, scale=0.8, thickness=2):
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-def timestamp_for_name(iso_ts: str | None) -> str:
+def timestamp_for_name(iso_ts: Optional[str]) -> str:
     t = iso_ts or datetime.utcnow().isoformat()
     return t.replace(":", "-").replace(".", "_")
 
@@ -122,8 +123,9 @@ class Sampler:
         self.mode = mode
         self.interval = interval_seconds
         self.every_n = every_n
-        self.last_time: dict[tuple, datetime] = {}
-        self.counts: defaultdict[tuple, int] = defaultdict(int)
+        self.last_time: Dict[Tuple[str, str], datetime] = {}
+        self.counts: defaultdict[Tuple[str, str], int] = defaultdict(int)
+
 
     def should_save(self, store_id, camera_id, now: datetime) -> bool:
         key = (store_id, camera_id)
@@ -249,12 +251,14 @@ def main():
             # Original (with label only)
             orig = img.copy()
             draw_top_right_label(orig, f"STORE {store_id} | CAMERA {camera_id}")
-            cv2.imwrite(p_orig, orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            ok = cv2.imwrite(p_orig, orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok: log.warning(f"Failed to write {p_orig}")
 
             # Plain resized (with label)
             resized = cv2.resize(img, (args.resize_width, args.resize_height))
             draw_top_right_label(resized, f"STORE {store_id} | CAMERA {camera_id}")
-            cv2.imwrite(p_resz, resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            ok = cv2.imwrite(p_resz, resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok: log.warning(f"Failed to write {p_resz}")
 
             # BBoxes (optional): draw on ORIGINAL-SIZED canvas, then resize AFTER drawing
             boxes_original = []
@@ -265,7 +269,8 @@ def main():
                 if boxes_original:
                     draw_bboxes(bbox_img_orig, boxes_original, (0,255,255), 2)
                 draw_top_right_label(bbox_img_orig, f"STORE {store_id} | CAMERA {camera_id}")
-                cv2.imwrite(p_bbox_o, bbox_img_orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                ok = cv2.imwrite(p_bbox_o, bbox_img_orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok: log.warning(f"Failed to write {p_bbox_o}")
 
                 # Now make a resized artifact AFTER drawing to preserve alignment
                 bbox_img_resized = cv2.resize(bbox_img_orig, (args.resize_width, args.resize_height))
@@ -281,7 +286,8 @@ def main():
                 # Still create bbox files for a consistent triplet, even when detector is off
                 bbox_img_orig = img.copy()
                 draw_top_right_label(bbox_img_orig, f"STORE {store_id} | CAMERA {camera_id}")
-                cv2.imwrite(p_bbox_o, bbox_img_orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                ok = cv2.imwrite(p_bbox_r, bbox_img_resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok: log.warning(f"Failed to write {p_bbox_r}")
 
                 bbox_img_resized = cv2.resize(bbox_img_orig, (args.resize_width, args.resize_height))
                 draw_top_right_label(bbox_img_resized, f"STORE {store_id} | CAMERA {camera_id}")
