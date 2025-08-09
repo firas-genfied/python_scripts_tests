@@ -967,37 +967,37 @@ class KafkaImageProcessor:
             "valid_detections": int(len(valid_detections))
         }
 
-    def save_processed_frame(self, result, timestamp, camera_id=None):
-        """Save the processed frame and detection data"""
-        if result is None:
-            return
+    # def save_processed_frame(self, result, timestamp, camera_id=None):
+    #     """Save the processed frame and detection data"""
+    #     if result is None:
+    #         return
             
-        self.frame_counter += 1
+    #     self.frame_counter += 1
         
-        # Save visualization image
-        output_image_path = os.path.join(self.output_dir, f"frame_{self.frame_counter:06d}_{timestamp}.jpg")
-        cv2.imwrite(output_image_path, result['vis_image'])
+    #     # Save visualization image
+    #     output_image_path = os.path.join(self.output_dir, f"frame_{self.frame_counter:06d}_{timestamp}.jpg")
+    #     cv2.imwrite(output_image_path, result['vis_image'])
         
-        # Save detection data as JSON
-        output_json_path = os.path.join(self.output_dir, f"frame_{self.frame_counter:06d}_{timestamp}.json")
-        result_data = {
-            "camera_id": camera_id,
-            "frame_number": self.frame_counter,
-            "timestamp": timestamp,
-            "image_dimensions": result.get('image_dimensions', [800, 600]),  # Default dimensions if not available
-            "store_area": result.get('store_area', [0, 0, 800, 600]),  # Default store area
-            "total_detections": result.get('total_detections', 0),
-            "valid_detections": result.get('valid_detections', 0),
-            "detection_data": result.get('detections', []),
-            "processing_timestamp": datetime.now().isoformat()
-        }
+    #     # Save detection data as JSON
+    #     output_json_path = os.path.join(self.output_dir, f"frame_{self.frame_counter:06d}_{timestamp}.json")
+    #     result_data = {
+    #         "camera_id": camera_id,
+    #         "frame_number": self.frame_counter,
+    #         "timestamp": timestamp,
+    #         "image_dimensions": result.get('image_dimensions', [800, 600]),  # Default dimensions if not available
+    #         "store_area": result.get('store_area', [0, 0, 800, 600]),  # Default store area
+    #         "total_detections": result.get('total_detections', 0),
+    #         "valid_detections": result.get('valid_detections', 0),
+    #         "detection_data": result.get('detections', []),
+    #         "processing_timestamp": datetime.now().isoformat()
+    #     }
         
-        with open(output_json_path, 'w') as f:
-            json.dump(result_data, f, indent=2)
+    #     with open(output_json_path, 'w') as f:
+    #         json.dump(result_data, f, indent=2)
         
-        logger.info(f"Processed frame {self.frame_counter} saved to: {output_image_path}")
-        logger.info(f"Detection data saved to: {output_json_path}")
-        logger.info(f"Found {len(result.get('detections', []))} valid person detections")
+    #     logger.info(f"Processed frame {self.frame_counter} saved to: {output_image_path}")
+    #     logger.info(f"Detection data saved to: {output_json_path}")
+    #     logger.info(f"Found {len(result.get('detections', []))} valid person detections")
 
     # def run(self):
     #     """Main processing loop for Kafka messages"""
