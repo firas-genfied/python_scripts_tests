@@ -25,7 +25,49 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("kafka_image_sampler")
+
+def setup_logging(output_root):
+    """Setup logging to both console and file"""
+    
+    # Create logs directory
+    log_dir = os.path.join(output_root, "logs")
+    ensure_dir(log_dir)
+    
+    # Create log filename with timestamp
+    log_filename = f"kafka_sampler_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
+    log_path = os.path.join(log_dir, log_filename)
+    
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    
+    # Root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Console handler (existing behavior)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(detailed_formatter)
+    
+    # File handler (new)
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(detailed_formatter)
+    
+    # Clear any existing handlers and add new ones
+    root_logger.handlers.clear()
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+    
+    return log_path
+
+# Remove your existing logging.basicConfig() and replace with:
+# (We'll call setup_logging() in main())
+# log = logging.getLogger("kafka_image_sampler")
+
+# log = logging.getLogger("kafka_image_sampler")
 
 # ---------- AWS Secrets ----------
 def fetch_kafka_creds():
@@ -95,7 +137,10 @@ def scale_boxes(boxes, sx, sy):
 
 # ---------- Decoding ----------
 def decode_message_to_image_and_meta(msg_dict):
-    """Same function but with image identifier in logs"""
+    """
+    Expects dict with keys:
+      store_id, camera_id, timestamp, frame_data (base64), width, height, ...
+    """
     if not isinstance(msg_dict, dict):
         return None, {}
         
@@ -123,25 +168,29 @@ def decode_message_to_image_and_meta(msg_dict):
         img_bytes = base64.b64decode(frame_data)
         decoded_size = len(img_bytes)
         
-        # INCLUDE IMAGE_ID IN ALL LOGS
-        log.info(f"[{image_id}] Image {width}x{height}: base64={len(frame_data)} chars, "
-                f"decoded={decoded_size} bytes, expected={expected_raw_size} bytes, "
-                f"ratio={decoded_size/expected_raw_size:.2f}")
+        # DETAILED LOGGING
+        ratio = decoded_size/expected_raw_size if expected_raw_size > 0 else 0
+        log.info(f"[{image_id}] DECODE_ATTEMPT: {width}x{height} | "
+                f"base64={len(frame_data)}chars | decoded={decoded_size}bytes | "
+                f"expected={expected_raw_size}bytes | ratio={ratio:.3f}")
 
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is not None:
             std_dev = np.std(img)
-            log.info(f"[{image_id}] Decode SUCCESS: shape={img.shape}, std_dev={std_dev:.1f}")
+            log.info(f"[{base}] SAVING_IMAGES: std_dev={std_dev:.1f} | dir={leaf_dir}")
+            mean_val = np.mean(img)
+            log.info(f"[{image_id}] DECODE_SUCCESS: shape={img.shape} | "
+                    f"std_dev={std_dev:.1f} | mean={mean_val:.1f}")
+            log.info(f"[{base}] SAVE_COMPLETE: {len(os.listdir(leaf_dir))} total files in directory")
         else:
-            log.warning(f"[{image_id}] Decode FAILED: cv2.imdecode returned None")
+            log.warning(f"[{image_id}] DECODE_FAILED: cv2.imdecode returned None")
             
         return img, metadata
     except Exception as e:
-        log.warning(f"[{image_id}] Failed to decode base64 frame: {e}")
+        log.error(f"[{image_id}] DECODE_ERROR: {e}")
         return None, metadata
-
 # ---------- Sampling policies ----------
 class Sampler:
     def __init__(self, mode, interval_seconds=None, every_n=None):
@@ -193,8 +242,13 @@ def main():
 
     args = ap.parse_args()
 
+    log_file_path = setup_logging(args.output_root)
+    log.info(f"Logging to file: {log_file_path}")
+    log.info(f"Starting Kafka image sampler with args: {vars(args)}")
+
     store_ids = [s.strip() for s in args.store_ids.split(",") if s.strip()]
     topics = [f"{args.topic_prefix}{sid}" for sid in store_ids]
+
 
     username, password = fetch_kafka_creds()
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").split(",")
