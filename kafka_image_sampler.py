@@ -12,6 +12,8 @@ import boto3
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 
+import base64
+
 # Optional heavy models only if needed
 def maybe_load_detector(enable):
     if not enable:
