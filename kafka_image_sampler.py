@@ -109,9 +109,22 @@ def decode_message_to_image_and_meta(msg_dict):
     if not frame_data or not isinstance(frame_data, str):
         return None, metadata
     try:
+        width = metadata.get("width", 0)
+        height = metadata.get("height", 0)
+        expected_raw_size = width * height * 3
         img_bytes = base64.b64decode(frame_data)
+        decoded_size = len(img_bytes)
+        log.info(f"Image {width}x{height}: base64={len(frame_data)} chars, "
+                f"decoded={decoded_size} bytes, expected={expected_raw_size} bytes, "
+                f"ratio={decoded_size/expected_raw_size:.2f}")
+
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is not None:
+            std_dev = np.std(img)
+            log.info(f"Decode SUCCESS: shape={img.shape}, std_dev={std_dev:.1f}")
+         else:
+            log.warning(f"Decode FAILED: cv2.imdecode returned None")
         return img, metadata
     except Exception as e:
         log.warning(f"Failed to decode base64 frame: {e}")
