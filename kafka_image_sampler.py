@@ -10,9 +10,7 @@ import torch
 from kafka import KafkaConsumer
 import boto3
 from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
 
-import base64
 
 # Optional heavy models only if needed
 def maybe_load_detector(enable):
@@ -131,60 +129,55 @@ def scale_boxes(boxes, sx, sy):
 
 # ---------- Decoding ----------
 def decode_message_to_image_and_meta(msg_dict):
-    """
-    Expects dict with keys:
-      store_id, camera_id, timestamp, frame_data (base64), width, height, ...
-    """
     if not isinstance(msg_dict, dict):
         return None, {}
-        
-    # Metadata passthrough
+
     meta_keys = ("stream_name","store_id","camera_id","node_ip","processor_id",
                  "timestamp","sequence_number","width","height","format","fps","original_size")
     metadata = {k: msg_dict.get(k) for k in meta_keys}
-    
-    # CREATE IDENTIFIER EARLY
+
     store_id = str(metadata.get("store_id", "unknown"))
     camera_id = str(metadata.get("camera_id", "unknown"))
     timestamp = metadata.get("timestamp", "")
     ts_name = timestamp_for_name(timestamp)
     image_id = f"store{store_id}_cam{camera_id}_{ts_name}"
-    
+
     frame_data = msg_dict.get("frame_data")
     if not frame_data or not isinstance(frame_data, str):
         log.warning(f"[{image_id}] No valid frame_data")
         return None, metadata
-        
+
     try:
-        width = metadata.get("width", 0)
-        height = metadata.get("height", 0)
+        # Safe casts
+        try:
+            width = int(metadata.get("width") or 0)
+            height = int(metadata.get("height") or 0)
+        except (TypeError, ValueError):
+            width, height = 0, 0
+
         expected_raw_size = width * height * 3
         img_bytes = base64.b64decode(frame_data)
         decoded_size = len(img_bytes)
-        
-        # DETAILED LOGGING
-        ratio = decoded_size/expected_raw_size if expected_raw_size > 0 else 0
-        log.info(f"[{image_id}] DECODE_ATTEMPT: {width}x{height} | "
-                f"base64={len(frame_data)}chars | decoded={decoded_size}bytes | "
-                f"expected={expected_raw_size}bytes | ratio={ratio:.3f}")
+        ratio = decoded_size/expected_raw_size if expected_raw_size > 0 else 0.0
+
+        log.info(f"[{image_id}] DECODE_ATTEMPT: {width}x{height} | base64={len(frame_data)}chars | "
+                 f"decoded={decoded_size}bytes | expected={expected_raw_size}bytes | ratio={ratio:.3f}")
 
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if img is not None:
-            std_dev = np.std(img)
-            log.info(f"[{base}] SAVING_IMAGES: std_dev={std_dev:.1f} | dir={leaf_dir}")
-            mean_val = np.mean(img)
-            log.info(f"[{image_id}] DECODE_SUCCESS: shape={img.shape} | "
-                    f"std_dev={std_dev:.1f} | mean={mean_val:.1f}")
-            log.info(f"[{base}] SAVE_COMPLETE: {len(os.listdir(leaf_dir))} total files in directory")
+            std_dev = float(np.std(img))
+            mean_val = float(np.mean(img))
+            log.info(f"[{image_id}] DECODE_SUCCESS: shape={img.shape} | std_dev={std_dev:.1f} | mean={mean_val:.1f}")
         else:
             log.warning(f"[{image_id}] DECODE_FAILED: cv2.imdecode returned None")
-            
+
         return img, metadata
     except Exception as e:
         log.error(f"[{image_id}] DECODE_ERROR: {e}")
         return None, metadata
+
 # ---------- Sampling policies ----------
 class Sampler:
     def __init__(self, mode, interval_seconds=None, every_n=None):
@@ -326,6 +319,9 @@ def main():
             draw_top_right_label(orig, f"STORE {store_id} | CAMERA {camera_id}")
             ok = cv2.imwrite(p_orig, orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ok: log.warning(f"Failed to write {p_orig}")
+            std_dev = float(np.std(img))
+            log.info(f"[{base}] SAVING_IMAGES: std_dev={std_dev:.1f} | dir={leaf_dir}")
+            # log.info(f"[{base}] SAVE_COMPLETE: {len(os.listdir(leaf_dir))} total files in directory")
 
             # Plain resized (with label)
             resized = cv2.resize(img, (args.resize_width, args.resize_height))
@@ -356,15 +352,18 @@ def main():
                 sx, sy = args.resize_width / w0, args.resize_height / h0
                 boxes_resized = scale_boxes(boxes_original, sx, sy)
             else:
-                # Still create bbox files for a consistent triplet, even when detector is off
+                # Create label-only variants for consistency
                 bbox_img_orig = img.copy()
                 draw_top_right_label(bbox_img_orig, f"STORE {store_id} | CAMERA {camera_id}")
-                ok = cv2.imwrite(p_bbox_r, bbox_img_resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                if not ok: log.warning(f"Failed to write {p_bbox_r}")
+                ok = cv2.imwrite(p_bbox_o, bbox_img_orig, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    log.warning(f"Failed to write {p_bbox_o}")
 
                 bbox_img_resized = cv2.resize(bbox_img_orig, (args.resize_width, args.resize_height))
                 draw_top_right_label(bbox_img_resized, f"STORE {store_id} | CAMERA {camera_id}")
-                cv2.imwrite(p_bbox_r, bbox_img_resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                ok = cv2.imwrite(p_bbox_r, bbox_img_resized, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    log.warning(f"Failed to write {p_bbox_r}")
 
             # Optional small metadata file per set
             meta_path = os.path.join(leaf_dir, f"{base}.json")
