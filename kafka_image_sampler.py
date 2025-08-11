@@ -21,11 +21,6 @@ def maybe_load_detector(enable):
     model = pred.model.eval()
     return pred, model
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-
 def setup_logging(output_root):
     """Setup logging to both console and file"""
     
@@ -63,11 +58,8 @@ def setup_logging(output_root):
     
     return log_path
 
-# Remove your existing logging.basicConfig() and replace with:
-# (We'll call setup_logging() in main())
-# log = logging.getLogger("kafka_image_sampler")
 
-# log = logging.getLogger("kafka_image_sampler")
+log = logging.getLogger("kafka_image_sampler")
 
 # ---------- AWS Secrets ----------
 def fetch_kafka_creds():
