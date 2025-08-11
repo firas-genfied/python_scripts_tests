@@ -95,39 +95,51 @@ def scale_boxes(boxes, sx, sy):
 
 # ---------- Decoding ----------
 def decode_message_to_image_and_meta(msg_dict):
-    """
-    Expects dict with keys:
-      store_id, camera_id, timestamp, frame_data (base64), width, height, ...
-    """
+    """Same function but with image identifier in logs"""
     if not isinstance(msg_dict, dict):
         return None, {}
+        
     # Metadata passthrough
     meta_keys = ("stream_name","store_id","camera_id","node_ip","processor_id",
                  "timestamp","sequence_number","width","height","format","fps","original_size")
     metadata = {k: msg_dict.get(k) for k in meta_keys}
+    
+    # CREATE IDENTIFIER EARLY
+    store_id = str(metadata.get("store_id", "unknown"))
+    camera_id = str(metadata.get("camera_id", "unknown"))
+    timestamp = metadata.get("timestamp", "")
+    ts_name = timestamp_for_name(timestamp)
+    image_id = f"store{store_id}_cam{camera_id}_{ts_name}"
+    
     frame_data = msg_dict.get("frame_data")
     if not frame_data or not isinstance(frame_data, str):
+        log.warning(f"[{image_id}] No valid frame_data")
         return None, metadata
+        
     try:
         width = metadata.get("width", 0)
         height = metadata.get("height", 0)
         expected_raw_size = width * height * 3
         img_bytes = base64.b64decode(frame_data)
         decoded_size = len(img_bytes)
-        log.info(f"Image {width}x{height}: base64={len(frame_data)} chars, "
+        
+        # INCLUDE IMAGE_ID IN ALL LOGS
+        log.info(f"[{image_id}] Image {width}x{height}: base64={len(frame_data)} chars, "
                 f"decoded={decoded_size} bytes, expected={expected_raw_size} bytes, "
                 f"ratio={decoded_size/expected_raw_size:.2f}")
 
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
         if img is not None:
             std_dev = np.std(img)
-            log.info(f"Decode SUCCESS: shape={img.shape}, std_dev={std_dev:.1f}")
-         else:
-            log.warning(f"Decode FAILED: cv2.imdecode returned None")
+            log.info(f"[{image_id}] Decode SUCCESS: shape={img.shape}, std_dev={std_dev:.1f}")
+        else:
+            log.warning(f"[{image_id}] Decode FAILED: cv2.imdecode returned None")
+            
         return img, metadata
     except Exception as e:
-        log.warning(f"Failed to decode base64 frame: {e}")
+        log.warning(f"[{image_id}] Failed to decode base64 frame: {e}")
         return None, metadata
 
 # ---------- Sampling policies ----------
