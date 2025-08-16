@@ -1,0 +1,20 @@
+apiVersion: v1
+data:
+  KAFKA_BOOTSTRAP_SERVERS: 4.232.129.207:29092
+  KAFKA_TOPIC_PATTERN: ^store-([0-9]+)$
+  KAFKA_TOPICS: '["store-27"]'
+  STORE_IDS: '["27","19","20","21","1"]'
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2025-06-16T10:33:52Z"
+  name: reid-processor-config
+  namespace: genfied
+  ownerReferences:
+  - apiVersion: stream.aiservice.genfied.com/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ServiceRegistry
+    name: reid-processor
+    uid: bc4600fa-642e-4470-b2ac-29ad7e17e5c8
+  resourceVersion: "25571883"
+  uid: 4b755d86-5b0e-404f-9efc-1601aaa766e9

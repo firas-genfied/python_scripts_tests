@@ -1,0 +1,20 @@
+apiVersion: v1
+data:
+  AUTH_ENDPOINT: http://genfied-api.xperie.nz:8000/api/v1/auth/login
+  AUTH_PASSWORD: admin1234
+  AUTH_REFRESH_INTERVAL: "1800"
+  AUTH_USERNAME: admin
+  KAFKA_BOOTSTRAP_SERVERS: 4.232.129.207:29092
+  KAFKA_CONSUMER_GROUP: reid-processor
+  KAFKA_TOPIC_PATTERN: ^store-([0-9]+)$
+  MILVUS_ROUTER_URL: http://20.244.11.233
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"AUTH_ENDPOINT":"http://genfied-api.xperie.nz:8000/api/v1/auth/login","AUTH_PASSWORD":"admin1234","AUTH_REFRESH_INTERVAL":"1800","AUTH_USERNAME":"admin","KAFKA_BOOTSTRAP_SERVERS":"4.232.129.207:29092","KAFKA_CONSUMER_GROUP":"reid-processor","KAFKA_TOPIC_PATTERN":"^store-([0-9]+)$","MILVUS_ROUTER_URL":"http://20.244.11.233"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"reid-env-config","namespace":"genfied"}}
+  creationTimestamp: "2025-04-16T08:05:47Z"
+  name: reid-env-config
+  namespace: genfied
+  resourceVersion: "6392712"
+  uid: 0b7355c5-1d76-4ab6-9fe3-9f32a7b26dfe

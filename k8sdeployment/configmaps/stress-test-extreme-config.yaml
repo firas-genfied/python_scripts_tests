@@ -1,0 +1,38 @@
+apiVersion: v1
+data:
+  LOG_LEVEL: INFO
+  PYTHONUNBUFFERED: "1"
+  extreme-150cam-args: |
+    --stores 15
+    --cameras-per-store 10
+    --fps 8.0
+    --duration 300
+    --batch-size 100
+    --batch-time 1.0
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 500
+    --buffer-size 1500
+    --batching-strategy per-camera
+  extreme-150cam-high-fps-args: |
+    --stores 10
+    --cameras-per-store 15
+    --fps 10.0
+    --duration 180
+    --batch-size 120
+    --batch-time 0.8
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 750
+    --buffer-size 2000
+    --batching-strategy per-camera
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"LOG_LEVEL":"INFO","PYTHONUNBUFFERED":"1","extreme-150cam-args":"--stores 15\n--cameras-per-store 10\n--fps 8.0\n--duration 300\n--batch-size 100\n--batch-time 1.0\n--router-url http://milvus-router.genfied.svc.cluster.local\n--max-concurrent 500\n--buffer-size 1500\n--batching-strategy per-camera\n","extreme-150cam-high-fps-args":"--stores 10\n--cameras-per-store 15\n--fps 10.0\n--duration 180\n--batch-size 120\n--batch-time 0.8\n--router-url http://milvus-router.genfied.svc.cluster.local\n--max-concurrent 750\n--buffer-size 2000\n--batching-strategy per-camera\n"},"kind":"ConfigMap","metadata":{"annotations":{},"labels":{"app":"stress-test-milvus"},"name":"stress-test-extreme-config","namespace":"genfied"}}
+  creationTimestamp: "2025-06-14T07:20:41Z"
+  labels:
+    app: stress-test-milvus
+  name: stress-test-extreme-config
+  namespace: genfied
+  resourceVersion: "23310988"
+  uid: decb5db1-3d92-4a38-9316-d6eb5397a51f

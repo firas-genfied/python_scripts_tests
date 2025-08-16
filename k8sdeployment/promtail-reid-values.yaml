@@ -1,0 +1,24 @@
+promtail:
+  enabled: true
+  config:
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    positions:
+      filename: /tmp/positions.yaml
+    scrape_configs:
+      - job_name: reid-processor-logs
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - genfied                   # ← your namespace here
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: reid                  # ← filters only Pods with app=reid
+        ignore_older: 5m                # skip existing old logs
+        static_configs:
+          - targets: [localhost]
+            labels:
+              job: reid-processor
+              __path__: /var/log/pods/**/genfied/**/*.log

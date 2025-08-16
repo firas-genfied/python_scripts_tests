@@ -1,0 +1,43 @@
+loki:
+  persistence:
+    enabled: true
+    size: 10Gi
+
+grafana:
+  enabled: false
+
+promtail:
+  enabled: true
+
+  extraVolumes:
+    - name: positions
+      emptyDir: {}
+
+  extraVolumeMounts:
+    - name: positions
+      mountPath: /run/promtail
+
+  config:
+    server:
+      http_listen_port: 3101
+      grpc_listen_port: 9095
+
+    positions:
+      filename: /run/promtail/positions.yaml
+
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+
+    snippets:
+      extraScrapeConfigs: |
+        - job_name: genfied-namespace-logs
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: ["genfied"]
+          ignore_older: 5m
+          static_configs:
+            - targets: [localhost]
+              labels:
+                job: genfied-logs
+                __path__: /var/log/pods/**/genfied/**/*.log

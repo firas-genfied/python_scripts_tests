@@ -1,0 +1,81 @@
+loki:
+  persistence:
+    enabled: true
+    size: 10Gi
+
+grafana:
+  enabled: false
+
+promtail:
+  enabled: true
+  
+  # Mount a writable directory for positions file
+  extraVolumes:
+    - name: positions
+      emptyDir: {}
+  
+  extraVolumeMounts:
+    - name: positions
+      mountPath: /run/promtail
+  
+  # Enable environment variable expansion
+  extraArgs:
+    - "-config.expand-env=true"
+  
+  config:
+    # Configure positions file in writable location
+    positions:
+      filename: /run/promtail/positions.yaml
+    
+    # Loki client configuration
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    
+    # Scrape configuration
+    scrape_configs:
+      # Default system logs
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_controller_name]
+            regex: ([0-9a-z-.]+?)(-[0-9a-f]{8,10})?
+            action: replace
+            target_label: __tmp_controller_name
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_label_app, __tmp_controller_name, __meta_kubernetes_pod_name]
+            regex: ^;*([^;]+)(;.*)?$
+            action: replace
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance, __meta_kubernetes_pod_label_release]
+            regex: ^;*([^;]+)(;.*)?$
+            action: replace
+            target_label: instance
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component, __meta_kubernetes_pod_label_component]
+            regex: ^;*([^;]+)(;.*)?$
+            action: replace
+            target_label: component
+        pipeline_stages:
+          - cri: {}
+      
+      # Specific job for genfied namespace
+      - job_name: genfied-namespace-logs
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["genfied"]
+        relabel_configs:
+          # Only scrape pods in genfied namespace
+          - source_labels: [__meta_kubernetes_namespace]
+            regex: genfied
+            action: keep
+          # Add namespace label
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          # Add pod name label
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          # Add container name label
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+        pipeline_stages:
+          - cri: {}

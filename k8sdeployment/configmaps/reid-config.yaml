@@ -1,0 +1,30 @@
+apiVersion: v1
+data:
+  system_config.json: '{  "system": {    "gpu_config": {      "enabled": true,      "devices":
+    [0],      "memory_limit_mb_per_gpu": 2048,      "batch_size_per_gpu": 12,      "load_balancing":
+    "memory_based",      "num_processors": 1    },    "thread_pool": {      "max_workers":
+    8    },    "memory_management": {      "clear_cuda_cache_interval": 300,      "gc_interval":
+    120    }  },  "milvus": {    "clients_per_store": 8,    "router_url": "http://milvus-router.genfied.svc.cluster.local"  },  "processing":
+    {    "batch_interval": 0.2,    "processing_fps": 5,    "mode": "batch"  },  "result_database":
+    {    "send_fps": 1  },  "buffer_settings": {    "max_size_per_camera": 60,    "max_total_size":
+    300,    "timeout_seconds": 5.0,    "drop_strategy": "smart",    "auto_adjust":
+    true  },  "cameras": [    {      "rtsp_url": "rtsp://admin:admin123@4.232.129.207:8554/5/7",      "camera_id":
+    1,      "store_id": 1,      "priority": 10    },    {      "rtsp_url": "rtsp://admin:admin123@4.232.129.207:8554/5/6",      "camera_id":
+    2,      "store_id": 1,      "priority": 10    }  ],  "logging": {    "level":
+    "INFO",    "file": "/var/log/rtsp-processor/processor.log",    "max_size_mb":
+    100,    "backup_count": 10,    "performance_logging_interval": 60  },  "output":
+    {    "save_debug_frames": false,    "debug_frames_dir": "/var/log/rtsp-processor/debug-frames",    "save_frame_interval":
+    30,    "send_results": true  },  "network": {    "rtsp": {      "transport": "tcp",      "reconnect_attempts":
+    5,      "reconnect_delay": 5    },    "result_sending": {      "endpoint": "http://analytics-server:8080/api/results",      "batch_size":
+    4,      "timeout": 5.0,      "retry_count": 3    }  },  "monitoring": {    "health_check_interval":
+    30,    "metrics_enabled": true,    "prometheus_port": 9090  }}'
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"system_config.json":"{\n  \"system\": {\n    \"gpu_config\": {\n      \"enabled\": true,\n      \"devices\": [0],\n      \"memory_limit_mb_per_gpu\": 2048,\n      \"batch_size_per_gpu\": 12,\n      \"load_balancing\": \"memory_based\",\n      \"num_processors\": 1\n    },\n    \"thread_pool\": {\n      \"max_workers\": 8\n    },\n    \"memory_management\": {\n      \"clear_cuda_cache_interval\": 300,\n      \"gc_interval\": 120\n    }\n  },\n  \"processing\": {\n    \"batch_interval\": 0.2,\n    \"processing_fps\": 5,\n    \"mode\": \"batch\"\n  },\n  \"result_database\": {\n    \"send_fps\": 1\n  },\n  \"buffer_settings\": {\n    \"max_size_per_camera\": 60,\n    \"max_total_size\": 300,\n    \"timeout_seconds\": 5.0,\n    \"drop_strategy\": \"smart\",\n    \"auto_adjust\": true\n  },\n  \"cameras\": [\n    {\n      \"rtsp_url\": \"rtsp://admin:admin123@4.232.129.207:8554/5/7\",\n      \"camera_id\": 1,\n      \"store_id\": 1,\n      \"priority\": 10\n    },\n    {\n      \"rtsp_url\": \"rtsp://admin:admin123@4.232.129.207:8554/5/6\",\n      \"camera_id\": 2,\n      \"store_id\": 1,\n      \"priority\": 10\n    }\n  ],\n  \"logging\": {\n    \"level\": \"INFO\",\n    \"file\": \"/var/log/rtsp-processor/processor.log\",\n    \"max_size_mb\": 100,\n    \"backup_count\": 10,\n    \"performance_logging_interval\": 60\n  },\n  \"output\": {\n    \"save_debug_frames\": false,\n    \"debug_frames_dir\": \"/var/log/rtsp-processor/debug-frames\",\n    \"save_frame_interval\": 30,\n    \"send_results\": true\n  },\n  \"network\": {\n    \"rtsp\": {\n      \"transport\": \"tcp\",\n      \"reconnect_attempts\": 5,\n      \"reconnect_delay\": 5\n    },\n    \"result_sending\": {\n      \"endpoint\": \"http://analytics-server:8080/api/results\",\n      \"batch_size\": 4,\n      \"timeout\": 5.0,\n      \"retry_count\": 3\n    }\n  },\n  \"monitoring\": {\n    \"health_check_interval\": 30,\n    \"metrics_enabled\": true,\n    \"prometheus_port\": 9090\n  }\n}\n"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"reid-config","namespace":"genfied"}}
+  creationTimestamp: "2025-04-15T12:27:42Z"
+  name: reid-config
+  namespace: genfied
+  resourceVersion: "24273148"
+  uid: bbfb79ce-81c6-4843-a94e-23e6a88c9889

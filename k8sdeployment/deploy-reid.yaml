@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reid-processor
+  namespace: genfied
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reid
+  template:
+    metadata:
+      labels:
+        app: reid
+      annotations:
+        # This annotation will be automatically updated by the controller
+        # when the ConfigMap changes, triggering a rolling restart
+        checksum/config: ""
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: genfied-ai-services-reid-v2
+      containers:
+      - name: reid
+        image: 575108955979.dkr.ecr.us-east-2.amazonaws.com/genfied_reid_test:latest
+        imagePullPolicy: Always
+        command: [ "python3" ]
+        args: [ "rtsp_stream_processor_multiple_cameras.py", "--config", "/app/config/system_config.json" ]
+        env:
+        - name: MILVUS_ROUTER_URL
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: MILVUS_ROUTER_URL
+        - name: KAFKA_BOOTSTRAP_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: KAFKA_BOOTSTRAP_SERVERS
+        - name: KAFKA_CONSUMER_GROUP
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: KAFKA_CONSUMER_GROUP
+        - name: KAFKA_TOPIC_PATTERN
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: KAFKA_TOPIC_PATTERN
+        - name: KAFKA_TOPICS
+          valueFrom:
+            configMapKeyRef:
+              # Use the automatically managed ConfigMap, the name of the configmap is always <deployment name>-config
+              name: reid-processor-config
+              key: KAFKA_TOPICS
+              optional: true
+        - name: MILVUS_BATCH_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: MILVUS_BATCH_SIZE
+        - name: MILVUS_BATCH_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: MILVUS_BATCH_INTERVAL
+        - name: STORE_IDS
+          valueFrom:
+            configMapKeyRef:
+              # Use the automatically managed ConfigMap
+              name: reid-processor-config
+              key: STORE_IDS
+              optional: true
+        - name: AUTH_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: AUTH_ENDPOINT
+        - name: AUTH_USERNAME
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: AUTH_USERNAME
+        - name: AUTH_PASSWORD
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: AUTH_PASSWORD
+        - name: AUTH_REFRESH_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: reid-env-config
+              key: AUTH_REFRESH_INTERVAL
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "500m"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "8Gi"
+            nvidia.com/gpu: 1
+            cpu: "2"
+        volumeMounts:
+        - mountPath: /app/config
+          name: config-volume
+        - mountPath: /app/kafka_config
+          name: kafka-config-volume
+      volumes:
+      - name: config-volume
+        configMap:
+          name: reid-config
+      - name: kafka-config-volume
+        configMap:
+          name: reid-processor-config
+      imagePullSecrets:
+      - name: ecr-registry-secret
+#DESCRIPTION
+# this Deployment ensures one GPU-backed Pod running your Python ReID processor, 
+# with its configuration and environment decoupled via Kubernetes ConfigMaps, 
+# and scheduled only onto the appropriate GPU node group.

@@ -1,0 +1,23 @@
+apiVersion: stream.aiservice.genfied.com/v1
+kind: ServiceRegistry
+metadata:
+  name: reid-processor
+  namespace: genfied
+spec:
+  serviceName: reid-processor
+  topicPrefixes: 
+    - '^store-([0-9]+)$'
+  stores: ["1","13"]
+  kafkaBootstrapServers: "35.181.243.135:29092"
+  scaling:
+    minReplicas: 1
+    maxReplicas: 5
+    resources:
+      requests:
+        memory: "4Gi"
+        cpu: "500m"
+        nvidia.com/gpu: 1
+      limits:
+        memory: "8Gi"
+        cpu: "2"
+        nvidia.com/gpu: 1

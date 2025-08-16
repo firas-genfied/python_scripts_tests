@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stress-test-complete-config
+  namespace: genfied
+  labels:
+    app: stress-test-milvus
+data:
+  # Default test parameters (medium load)
+  default-args: |
+    --stores 5
+    --cameras-per-store 3
+    --fps 5.0
+    --duration 120
+    --batch-size 50
+    --batch-time 2.0
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 100
+    --buffer-size 300
+    --batching-strategy per-camera
+  
+  # Light load test
+  light-args: |
+    --stores 2
+    --cameras-per-store 2
+    --fps 2.0
+    --duration 60
+    --batch-size 30
+    --batch-time 2.0
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 50
+    --buffer-size 150
+    --batching-strategy per-camera
+  
+  # Heavy load test  
+  heavy-args: |
+    --stores 10
+    --cameras-per-store 5
+    --fps 8.0
+    --duration 180
+    --batch-size 70
+    --batch-time 1.5
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 200
+    --buffer-size 500
+    --batching-strategy per-camera
+  
+  # Environment variables
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: "INFO"

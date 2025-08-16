@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milvus-router-config-file
+  namespace: genfied
+data:
+  config.json: |
+    {
+      "collection_name": "person_embeddings",
+      "embedding_dim": 768,
+      "max_connections_per_shard": 10,
+      "connection_timeout": 15,
+      "health_check_interval": 30,
+      "topology_refresh_interval": 60,
+      "shards": {
+        "shard1": {
+          "id": "shard1",
+          "host": "20.244.11.103",
+          "port": 19530,
+          "status": "active"
+        }
+      },
+      "store_mappings": {
+        "1": "shard1",
+        "2": "shard1",
+        "5": "shard1",
+        "14": "shard1"
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milvus-router-config
+  namespace: genfied
+data:
+  config_service_url: ""
+  redis_url: ""

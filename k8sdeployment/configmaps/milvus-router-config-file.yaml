@@ -1,0 +1,41 @@
+apiVersion: v1
+data:
+  config.json: |-
+    {
+      "collection_name": "person_reid_features",
+      "embedding_dim": 768,
+      "max_connections_per_shard": 150,
+      "connection_timeout": 45,
+      "health_check_interval": 10,
+      "topology_refresh_interval": 60,
+      "shards": {
+        "shard1": {
+          "id": "shard1",
+          "host": "74.235.98.141",
+          "port": 19530,
+          "status": "active"
+        }
+      },
+      "store_mappings": {
+        "1": "shard1",
+        "100": "shard1",
+        "14": "shard1",
+        "15": "shard1",
+        "19": "shard1",
+        "2": "shard1",
+        "20": "shard1",
+        "21": "shard1",
+        "27": "shard1",
+        "5": "shard1"
+      }
+    }
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"config.json":"{\n  \"collection_name\": \"person_reid_features\",\n  \"embedding_dim\": 768,\n  \"max_connections_per_shard\": 64,\n  \"connection_timeout\": 30,\n  \"health_check_interval\": 10,\n  \"topology_refresh_interval\": 60,\n  \"shards\": {\n    \"shard1\": {\n      \"id\": \"shard1\",\n      \"host\": \"74.235.98.141\",\n      \"port\": 19530,\n      \"status\": \"active\"\n    }\n  },\n  \"store_mappings\": {\n    \"1\": \"shard1\",\n    \"2\": \"shard1\",\n    \"5\": \"shard1\",\n    \"14\": \"shard1\"\n  }\n}\n"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"milvus-router-config-file","namespace":"genfied"}}
+  creationTimestamp: "2025-05-18T17:34:06Z"
+  name: milvus-router-config-file
+  namespace: genfied
+  resourceVersion: "24309751"
+  uid: 648a7c40-fc86-4d57-8630-e13dba466b3c

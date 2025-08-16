@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-router
+  namespace: genfied
+  labels:
+    app: milvus-router
+    tier: middleware
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: milvus-router
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: milvus-router
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        checksum/config.json: "00000000"
+    spec:
+      # Node selector for your dedicated node group
+      nodeSelector:
+        role: milvus-router
+      # Fix typo: "affinitiy" -> "affinity"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - milvus-router
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: milvus-router
+        image: 575108955979.dkr.ecr.us-east-2.amazonaws.com/milvus-router:latest # This will be replaced by actual ECR URI
+        imagePullPolicy: Always
+        env:
+        - name: CONFIG_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: milvus-router-config
+              key: config_service_url
+              optional: true
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: milvus-router-config
+              key: redis_url
+              optional: true
+        - name: LOG_LEVEL
+          value: "INFO"
+        # Mount config file
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config.json
+          subPath: config.json
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      volumes:
+      - name: config-volume
+        configMap:
+          name: milvus-router-config-file
+      terminationGracePeriodSeconds: 30

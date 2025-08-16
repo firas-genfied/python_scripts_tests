@@ -1,0 +1,26 @@
+apiVersion: v1
+data:
+  AUTH_ENDPOINT: http://genfied-api.xperie.nz:8000/api/v1/auth/login
+  AUTH_PASSWORD: admin123
+  AUTH_REFRESH_INTERVAL: "1800"
+  AUTH_USERNAME: admin
+  KAFKA_BOOTSTRAP_SERVERS: 4.232.129.207:29092
+  KAFKA_CONSUMER_GROUP: reid-processor
+  KAFKA_TOPIC_PATTERN: ^store-([0-9]+)$
+  MILVUS_BATCH_INTERVAL: "2.0"
+  MILVUS_BATCH_SIZE: "70"
+  MILVUS_ENABLE_RATE_LIMITING: "false"
+  MILVUS_ENABLE_SEMAPHORE: "true"
+  MILVUS_MAX_CONCURRENT: "150"
+  MILVUS_MIN_INTERVAL: "0.01"
+  MILVUS_ROUTER_URL: http://milvus-router.genfied.svc.cluster.local
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"AUTH_ENDPOINT":"http://genfied-api.xperie.nz:8000/api/v1/auth/login","AUTH_PASSWORD":"admin123","AUTH_REFRESH_INTERVAL":"1800","AUTH_USERNAME":"admin","KAFKA_BOOTSTRAP_SERVERS":"4.232.129.207:29092","KAFKA_CONSUMER_GROUP":"reid-processor","KAFKA_TOPIC_PATTERN":"^store-([0-9]+)$","MILVUS_BATCH_INTERVAL":"0.3","MILVUS_BATCH_SIZE":"50","MILVUS_ENABLE_RATE_LIMITING":"false","MILVUS_ENABLE_SEMAPHORE":"true","MILVUS_MAX_CONCURRENT":"300","MILVUS_MIN_INTERVAL":"0.001","MILVUS_ROUTER_URL":"http://milvus-router.genfied.svc.cluster.local"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"reid-env-config","namespace":"genfied"}}
+  creationTimestamp: "2025-04-16T08:05:47Z"
+  name: reid-env-config
+  namespace: genfied
+  resourceVersion: "24274043"
+  uid: 0b7355c5-1d76-4ab6-9fe3-9f32a7b26dfe

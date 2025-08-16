@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: topic-operator-ingress
+  namespace: genfied
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: topic-api.test   # This is just a placeholder - you'll override with Host header
+    http:
+      paths:
+      - path: /services
+        pathType: Prefix
+        backend:
+          service:
+            name: topic-operator-http
+            port:
+              number: 8088

@@ -1,0 +1,49 @@
+apiVersion: v1
+data:
+  LOG_LEVEL: INFO
+  PYTHONUNBUFFERED: "1"
+  default-args: |
+    --stores 5
+    --cameras-per-store 3
+    --fps 5.0
+    --duration 120
+    --batch-size 50
+    --batch-time 2.0
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 100
+    --buffer-size 300
+    --batching-strategy per-camera
+  heavy-args: |
+    --stores 10
+    --cameras-per-store 5
+    --fps 8.0
+    --duration 180
+    --batch-size 70
+    --batch-time 1.5
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 200
+    --buffer-size 500
+    --batching-strategy per-camera
+  light-args: |
+    --stores 2
+    --cameras-per-store 2
+    --fps 2.0
+    --duration 60
+    --batch-size 30
+    --batch-time 2.0
+    --router-url http://milvus-router.genfied.svc.cluster.local
+    --max-concurrent 50
+    --buffer-size 150
+    --batching-strategy per-camera
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"LOG_LEVEL":"INFO","PYTHONUNBUFFERED":"1","default-args":"--stores 5\n--cameras-per-store 3\n--fps 5.0\n--duration 120\n--batch-size 50\n--batch-time 2.0\n--router-url http://milvus-router.genfied.svc.cluster.local\n--max-concurrent 100\n--buffer-size 300\n--batching-strategy per-camera\n","heavy-args":"--stores 10\n--cameras-per-store 5\n--fps 8.0\n--duration 180\n--batch-size 70\n--batch-time 1.5\n--router-url http://milvus-router.genfied.svc.cluster.local\n--max-concurrent 200\n--buffer-size 500\n--batching-strategy per-camera\n","light-args":"--stores 2\n--cameras-per-store 2\n--fps 2.0\n--duration 60\n--batch-size 30\n--batch-time 2.0\n--router-url http://milvus-router.genfied.svc.cluster.local\n--max-concurrent 50\n--buffer-size 150\n--batching-strategy per-camera\n"},"kind":"ConfigMap","metadata":{"annotations":{},"labels":{"app":"stress-test-milvus"},"name":"stress-test-complete-config","namespace":"genfied"}}
+  creationTimestamp: "2025-06-14T06:58:36Z"
+  labels:
+    app: stress-test-milvus
+  name: stress-test-complete-config
+  namespace: genfied
+  resourceVersion: "23303939"
+  uid: 3571196c-c477-4a5e-a27a-2ff58effa0bb

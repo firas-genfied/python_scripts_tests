@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: prometheus
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: grafana.test  # Placeholder host, similar to your existing one
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              number: 3000

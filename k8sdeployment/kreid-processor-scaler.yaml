@@ -1,0 +1,78 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"keda.sh/v1alpha1","kind":"ScaledObject","metadata":{"annotations":{},"name":"reid-processor-scaler","namespace":"genfied"},"spec":{"advanced":{"horizontalPodAutoscalerConfig":{"behavior":{"scaleDown":{"policies":[{"periodSeconds":300,"type":"Percent","value":50}],"stabilizationWindowSeconds":300}}}},"cooldownPeriod":600,"maxReplicaCount":10,"minReplicaCount":1,"pollingInterval":30,"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"reid-processor"},"triggers":[{"metadata":{"query":"avg(DCGM_FI_DEV_GPU_UTIL{namespace=\"genfied\"})\n","serverAddress":"http://prometheus-server.prometheus.svc.cluster.local","threshold":"70"},"type":"prometheus"}]}}
+  creationTimestamp: "2025-05-01T07:35:11Z"
+  finalizers:
+  - finalizer.keda.sh
+  generation: 6
+  labels:
+    scaledobject.keda.sh/name: reid-processor-scaler
+  name: reid-processor-scaler
+  namespace: genfied
+  resourceVersion: "4851599"
+  uid: 231a1fad-e554-4d2c-98f4-d45059a4f883
+spec:
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          policies:
+          - periodSeconds: 300
+            type: Percent
+            value: 50
+          stabilizationWindowSeconds: 300
+    scalingModifiers: {}
+  cooldownPeriod: 600
+  maxReplicaCount: 10
+  minReplicaCount: 0
+  pollingInterval: 30
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reid-processor
+  triggers:
+  - metadata:
+      query: |
+        avg(DCGM_FI_DEV_GPU_UTIL{namespace="genfied"})
+      serverAddress: http://prometheus-server.prometheus.svc.cluster.local
+      threshold: "70"
+    type: prometheus
+  - metadata:
+      bootstrapServers: 4.232.129.207:29092
+      consumerGroup: reid-processor
+      lagThreshold: "200"
+      offsetResetPolicy: latest
+    type: kafka
+status:
+  authenticationsTypes: ""
+  conditions:
+  - message: ScaledObject is defined correctly and is ready for scaling
+    reason: ScaledObjectReady
+    status: "True"
+    type: Ready
+  - message: Scaling is performed because triggers are active
+    reason: ScalerActive
+    status: "True"
+    type: Active
+  - message: No fallbacks are active on this scaled object
+    reason: NoFallbackFound
+    status: "False"
+    type: Fallback
+  - status: Unknown
+    type: Paused
+  externalMetricNames:
+  - s0-prometheus
+  - s1-kafka-reid-processor-topics
+  hpaName: keda-hpa-reid-processor-scaler
+  lastActiveTime: "2025-05-03T07:48:58Z"
+  originalReplicaCount: 1
+  scaleTargetGVKR:
+    group: apps
+    kind: Deployment
+    resource: deployments
+    version: v1
+  scaleTargetKind: apps/v1.Deployment
+  triggersTypes: prometheus,kafka
