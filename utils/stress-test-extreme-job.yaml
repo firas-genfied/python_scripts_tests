@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stress-test-milvus-extreme-150cam
+  namespace: genfied
+  labels:
+    app: stress-test-milvus
+    test-type: extreme-load
+    camera-count: "150"
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 7200  # Keep results for 2 hours
+  
+  template:
+    metadata:
+      labels:
+        app: stress-test-milvus
+        test-type: extreme-load
+        camera-count: "150"
+    spec:
+      restartPolicy: Never
+      
+      # Ensure this runs on a different node than router pods
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - milvus-router
+              topologyKey: "kubernetes.io/hostname"
+      
+      containers:
+      - name: stress-test
+        image: 575108955979.dkr.ecr.us-east-2.amazonaws.com/stress-test-milvus:latest
+        imagePullPolicy: Always
+        
+        command: ["/bin/sh"]
+        args: 
+        - -c
+        - |
+          echo "🚀 Starting EXTREME load stress test with 150 cameras:"
+          echo "$(cat /config/test-args)"
+          echo "⚠️  This will generate ~1200 frames/second and ~60,000 features!"
+          echo "================================"
+          echo "Starting in 5 seconds..."
+          sleep 5
+          python stress_test_milvus_architecture.py $(cat /config/test-args)
+          exit_code=$?
+          echo "🏁 Extreme test completed with exit code: $exit_code"
+          echo "📊 Check logs above for detailed performance metrics"
+          exit $exit_code
+        
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: LOG_LEVEL
+          value: "INFO"
+        
+        volumeMounts:
+        - name: test-config
+          mountPath: /config
+          readOnly: true
+        
+        # Significantly higher resources for extreme load
+        resources:
+          requests:
+            cpu: "1000m"      # 4 CPU cores
+            memory: "2Gi"     # 8GB RAM
+          limits:
+            cpu: "2000m"      # Max 8 CPU cores  
+            memory: "4Gi"    # Max 16GB RAM
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+      
+      volumes:
+      - name: test-config
+        configMap:
+          name: stress-test-extreme-config
+          items:
+          - key: extreme-150cam-args
+            path: test-args
+      
+      # Extended time limit for extreme test
+      activeDeadlineSeconds: 1800  # 30 minutes max

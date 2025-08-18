@@ -1,0 +1,96 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stress-test-milvus
+  namespace: genfied
+  labels:
+    app: stress-test-milvus
+    test-type: load-testing
+spec:
+  # Job will run once and not restart on failure
+  backoffLimit: 0
+  # Clean up completed jobs after 1 hour
+  ttlSecondsAfterFinished: 3600
+  
+  template:
+    metadata:
+      labels:
+        app: stress-test-milvus
+        test-type: load-testing
+    spec:
+      restartPolicy: Never
+      
+      # Use a different node than router pods for better isolation
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - milvus-router
+              topologyKey: "kubernetes.io/hostname"
+      
+      containers:
+      - name: stress-test
+        image: 575108955979.dkr.ecr.us-east-2.amazonaws.com/stress-test-milvus:latest
+        imagePullPolicy: Always
+        
+        # Use default-args from ConfigMap (you can change this to light-args, heavy-args, etc.)
+        command: ["/bin/sh"]
+        args: 
+        - -c
+        - |
+          echo "Starting stress test with configuration:"
+          echo "$(cat /config/test-args)"
+          echo "================================"
+          python stress_test_milvus_architecture.py $(cat /config/test-args)
+        
+        # Environment variables from ConfigMap
+        env:
+        - name: PYTHONUNBUFFERED
+          valueFrom:
+            configMapKeyRef:
+              name: stress-test-complete-config
+              key: PYTHONUNBUFFERED
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: stress-test-complete-config
+              key: LOG_LEVEL
+        
+        # Mount ConfigMap as volume
+        volumeMounts:
+        - name: test-config
+          mountPath: /config
+          readOnly: true
+        
+        # Resource limits appropriate for stress testing
+        resources:
+          requests:
+            cpu: "1000m"      # 1 CPU core
+            memory: "2Gi"     # 2GB RAM
+          limits:
+            cpu: "2000m"      # Max 2 CPU cores
+            memory: "4Gi"     # Max 4GB RAM
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+      
+      volumes:
+      - name: test-config
+        configMap:
+          name: stress-test-complete-config
+          items:
+          - key: default-args  # Change this to light-args, heavy-args, etc.
+            path: test-args
+      
+      # Give the job enough time to complete
+      activeDeadlineSeconds: 900  # 15 minutes max runtime

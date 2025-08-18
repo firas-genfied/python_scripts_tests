@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stress-test-milvus-light
+  namespace: genfied
+  labels:
+    app: stress-test-milvus
+    test-type: light-load
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  
+  template:
+    metadata:
+      labels:
+        app: stress-test-milvus
+        test-type: light-load
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: stress-test
+        image: 575108955979.dkr.ecr.us-east-2.amazonaws.com/stress-test-milvus:latest
+        imagePullPolicy: Always
+        
+        command: ["/bin/sh"]
+        args: 
+        - -c
+        - |
+          echo "Starting LIGHT load stress test:"
+          echo "$(cat /config/test-args)"
+          echo "================================"
+          python stress_test_milvus_architecture.py $(cat /config/test-args)
+        
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: LOG_LEVEL
+          value: "INFO"
+        
+        volumeMounts:
+        - name: test-config
+          mountPath: /config
+          readOnly: true
+        
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+      
+      volumes:
+      - name: test-config
+        configMap:
+          name: stress-test-complete-config
+          items:
+          - key: light-args
+            path: test-args
+      
+      activeDeadlineSeconds: 300  # 5 minutes
