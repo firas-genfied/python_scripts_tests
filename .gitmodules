@@ -1,6 +1,3 @@
-[submodule "TransReid"]
-	path = TransReid
-	url = https://github.com/anuj018/TransReid.git
 [submodule "TransReID"]
 	path = TransReID
 	url = https://github.com/anuj018/TransReID.git
