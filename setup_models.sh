@@ -4,13 +4,13 @@ set -e
 # Backbone (ViT-JX) from timm releases
 BACKBONE_URL="https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_p16_224-80ecf9dd.pth"
 BACKBONE_FILE="jx_vit_base_p16_224-80ecf9dd.pth"
-BACKBONE_DIR="/app/TransReID/.cache/torch/checkpoints"
+BACKBONE_DIR="/home/tanay/workstation/genfied_workstation/ObjectTracking/TransReID/.cache/torch/checkpoints"
 BACKBONE_PATH="$BACKBONE_DIR/$BACKBONE_FILE"
 
 # Fine-tuned TransReID model
 FINETUNE_URL="https://genfied.blob.core.windows.net/models/vit_base_msmt.pth"
 FINETUNE_FILE="vit_base_msmt.pth"
-FINETUNE_DIR="/app/TransReID/models"
+FINETUNE_DIR="/home/tanay/workstation/genfied_workstation/ObjectTracking/TransReID/models"
 FINETUNE_PATH="$FINETUNE_DIR/$FINETUNE_FILE"
 
 # Ensure directories exist

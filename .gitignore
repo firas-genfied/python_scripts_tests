@@ -164,4 +164,5 @@ status_checker_logs.txt
 
 .env
 processor_segment_with_transreid_tanishq.py
-processor_segment_with_transreid_tanishq_2.py
+processor_segment_with_transreid_tanishq_2.pyrouter-repo/
+actions-runner/
