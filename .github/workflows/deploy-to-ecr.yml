@@ -4,6 +4,7 @@ on:
     branches:
       - feature/milvusvectordb
       - feature/kafaintegration
+      - feature/dev_branch
 
 jobs:
   build-and-push:
